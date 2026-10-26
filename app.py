@@ -1,21 +1,19 @@
 import streamlit as st
 from PIL import Image
-import io
-import base64
 import cv2
 import numpy as np
 from google import genai
-from google.genai import types
 from openai import OpenAI
+import io
+import base64
 
-# Hỗ trợ đọc định dạng ảnh HEIC/HEIF từ iPhone
+# Hỗ trợ ảnh chụp iPhone (HEIC/HEIF)
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
     pass
 
-# ----------------- CẤU HÌNH TRANG -----------------
 st.set_page_config(
     page_title="AI 12-Lead ECG Expert",
     page_icon="🫀",
@@ -23,14 +21,7 @@ st.set_page_config(
 )
 
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
-def preprocess_ecg(
-    pil_img, 
-    remove_shadow=True, 
-    apply_clahe=True, 
-    clahe_clip=2.0, 
-    sharpen_level=1.0, 
-    rotation_angle=0
-):
+def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
     img = np.array(pil_img)
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -39,16 +30,13 @@ def preprocess_ecg(
     else:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # 1. Cân góc xoay
     if rotation_angle != 0:
         (h, w) = img.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), rotation_angle, 1.0)
         img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2. Khử bóng mờ & Đều sáng nền
     if remove_shadow:
         dilated = cv2.dilate(gray, np.ones((7, 7), np.uint8))
         bg_img = cv2.medianBlur(dilated, 21)
@@ -58,96 +46,52 @@ def preprocess_ecg(
     else:
         processed = gray
 
-    # 3. Tăng tương phản lưới sóng (CLAHE)
     if apply_clahe:
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
         processed = clahe.apply(processed)
 
-    # 4. Làm sắc nét sóng
     if sharpen_level > 0:
         gaussian = cv2.GaussianBlur(processed, (0, 0), 2.0)
         sharpened = cv2.addWeighted(processed, 1.0 + sharpen_level, gaussian, -sharpen_level, 0)
         processed = np.clip(sharpened, 0, 255).astype(np.uint8)
 
-    processed_rgb = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
-    return Image.fromarray(processed_rgb)
+    return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
-# ----------------- PROMPT CHUYÊN KHOA TIM MẠCH -----------------
+# ----------------- PROMPT LÂM SÀNG -----------------
 SYSTEM_PROMPT = """
-Bạn là một chuyên gia Tim mạch can thiệp và Điện sinh lý học tim hàng đầu.
-Nhiệm vụ của bạn là đọc và phân tích hình ảnh Điện tâm đồ 12 chuyển đạo tiêu chuẩn được cung cấp.
+Bạn là một chuyên gia Tim mạch can thiệp và Điện sinh lý học tim.
+Hãy đọc và phân tích hình ảnh Điện tâm đồ 12 chuyển đạo tiêu chuẩn theo trình tự:
 
-Hãy tiến hành đọc một cách chặt chẽ, tuần tự theo các bước chuẩn lâm sàng sau:
+1. ĐÁNH GIÁ KỸ THUẬT: Test biên độ (mm/mV), Tốc độ kéo giấy (mm/s), Độ nhiễu, Mắc ngược điện cực (aVR).
+2. TẦN SỐ & NHỊP: Tần số (ck/p), Nhịp xoang hay rối loạn nhịp (Rung nhĩ, cuồng nhĩ, ngoại tâm thu...).
+3. TRỤC ĐIỆN TIM: Bình thường, lệch trái, lệch phải hay vô định.
+4. HÌNH THÁI SÓNG & KHOẢNG:
+   - Sóng P (dày nhĩ).
+   - Khoảng PR (dài/ngắn, block nhĩ thất).
+   - Phức bộ QRS (thời gian hẹp/rộng, biên độ Sokolow-Lyon/Cornell, sóng Q hoại tử).
+   - Đoạn ST (đẳng điện, chênh lên, chênh xuống, vị trí thành cơ tim tổn thương, hình ảnh soi gương).
+   - Sóng T và khoảng QTc.
+5. KẾT LUẬN & GỢI Ý XỬ TRÍ:
+   - Chẩn đoán ECG chính.
+   - Mức độ khẩn cấp (TỐI KHẨN CẤP / KHẨN CẤP / THƯỜNG QUY).
+   - Đề xuất cận lâm sàng kết hợp (Troponin hs, Siêu âm tim, Khí máu...).
 
-### 1. ĐÁNH GIÁ CHẤT LƯỢNG KỸ THUẬT & DẪN TRUYỀN
-- Kiểm tra test biên độ (Calibration): Thường là 10 mm/mV (1 mV = 2 ô lớn).
-- Tốc độ kéo giấy (Paper speed): Thường là 25 mm/s (1 ô nhỏ = 0.04s, 1 ô lớn = 0.2s).
-- Đánh giá nhiễu: Nhiễu cơ vân, đường đẳng điện trôi, mắc ngược điện cực (aVR có P và QRS dương bất thường không?).
-
-### 2. TẦN SỐ & NHỊP
-- Tần số tim: Khoảng bao nhiêu nhịp/phút?
-- Nhịp: Nhịp xoang đều/không đều? Hay loạn nhịp (Rung nhĩ, Cuồng nhĩ, PSVT, VT, Ngoại tâm thu nhĩ/thất...)?
-
-### 3. TRỤC ĐIỆN TIM & GÓC ALPHA
-- Trục: Bình thường (0° đến +90°), Lệch trái (-30° đến -90°), Lệch phải (+90° đến +180°), hay Vô định?
-- Phân tích dựa trên D1, D2, aVF.
-
-### 4. ĐO ĐẠC HÌNH THÁI CÁC SÓNG & KHOẢNG
-- **Sóng P**: Biên độ, thời gian, hình thái hai đỉnh hoặc pha âm sâu ở V1.
-- **Khoảng PR**: Bình thường (0.12 - 0.20s), Ngắn (WPW, LGL), Dài (Block AV độ I, II, III).
-- **Phức bộ QRS**: 
-  - Thời gian: Hẹp (< 0.12s) hay Rộng (Block nhánh, nhịp tự thất)?
-  - Biên độ & Dày thất: Sokolow-Lyon, Cornell.
-  - Sóng Q hoại tử bệnh lý ở các đạo trình liên quan.
-- **Đoạn ST**: 
-  - Đẳng điện, chênh lên hay chênh xuống? Dạng vòm hay dốc?
-  - Định vị thành tổn thương: Trước vách (V1-V2), Mỏm (V3-V4), Bên (DI, aVL, V5-V6), Dưới (DII, DIII, aVF), Thành sau...
-  - Hình ảnh soi gương (reciprocal changes)?
-- **Sóng T & QTc**: Chiều, độ nhọn đối xứng, khoảng QTc kéo dài hay bình thường.
-
-### 5. KẾT LUẬN & GỢI Ý XỬ TRÍ
-- **Kết luận điện tâm đồ**: Tóm tắt chẩn đoán chính.
-- **Mức độ khẩn cấp**: [TỐI KHẨN CẤP / KHẨN CẤP / THEO DÕI THƯỜNG QUY].
-- **Đề xuất cận lâm sàng kết hợp**: (Troponin hs, Khí máu, Siêu âm tim tại giường, Điện giải đồ...).
-
-*Lưu ý: Luôn bắt đầu phần kết luận bằng lời nhắc: Đây là công cụ AI hỗ trợ đọc dữ liệu thô, quyết định lâm sàng cuối cùng thuộc về bác sĩ trực tiếp khám bệnh.*
+Lưu ý: Bắt đầu kết luận với lưu ý đây là công cụ AI hỗ trợ, quyết định lâm sàng cuối cùng thuộc về bác sĩ điều trị.
 """
 
-# ----------------- HÀM GỌI API (STREAMING & AUTO-OPTIMIZED) -----------------
+# ----------------- HÀM GỌI GEMINI STREAM (CHUẨN TỐC ĐỘ CAO) -----------------
 def analyze_with_gemini_stream(api_key, model_name, image, prompt):
-    clean_key = api_key.strip()
+    client = genai.Client(api_key=api_key.strip())
     
-    # 1. Tối ưu kích thước ảnh (1400px sắc nét từng ô 1mm, nén nhẹ để truyền trong 0.5s)
+    # Nén nhanh kích thước ảnh về tối đa 1600px để truyền dữ liệu trong tích tắc
     img_to_send = image.copy()
-    max_dimension = 1400
-    if max(img_to_send.size) > max_dimension:
-        img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    if max(img_to_send.size) > 1600:
+        img_to_send.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
     
-    buf = io.BytesIO()
-    img_to_send.convert("RGB").save(buf, format="JPEG", quality=80)
-    img_bytes = buf.getvalue()
-
-    # 2. Khởi tạo Client với Timeout 45 giây
-    client = genai.Client(
-        api_key=clean_key,
-        http_options={'timeout': 45.0}
-    )
-
-    contents = [
-        genai.types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-        prompt
-    ]
-
-    # 3. Tắt thinking ngầm để tránh nghẽn luồng và đẩy kết quả ra ngay
-    config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-        temperature=0.1
-    )
-
+    # Truyền phát dữ liệu trực tiếp, không can thiệp tham số gây xung đột
     response = client.models.generate_content_stream(
         model=model_name,
-        contents=contents,
-        config=config
+        contents=[img_to_send, prompt]
     )
     for chunk in response:
         if chunk.text:
@@ -156,9 +100,8 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
 def encode_image_to_base64(pil_image):
     buffered = io.BytesIO()
     rgb_image = pil_image.convert('RGB')
-    max_dimension = 1400
-    if max(rgb_image.size) > max_dimension:
-        rgb_image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    if max(rgb_image.size) > 1600:
+        rgb_image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
     rgb_image.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
@@ -193,17 +136,11 @@ def analyze_with_openai_stream(api_key, model_name, base64_image, prompt):
 st.title("🫀 Phân Tích Điện Tâm Đồ 12 Chuyển Đạo")
 st.caption("Hệ thống AI chuyên khoa Tim mạch - Phân tích sóng thời gian thực & Tiền xử lý ảnh")
 
-# --- SIDEBAR: Cấu hình mô hình & Quản lý API Key ---
 with st.sidebar:
     st.header("⚙️ Lựa chọn Mô hình AI")
-    
     provider = st.radio(
         "Chọn chế độ phân tích:",
-        (
-            "Google Gemini (Mặc định - Miễn phí)", 
-            "OpenAI GPT-4o (Yêu cầu Key cá nhân)", 
-            "So sánh song song (Cần Key OpenAI)"
-        ),
+        ("Google Gemini (Mặc định - Miễn phí)", "OpenAI GPT-4o (Yêu cầu Key cá nhân)", "So sánh song song (Cần Key OpenAI)"),
         index=0
     )
     
@@ -213,16 +150,10 @@ with st.sidebar:
     active_gemini_key = system_gemini_key
     active_openai_key = ""
 
-    # 1. Cấu hình Gemini
     if provider in ["Google Gemini (Mặc định - Miễn phí)", "So sánh song song (Cần Key OpenAI)"]:
         gemini_model = st.selectbox(
             "Phiên bản Gemini:",
-            [
-                "gemini-2.0-flash",       # Ưu tiên tính ổn định cao, không timeout
-                "gemini-3.8-flash",
-                "gemini-2.5-flash",
-                "gemini-1.5-flash"
-            ],
+            ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"],
             index=0
         )
         if system_gemini_key:
@@ -230,23 +161,17 @@ with st.sidebar:
         else:
             active_gemini_key = st.text_input("Nhập Google Gemini API Key:", type="password")
 
-    # 2. Cấu hình OpenAI
     if provider in ["OpenAI GPT-4o (Yêu cầu Key cá nhân)", "So sánh song song (Cần Key OpenAI)"]:
         openai_model = st.selectbox("Phiên bản OpenAI:", ["gpt-4o", "gpt-4o-mini"])
         if system_openai_key:
             use_sys_openai = st.checkbox("Dùng key OpenAI hệ thống", value=True)
             active_openai_key = system_openai_key if use_sys_openai else st.text_input("Nhập OpenAI API Key cá nhân:", type="password")
         else:
-            active_openai_key = st.text_input(
-                "Nhập OpenAI API Key cá nhân (sk-...):", 
-                type="password",
-                help="Key chỉ lưu tạm trên phiên duyệt web của bạn, không bị lưu trữ."
-            )
+            active_openai_key = st.text_input("Nhập OpenAI API Key cá nhân (sk-...):", type="password")
 
     st.markdown("---")
     st.header("🛠️ Bộ Tiền Xử Lý Ảnh")
     enable_preprocessing = st.checkbox("Bật tiền xử lý ảnh nâng cao", value=True)
-    
     if enable_preprocessing:
         remove_shadow = st.checkbox("Khử bóng mờ & Đều ánh sáng nền", value=True)
         apply_clahe = st.checkbox("Tăng tương phản lưới sóng (CLAHE)", value=True)
@@ -254,29 +179,20 @@ with st.sidebar:
         sharpen_lvl = st.slider("Độ sắc nét sóng:", min_value=0.0, max_value=3.0, value=1.0, step=0.5)
         rot_angle = st.slider("Cân góc xoay (°):", min_value=-15, max_value=15, value=0, step=1)
     else:
-        remove_shadow = False
-        apply_clahe = False
-        clahe_clip = 2.0
-        sharpen_lvl = 0.0
-        rot_angle = 0
+        remove_shadow, apply_clahe, clahe_clip, sharpen_lvl, rot_angle = False, False, 2.0, 0.0, 0
 
     st.markdown("---")
     st.header("📋 Thông tin Ca Bệnh (Tùy chọn)")
     patient_age = st.number_input("Tuổi bệnh nhân:", min_value=0, max_value=120, value=60)
     patient_sex = st.selectbox("Giới tính:", ["Nam", "Nữ", "Không xác định"])
-    clinical_history = st.text_area(
-        "Bệnh sử / Triệu chứng lâm sàng:",
-        placeholder="VD: Đau ngực trái dữ dội lan ra vai trái 2 giờ trước, tiền căn tăng huyết áp..."
-    )
+    clinical_history = st.text_area("Bệnh sử / Triệu chứng lâm sàng:", placeholder="VD: Đau thắt ngực trái 2 giờ trước...")
 
-# --- KHUNG TẢI ẢNH & HIỂN THỊ ---
 st.subheader("1. Tải ảnh hoặc Chụp trực tiếp")
 uploaded_file = st.file_uploader(
     "Chọn ảnh ECG 12 chuyển đạo", 
     type=["jpg", "jpeg", "png", "jfif", "webp", "bmp", "heic", "heif"]
 )
-enable_cam = st.checkbox("Sử dụng Camera")
-if enable_cam:
+if st.checkbox("Sử dụng Camera"):
     cam_file = st.camera_input("Chụp ảnh ECG")
     if cam_file:
         uploaded_file = cam_file
@@ -286,7 +202,6 @@ final_image_to_analyze = None
 
 if uploaded_file is not None:
     raw_image = Image.open(uploaded_file)
-    
     if enable_preprocessing:
         processed_image = preprocess_ecg(
             raw_image,
@@ -297,57 +212,39 @@ if uploaded_file is not None:
             rotation_angle=rot_angle
         )
         final_image_to_analyze = processed_image
-        
-        col_raw, col_proc = st.columns(2)
-        with col_raw:
+        c_raw, c_proc = st.columns(2)
+        with c_raw:
             st.image(raw_image, caption="Ảnh gốc (Raw Image)", width="stretch")
-        with col_proc:
+        with c_proc:
             st.image(processed_image, caption="Ảnh sau tiền xử lý (Sẽ gửi vào AI)", width="stretch")
     else:
         final_image_to_analyze = raw_image
         st.image(raw_image, caption="Ảnh ECG sử dụng trực tiếp", width="stretch")
 
-# Chuẩn bị Prompt kết hợp lâm sàng
 full_prompt = SYSTEM_PROMPT
 if clinical_history or patient_age:
-    full_prompt += f"\n\n### BỐI CẢNH LÂM SÀNG CỦA CA BỆNH:\n- Tuổi: {patient_age}\n- Giới tính: {patient_sex}\n- Thông tin thêm: {clinical_history if clinical_history else 'Không có'}\nHãy kết hợp bối cảnh này để biện luận các biến đổi trên ECG."
+    full_prompt += f"\n\n### BỐI CẢNH LÂM SÀNG:\n- Tuổi: {patient_age}\n- Giới tính: {patient_sex}\n- Thông tin thêm: {clinical_history if clinical_history else 'Không có'}"
 
-# --- NÚT BẮT ĐẦU PHÂN TÍCH ---
 st.markdown("---")
 if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch"):
     if final_image_to_analyze is None:
         st.warning("Vui lòng tải lên hoặc chụp một ảnh ECG trước khi phân tích!")
     else:
-        # 1. Chế độ Google Gemini
         if provider == "Google Gemini (Mặc định - Miễn phí)":
             if not active_gemini_key:
                 st.error("Chưa có Gemini API Key! Hãy cấu hình trong Secrets hoặc nhập ở menu bên trái.")
             else:
-                fallback_candidates = [gemini_model]
-                for fb in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.8-flash"]:
-                    if fb not in fallback_candidates:
-                        fallback_candidates.append(fb)
+                st.subheader(f"📋 Báo Cáo Phân Tích ({gemini_model})")
+                try:
+                    st.write_stream(
+                        analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                    )
+                except Exception as e:
+                    st.error(f"Lỗi phân tích: {e}")
 
-                success = False
-                for target_model in fallback_candidates:
-                    try:
-                        st.subheader(f"📋 Báo Cáo Phân Tích ({target_model})")
-                        st.write_stream(
-                            analyze_with_gemini_stream(active_gemini_key, target_model, final_image_to_analyze, full_prompt)
-                        )
-                        success = True
-                        break
-                    except Exception as e:
-                        st.warning(f"⚠️ {target_model} phản hồi chậm hoặc nghẽn kết nối. Đang tự động chuyển sang mô hình dự phòng...")
-                        continue
-
-                if not success:
-                    st.error("Không thể kết nối đến máy chủ Google lúc này. Vui lòng thử lại sau ít phút.")
-
-        # 2. Chế độ OpenAI GPT-4o
         elif provider == "OpenAI GPT-4o (Yêu cầu Key cá nhân)":
             if not active_openai_key:
-                st.warning("Vui lòng nhập OpenAI API Key cá nhân của bạn ở thanh bên trái.")
+                st.warning("Vui lòng nhập OpenAI API Key cá nhân của bạn.")
             else:
                 base64_img = encode_image_to_base64(final_image_to_analyze)
                 st.subheader(f"📋 Báo Cáo Phân Tích ({openai_model})")
@@ -356,14 +253,11 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
                         analyze_with_openai_stream(active_openai_key, openai_model, base64_img, full_prompt)
                     )
                 except Exception as e:
-                    st.error(f"Lỗi: {e}")
+                    st.error(f"Lỗi OpenAI: {e}")
 
-        # 3. Chế độ So sánh song song
         elif provider == "So sánh song song (Cần Key OpenAI)":
-            if not active_gemini_key:
-                st.error("Thiếu Gemini API Key!")
-            elif not active_openai_key:
-                st.warning("Chế độ so sánh yêu cầu bạn nhập thêm OpenAI API Key cá nhân ở cột bên trái.")
+            if not active_gemini_key or not active_openai_key:
+                st.warning("Chế độ so sánh cần cả Gemini Key và OpenAI Key.")
             else:
                 base64_img = encode_image_to_base64(final_image_to_analyze)
                 c1, c2 = st.columns(2)
@@ -374,7 +268,7 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
                             analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
                         )
                     except Exception as e:
-                        st.error(f"Gemini Lỗi: {e}")
+                        st.error(f"Lỗi Gemini: {e}")
                 with c2:
                     st.subheader(f"🔸 {openai_model}")
                     try:
@@ -382,4 +276,4 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
                             analyze_with_openai_stream(active_openai_key, openai_model, base64_img, full_prompt)
                         )
                     except Exception as e:
-                        st.error(f"OpenAI Lỗi: {e}")
+                        st.error(f"Lỗi OpenAI: {e}")
