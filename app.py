@@ -15,7 +15,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# ----------------- HÀM TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
+# ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(
     pil_img, 
     remove_shadow=True, 
@@ -24,7 +24,6 @@ def preprocess_ecg(
     sharpen_level=1.0, 
     rotation_angle=0
 ):
-    # Chuyển PIL Image sang OpenCV BGR
     img = np.array(pil_img)
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -33,17 +32,16 @@ def preprocess_ecg(
     else:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # 1. Xoay ảnh cân chỉnh góc
+    # 1. Cân góc xoay
     if rotation_angle != 0:
         (h, w) = img.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
         img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-    # Chuyển sang ảnh Grayscale để xử lý nét sóng
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2. Khử bóng đổ và cân bằng ánh sáng nền
+    # 2. Khử bóng mờ & Đều sáng nền
     if remove_shadow:
         dilated = cv2.dilate(gray, np.ones((7, 7), np.uint8))
         bg_img = cv2.medianBlur(dilated, 21)
@@ -53,7 +51,7 @@ def preprocess_ecg(
     else:
         processed = gray
 
-    # 3. Tăng tương phản cục bộ thích ứng (CLAHE)
+    # 3. Tăng tương phản thích ứng cục bộ (CLAHE)
     if apply_clahe:
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
         processed = clahe.apply(processed)
@@ -64,7 +62,6 @@ def preprocess_ecg(
         sharpened = cv2.addWeighted(processed, 1.0 + sharpen_level, gaussian, -sharpen_level, 0)
         processed = np.clip(sharpened, 0, 255).astype(np.uint8)
 
-    # Chuyển ngược lại RGB dạng PIL để hiển thị và gửi API
     processed_rgb = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
     return Image.fromarray(processed_rgb)
 
@@ -150,32 +147,56 @@ def analyze_with_openai(api_key, model_name, base64_image, prompt):
 
 # ----------------- GIAO DIỆN CHÍNH -----------------
 st.title("🫀 Phân Tích Điện Tâm Đồ 12 Chuyển Đạo")
-st.caption("Ứng dụng AI phân tích ECG tích hợp bộ lọc tăng nét và khử nhiễu ảnh y tế")
+st.caption("Ứng dụng AI phân tích ECG - Tích hợp tiền xử lý ảnh và đối chiếu đa mô hình")
 
-# --- SIDEBAR: Cấu hình API & Tiền xử lý ---
+# --- SIDEBAR: Cấu hình mô hình & Quản lý API Key ---
 with st.sidebar:
-    st.header("⚙️ Cấu hình Mô hình")
+    st.header("⚙️ Lựa chọn Mô hình AI")
+    
     provider = st.radio(
-        "Nhà cung cấp AI:",
-        ("Google Gemini", "OpenAI (ChatGPT)", "So sánh cả 2 mô hình"),
+        "Chọn chế độ phân tích:",
+        (
+            "Google Gemini (Mặc định - Miễn phí)", 
+            "OpenAI GPT-4o (Yêu cầu Key cá nhân)", 
+            "So sánh song song (Cần Key OpenAI)"
+        ),
         index=0
     )
     
-    default_gemini_key = st.secrets.get("GEMINI_API_KEY", "")
-    default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
-    gemini_key = default_gemini_key
-    openai_key = default_openai_key
+    # Lấy key mặc định từ secrets của chủ web
+    system_gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+    system_openai_key = st.secrets.get("OPENAI_API_KEY", "")
     
-    if provider in ["Google Gemini", "So sánh cả 2 mô hình"]:
-        gemini_model = st.selectbox("Phiên bản Gemini:", ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-2.5-pro"])
-        if not default_gemini_key:
-            gemini_key = st.text_input("Gemini API Key:", type="password")
+    active_gemini_key = system_gemini_key
+    active_openai_key = ""
 
-    if provider in ["OpenAI (ChatGPT)", "So sánh cả 2 mô hình"]:
+    # 1. Cấu hình Gemini
+    if provider in ["Google Gemini (Mặc định - Miễn phí)", "So sánh song song (Cần Key OpenAI)"]:
+        gemini_model = st.selectbox("Phiên bản Gemini:", ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-2.5-pro"])
+        if system_gemini_key:
+            st.success("🟢 Đang dùng Gemini API Key hệ thống (Miễn phí)")
+        else:
+            active_gemini_key = st.text_input("Nhập Google Gemini API Key:", type="password")
+
+    # 2. Cấu hình OpenAI (Bảo vệ tài khoản cá nhân)
+    if provider in ["OpenAI GPT-4o (Yêu cầu Key cá nhân)", "So sánh song song (Cần Key OpenAI)"]:
         openai_model = st.selectbox("Phiên bản OpenAI:", ["gpt-4o", "gpt-4o-mini"])
-        if not default_openai_key:
-            openai_key = st.text_input("OpenAI API Key:", type="password")
-            
+        
+        # Nếu chủ web có cấu hình sẵn key OpenAI trong secrets thì cho phép dùng, ngược lại bắt buộc nhập
+        if system_openai_key:
+            use_system_openai = st.checkbox("Dùng key OpenAI hệ thống", value=True)
+            if use_system_openai:
+                active_openai_key = system_openai_key
+            else:
+                active_openai_key = st.text_input("Nhập OpenAI API Key cá nhân:", type="password")
+        else:
+            active_openai_key = st.text_input(
+                "Nhập OpenAI API Key cá nhân (sk-...):", 
+                type="password",
+                help="Key này chỉ lưu tạm thời trên phiên duyệt web của bạn, không bị lưu trữ lại."
+            )
+            st.caption("ℹ️ *Chế độ này yêu cầu key cá nhân để tránh phát sinh chi phí cho chủ ứng dụng.*")
+
     st.markdown("---")
     st.header("🛠️ Bộ Tiền Xử Lý Ảnh")
     enable_preprocessing = st.checkbox("Bật tiền xử lý ảnh nâng cao", value=True)
@@ -194,15 +215,15 @@ with st.sidebar:
         rot_angle = 0
 
     st.markdown("---")
-    st.header("📋 Thông tin Ca Bệnh")
+    st.header("📋 Thông tin Ca Bệnh (Tùy chọn)")
     patient_age = st.number_input("Tuổi bệnh nhân:", min_value=0, max_value=120, value=60)
     patient_sex = st.selectbox("Giới tính:", ["Nam", "Nữ", "Không xác định"])
     clinical_history = st.text_area(
         "Bệnh sử / Triệu chứng lâm sàng:",
-        placeholder="VD: Đau thắt ngực kiểu mạch vành kèm vã mồ hôi 1h, tiền căn rung nhĩ đang dùng NOAC..."
+        placeholder="VD: Đau ngực trái sau xương ức 30 phút, vã mồ hôi, tiền căn tăng huyết áp..."
     )
 
-# --- KHUNG TẢI ẢNH & HIỂN THỊ TRƯỚC / SAU ---
+# --- KHUNG TẢI ẢNH & HIỂN THỊ ---
 st.subheader("1. Tải ảnh hoặc Chụp trực tiếp")
 uploaded_file = st.file_uploader("Chọn ảnh ECG 12 chuyển đạo (JPG/PNG)", type=["jpg", "jpeg", "png"])
 enable_cam = st.checkbox("Sử dụng Camera")
@@ -217,7 +238,6 @@ final_image_to_analyze = None
 if uploaded_file is not None:
     raw_image = Image.open(uploaded_file)
     
-    # Thực hiện tiền xử lý nếu được bật
     if enable_preprocessing:
         processed_image = preprocess_ecg(
             raw_image,
@@ -229,7 +249,6 @@ if uploaded_file is not None:
         )
         final_image_to_analyze = processed_image
         
-        # Hiển thị song song ảnh gốc và ảnh sau xử lý
         col_raw, col_proc = st.columns(2)
         with col_raw:
             st.image(raw_image, caption="Ảnh gốc (Raw Image)", use_container_width=True)
@@ -244,47 +263,52 @@ full_prompt = SYSTEM_PROMPT
 if clinical_history or patient_age:
     full_prompt += f"\n\n### BỐI CẢNH LÂM SÀNG CỦA CA BỆNH:\n- Tuổi: {patient_age}\n- Giới tính: {patient_sex}\n- Thông tin thêm: {clinical_history if clinical_history else 'Không có'}\nHãy kết hợp bối cảnh này để biện luận các biến đổi trên ECG."
 
-# --- NÚT PHÂN TÍCH ---
+# --- NÚT BẮT ĐẦU PHÂN TÍCH ---
 st.markdown("---")
 if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", use_container_width=True):
     if final_image_to_analyze is None:
-        st.warning("Vui lòng tải lên hoặc chụp một ảnh ECG trước!")
+        st.warning("Vui lòng tải lên hoặc chụp một ảnh ECG trước khi phân tích!")
     else:
         base64_img = encode_image_to_base64(final_image_to_analyze)
         
-        if provider == "Google Gemini":
-            if not gemini_key:
-                st.error("Thiếu Gemini API Key!")
+        # 1. Chế độ Gemini mặc định
+        if provider == "Google Gemini (Mặc định - Miễn phí)":
+            if not active_gemini_key:
+                st.error("Chưa có Gemini API Key! Hãy cấu hình trong Secrets hoặc nhập ở menu bên trái.")
             else:
                 with st.spinner(f"Đang phân tích qua {gemini_model}..."):
                     try:
-                        res = analyze_with_gemini(gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                        res = analyze_with_gemini(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
                         st.subheader(f"📋 Báo Cáo Phân Tích ({gemini_model})")
                         st.markdown(res)
                     except Exception as e:
                         st.error(f"Lỗi: {e}")
 
-        elif provider == "OpenAI (ChatGPT)":
-            if not openai_key:
-                st.error("Thiếu OpenAI API Key!")
+        # 2. Chế độ OpenAI (Người dùng tự nhập key)
+        elif provider == "OpenAI GPT-4o (Yêu cầu Key cá nhân)":
+            if not active_openai_key:
+                st.warning("Vui lòng nhập OpenAI API Key cá nhân của bạn ở thanh bên trái để sử dụng mô hình này.")
             else:
                 with st.spinner(f"Đang phân tích qua {openai_model}..."):
                     try:
-                        res = analyze_with_openai(openai_key, openai_model, base64_img, full_prompt)
+                        res = analyze_with_openai(active_openai_key, openai_model, base64_img, full_prompt)
                         st.subheader(f"📋 Báo Cáo Phân Tích ({openai_model})")
                         st.markdown(res)
                     except Exception as e:
                         st.error(f"Lỗi: {e}")
 
-        elif provider == "So sánh cả 2 mô hình":
-            if not gemini_key or not openai_key:
-                st.error("Cần nhập cả 2 API Key để so sánh!")
+        # 3. Chế độ So sánh song song
+        elif provider == "So sánh song song (Cần Key OpenAI)":
+            if not active_gemini_key:
+                st.error("Thiếu Gemini API Key!")
+            elif not active_openai_key:
+                st.warning("Chế độ so sánh yêu cầu bạn nhập thêm OpenAI API Key cá nhân ở cột bên trái.")
             else:
                 c1, c2 = st.columns(2)
                 with c1:
                     with st.spinner(f"Đang tải {gemini_model}..."):
                         try:
-                            gemini_res = analyze_with_gemini(gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                            gemini_res = analyze_with_gemini(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
                             st.subheader(f"🔹 {gemini_model}")
                             st.markdown(gemini_res)
                         except Exception as e:
@@ -292,7 +316,7 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", use_container_
                 with c2:
                     with st.spinner(f"Đang tải {openai_model}..."):
                         try:
-                            openai_res = analyze_with_openai(openai_key, openai_model, base64_img, full_prompt)
+                            openai_res = analyze_with_openai(active_openai_key, openai_model, base64_img, full_prompt)
                             st.subheader(f"🔸 {openai_model}")
                             st.markdown(openai_res)
                         except Exception as e:
