@@ -89,7 +89,46 @@ STREAM_BUDGET_SECONDS = 90
 MAX_IMAGE_EDGE = 2400
 
 
-def analyze_with_gemini_stream(api_key, model_name, image, prompt):
+def gemini_config(model_name, thinking_level="medium"):
+    options = {"max_output_tokens": 8192}
+    # Only apply controls documented for this exact model.
+    if model_name.removeprefix("models/") == "gemini-3.8-flash":
+        options["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+    return types.GenerateContentConfig(**options)
+
+
+def probe_gemini(api_key, model_name, image=None):
+    """Small inference on the same host, key and model as the ECG request."""
+    started = time.monotonic()
+    config = gemini_config(model_name, "low")
+    config.max_output_tokens = 2048
+    contents = "Reply with only OK."
+    if image is not None:
+        # Same image and encoding as analysis; short output isolates input handling.
+        contents = [image, "Describe the image in one short sentence. Do not diagnose."]
+    try:
+        with genai.Client(
+            api_key=api_key.strip(),
+            http_options=types.HttpOptions(
+                timeout=20000, retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        ) as client:
+            result = client.models.generate_content(
+                model=model_name, contents=contents, config=config
+            )
+            answer = result.text or ""
+            if not answer.strip():
+                raise RuntimeError("API không trả văn bản; kiểm tra giới hạn token hoặc bộ lọc.")
+        return {"Model": model_name, "Bước": "Ảnh + yêu cầu ngắn" if image else "Văn bản ngắn",
+                "Kết quả": "Thành công", "Giây": round(time.monotonic()-started, 1),
+                "Chi tiết": answer}
+    except Exception as error:
+        return {"Model": model_name, "Bước": "Ảnh + yêu cầu ngắn" if image else "Văn bản ngắn",
+                "Kết quả": "Thất bại", "Giây": round(time.monotonic()-started, 1),
+                "Chi tiết": str(error)}
+
+
+def analyze_with_gemini_stream(api_key, model_name, image, prompt, thinking_level="medium"):
     with genai.Client(
         api_key=api_key.strip(),
         http_options=types.HttpOptions(
@@ -102,7 +141,7 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
         response = client.models.generate_content_stream(
             model=model_name,
             contents=[img_to_send, prompt],
-            config=types.GenerateContentConfig(max_output_tokens=4096),
+            config=gemini_config(model_name, thinking_level),
         )
         try:
             for chunk in response:
@@ -229,7 +268,7 @@ def get_secret(name, default=""):
 
 # ----------------- GIAO DIỆN CHÍNH -----------------
 st.title("🫀 Phân Tích Điện Tâm Đồ 12 Chuyển Đạo")
-st.caption("Hệ thống AI chuyên khoa Tim mạch - Phân tích sóng thời gian thực & Tiền xử lý ảnh")
+st.caption("Bản kiểm tra API v2 · AI hỗ trợ đọc ECG 12 chuyển đạo")
 
 with st.sidebar:
     st.header("⚙️ Lựa chọn Mô hình AI")
@@ -252,10 +291,31 @@ with st.sidebar:
             value=get_secret("GEMINI_MODEL", "gemini-3.8-flash"),
             help="Dùng đúng model ID mà dự án của em được phép gọi. Danh sách model không đảm bảo còn quota suy luận.",
         ).strip()
+        gemini_thinking = st.selectbox(
+            "Mức suy luận (áp dụng cho Gemini 3.8 Flash):",
+            ["medium", "low", "high"],
+            help="Low có thể giảm thời gian chờ nhưng cần đánh giá lại chất lượng đọc ECG. Không đảm bảo độ chính xác tương đương.",
+        )
         if system_gemini_key:
             st.success("🟢 Đang dùng Gemini API Key hệ thống")
         else:
             active_gemini_key = st.text_input("Nhập Google Gemini API Key:", type="password")
+
+        if st.button("Lấy danh sách model từ API"):
+            if not active_gemini_key:
+                st.warning("Cần API key để lấy danh sách model.")
+            else:
+                try:
+                    with genai.Client(api_key=active_gemini_key.strip(), http_options=types.HttpOptions(
+                        timeout=15000, retry_options=types.HttpRetryOptions(attempts=1)
+                    )) as client:
+                        names = [m.name for m in client.models.list()
+                                 if "generateContent" in (m.supported_actions or [])]
+                    st.code("\n".join(names) or "Không có model generateContent trong danh sách.")
+                    st.caption("Có tên trong danh sách chưa đảm bảo được phép phân tích ảnh hoặc còn quota.")
+                except Exception as error:
+                    st.error(friendly_api_error(error))
+                    st.code(str(error))
 
     if provider in ["OpenAI GPT-4o (Yêu cầu Key cá nhân)", "So sánh lần lượt (Cần Key OpenAI)"]:
         openai_model = st.selectbox("Phiên bản OpenAI:", ["gpt-4o", "gpt-4o-mini"])
@@ -318,6 +378,26 @@ if uploaded_file is not None:
         final_image_to_analyze = raw_image
         st.image(raw_image, caption="Ảnh ECG sử dụng trực tiếp", width="stretch")
 
+if provider in ["Google Gemini (Theo quota tài khoản)", "So sánh lần lượt (Cần Key OpenAI)"]:
+    with st.expander("🔎 Kiểm tra API khi phân tích bị timeout", expanded=False):
+        st.caption("Thử từng bước. Mỗi nút gửi một yêu cầu đến cùng model đang chọn; có thể tính phí API.")
+        if st.button("1. Thử văn bản ngắn (không gửi ảnh)"):
+            if not active_gemini_key:
+                st.warning("Vui lòng nhập API key trước.")
+            else:
+                with st.spinner("Đang thử API với văn bản ngắn..."):
+                    st.session_state["api_probe_text"] = probe_gemini(active_gemini_key, gemini_model)
+        if st.button("2. Thử ảnh đang tải + câu trả lời ngắn"):
+            if not active_gemini_key or final_image_to_analyze is None:
+                st.warning("Cần API key và ảnh trước khi thử bước 2.")
+            else:
+                with st.spinner("Đang thử API với ảnh..."):
+                    st.session_state["api_probe_image"] = probe_gemini(active_gemini_key, gemini_model, final_image_to_analyze)
+        for key in ("api_probe_text", "api_probe_image"):
+            if key in st.session_state:
+                st.json(st.session_state[key])
+        st.caption("Nếu bước 1 cũng timeout: chưa thể quy lỗi cho ảnh ECG. Nếu cả hai bước thành công nhưng phân tích đầy đủ timeout: cần kiểm tra độ dài yêu cầu, suy luận và tải máy chủ. Kết quả chỉ phản ánh thời điểm thử.")
+
 full_prompt = SYSTEM_PROMPT
 if clinical_history or patient_age:
     full_prompt += f"\n\n### BỐI CẢNH LÂM SÀNG:\n- Tuổi: {patient_age}\n- Giới tính: {patient_sex}\n- Thông tin thêm: {clinical_history if clinical_history else 'Không có'}"
@@ -334,7 +414,7 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
                 st.subheader(f"📋 Báo Cáo Phân Tích ({gemini_model})")
                 try:
                     display_analysis(
-                        analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                        analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt, thinking_level=gemini_thinking)
                     )
                 except Exception as e:
                     st.error(friendly_api_error(e))
@@ -362,7 +442,7 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
                     st.subheader(f"🔹 {gemini_model}")
                     try:
                         display_analysis(
-                            analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                            analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt, thinking_level=gemini_thinking)
                         )
                     except Exception as e:
                         st.error(f"Lỗi Gemini: {e}")
