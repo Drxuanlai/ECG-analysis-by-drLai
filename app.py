@@ -155,12 +155,28 @@ Lưu ý: Bắt đầu kết luận với lưu ý đây là công cụ AI hỗ tr
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 90
 MAX_IMAGE_EDGE = 2400
+GEMINI_MODEL = "gemini-3.6-flash"
+
+
+def build_clinical_context(age, sex, history):
+    age_text = f"{age} tuổi" if age is not None else "Chưa cung cấp"
+    sex_text = sex if sex in ("Nam", "Nữ", "Khác") else "Chưa cung cấp"
+    history_text = history.strip() or "Chưa cung cấp"
+    return (
+        "\n\n### THÔNG TIN DO NGƯỜI DÙNG CUNG CẤP:\n"
+        f"- Tuổi: {age_text}\n- Giới tính: {sex_text}\n"
+        f"- Bệnh sử / triệu chứng: {history_text}\n"
+        "Không tự điền tuổi hay giới tính khi chưa được cung cấp. Nếu đọc được thông tin "
+        "trên ảnh, phải ghi rõ nguồn là chữ in trên bản ghi, chưa được người dùng xác nhận. "
+        "Chưa cung cấp triệu chứng không có nghĩa là không có triệu chứng. "
+        "Không suy diễn dữ liệu còn thiếu từ giá trị mặc định hoặc từ hình thái ECG."
+    )
 
 
 def gemini_config(model_name, thinking_level="medium"):
     options = {"max_output_tokens": 8192}
     # Only apply controls documented for this exact model.
-    if model_name.removeprefix("models/") == "gemini-3.6-flash":
+    if model_name.removeprefix("models/") == GEMINI_MODEL:
         options["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
     return types.GenerateContentConfig(**options)
 
@@ -336,7 +352,7 @@ def get_secret(name, default=""):
 
 # ----------------- GIAO DIỆN CHÍNH -----------------
 st.title("🫀 Phân Tích Điện Tâm Đồ 12 Chuyển Đạo")
-st.caption("Bản v3 · Tự nhận diện chiều ảnh ECG")
+st.caption("Bản v4 · Gemini 3.6 Flash · Thông tin bệnh nhân tùy chọn")
 
 with st.sidebar:
     st.header("⚙️ Lựa chọn Mô hình AI")
@@ -353,14 +369,15 @@ with st.sidebar:
     active_openai_key = ""
 
     if provider in ["Google Gemini (Theo quota tài khoản)", "So sánh lần lượt (Cần Key OpenAI)"]:
-        # Cho phép cấu hình model; không suy đoán model duy nhất từ một lỗi API.
+        # Cố định model theo lựa chọn của dự án, không dùng cấu hình model cũ trong Secrets.
         gemini_model = st.text_input(
             "Tên model Gemini:",
-            value=get_secret("GEMINI_MODEL", "gemini-3.6-flash"),
-            help="Dùng đúng model ID mà dự án của em được phép gọi. Danh sách model không đảm bảo còn quota suy luận.",
+            value=GEMINI_MODEL,
+            disabled=True,
+            help="Bản này cố định Gemini 3.6 Flash theo cấu hình dự án.",
         ).strip()
         gemini_thinking = st.selectbox(
-            "Mức suy luận (áp dụng cho Gemini 3.6 Flash):",
+            "Mức suy luận Gemini 3.6 Flash:",
             ["medium", "low", "high"],
             help="Low có thể giảm thời gian chờ nhưng cần đánh giá lại chất lượng đọc ECG. Không đảm bảo độ chính xác tương đương.",
         )
@@ -407,8 +424,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("📋 Thông tin Ca Bệnh (Tùy chọn)")
-    patient_age = st.number_input("Tuổi bệnh nhân:", min_value=0, max_value=120, value=60)
-    patient_sex = st.selectbox("Giới tính:", ["Nam", "Nữ", "Không xác định"])
+    patient_age = st.number_input(
+        "Tuổi bệnh nhân (không bắt buộc):", min_value=0, max_value=120, value=None,
+        step=1, placeholder="Chưa cung cấp", key="patient_age_optional_v4",
+    )
+    patient_sex = st.selectbox(
+        "Giới tính (không bắt buộc):", ["Chưa cung cấp", "Nam", "Nữ", "Khác"],
+        key="patient_sex_optional_v4",
+    )
     clinical_history = st.text_area("Bệnh sử / Triệu chứng lâm sàng:", placeholder="VD: Đau thắt ngực trái 2 giờ trước...")
 
 st.subheader("1. Tải ảnh hoặc Chụp trực tiếp")
@@ -489,9 +512,7 @@ if provider in ["Google Gemini (Theo quota tài khoản)", "So sánh lần lư�
                 st.json(st.session_state[key])
         st.caption("Nếu bước 1 cũng timeout: chưa thể quy lỗi cho ảnh ECG. Nếu cả hai bước thành công nhưng phân tích đầy đủ timeout: cần kiểm tra độ dài yêu cầu, suy luận và tải máy chủ. Kết quả chỉ phản ánh thời điểm thử.")
 
-full_prompt = SYSTEM_PROMPT
-if clinical_history or patient_age:
-    full_prompt += f"\n\n### BỐI CẢNH LÂM SÀNG:\n- Tuổi: {patient_age}\n- Giới tính: {patient_sex}\n- Thông tin thêm: {clinical_history if clinical_history else 'Không có'}"
+full_prompt = SYSTEM_PROMPT + build_clinical_context(patient_age, patient_sex, clinical_history)
 
 st.markdown("---")
 if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch"):
