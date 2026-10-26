@@ -356,11 +356,11 @@ with st.sidebar:
         # Cho phép cấu hình model; không suy đoán model duy nhất từ một lỗi API.
         gemini_model = st.text_input(
             "Tên model Gemini:",
-            value=get_secret("GEMINI_MODEL", "gemini-3.8-flash"),
+            value=get_secret("GEMINI_MODEL", "gemini-3.6-flash"),
             help="Dùng đúng model ID mà dự án của em được phép gọi. Danh sách model không đảm bảo còn quota suy luận.",
         ).strip()
         gemini_thinking = st.selectbox(
-            "Mức suy luận (áp dụng cho Gemini 3.8 Flash):",
+            "Mức suy luận (áp dụng cho Gemini 3.6 Flash):",
             ["medium", "low", "high"],
             help="Low có thể giảm thời gian chờ nhưng cần đánh giá lại chất lượng đọc ECG. Không đảm bảo độ chính xác tương đương.",
         )
