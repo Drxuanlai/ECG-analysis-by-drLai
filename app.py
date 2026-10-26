@@ -1,14 +1,14 @@
 import streamlit as st
 from PIL import Image
-import os
 import io
 import base64
 import cv2
 import numpy as np
 from google import genai
+from google.genai import types
 from openai import OpenAI
 
-# Hỗ trợ đọc file ảnh định dạng HEIC/HEIF từ iPhone
+# Hỗ trợ đọc định dạng ảnh HEIC/HEIF từ iPhone
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
@@ -58,12 +58,12 @@ def preprocess_ecg(
     else:
         processed = gray
 
-    # 3. Tăng tương phản thích ứng cục bộ (CLAHE)
+    # 3. Tăng tương phản lưới sóng (CLAHE)
     if apply_clahe:
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
         processed = clahe.apply(processed)
 
-    # 4. Làm sắc nét viền sóng (Unsharp Masking)
+    # 4. Làm sắc nét sóng
     if sharpen_level > 0:
         gaussian = cv2.GaussianBlur(processed, (0, 0), 2.0)
         sharpened = cv2.addWeighted(processed, 1.0 + sharpen_level, gaussian, -sharpen_level, 0)
@@ -93,47 +93,44 @@ Hãy tiến hành đọc một cách chặt chẽ, tuần tự theo các bước
 - Phân tích dựa trên D1, D2, aVF.
 
 ### 4. ĐO ĐẠC HÌNH THÁI CÁC SÓNG & KHOẢNG
-- **Sóng P**: Biên độ (dày nhĩ phải nếu > 2.5mm ở DII), thời gian (dày nhĩ trái nếu > 0.12s, P hai đỉnh ở DII hoặc pha âm sâu ở V1).
-- **Khoảng PR**: Bình thường (0.12 - 0.20s), Ngắn (Hội chứng WPW, LGL), Dài (Block AV độ I, Mobitz I, Mobitz II, Block AV độ III).
+- **Sóng P**: Biên độ, thời gian, hình thái hai đỉnh hoặc pha âm sâu ở V1.
+- **Khoảng PR**: Bình thường (0.12 - 0.20s), Ngắn (WPW, LGL), Dài (Block AV độ I, II, III).
 - **Phức bộ QRS**: 
-  - Thời gian: Hẹp (< 0.12s) hay Rộng (Block nhánh Trái/Phải, nhịp tự thất)?
-  - Biên độ & Dày thất: Tiêu chuẩn Sokolow-Lyon (SV1 + RV5/V6 >= 35mm), Cornell (RaVL + SV3).
-  - Sóng Q hoại tử: Có sóng Q bệnh lý (sâu > 1/4 R, rộng >= 0.04s) ở vùng nào không?
+  - Thời gian: Hẹp (< 0.12s) hay Rộng (Block nhánh, nhịp tự thất)?
+  - Biên độ & Dày thất: Sokolow-Lyon, Cornell.
+  - Sóng Q hoại tử bệnh lý ở các đạo trình liên quan.
 - **Đoạn ST**: 
-  - Đẳng điện, chênh lên hay chênh xuống? Dạng vòm, dốc lên, dốc xuống?
-  - Định vị thành tổn thương: Trước vách (V1-V2), Trước mỏm (V3-V4), Bên (DI, aVL, V5-V6), Thành dưới (DII, DIII, aVF), Thành sau...
+  - Đẳng điện, chênh lên hay chênh xuống? Dạng vòm hay dốc?
+  - Định vị thành tổn thương: Trước vách (V1-V2), Mỏm (V3-V4), Bên (DI, aVL, V5-V6), Dưới (DII, DIII, aVF), Thành sau...
   - Hình ảnh soi gương (reciprocal changes)?
-- **Sóng T**: Chiều, biên độ, hình dạng (T âm nhọn đối xứng, T cao nhọn đối xứng...).
-- **Khoảng QTc**: Kéo dài hay bình thường?
+- **Sóng T & QTc**: Chiều, độ nhọn đối xứng, khoảng QTc kéo dài hay bình thường.
 
 ### 5. KẾT LUẬN & GỢI Ý XỬ TRÍ
-- **Kết luận điện tâm đồ**: Tóm tắt chẩn đoán ngắn gọn.
+- **Kết luận điện tâm đồ**: Tóm tắt chẩn đoán chính.
 - **Mức độ khẩn cấp**: [TỐI KHẨN CẤP / KHẨN CẤP / THEO DÕI THƯỜNG QUY].
 - **Đề xuất cận lâm sàng kết hợp**: (Troponin hs, Khí máu, Siêu âm tim tại giường, Điện giải đồ...).
 
 *Lưu ý: Luôn bắt đầu phần kết luận bằng lời nhắc: Đây là công cụ AI hỗ trợ đọc dữ liệu thô, quyết định lâm sàng cuối cùng thuộc về bác sĩ trực tiếp khám bệnh.*
 """
 
-# ----------------- HÀM GỌI API (STREAMING & RESIZING) -----------------
-from google.genai import types  # Đảm bảo có import types ở đầu file hoặc dùng trực tiếp
-
+# ----------------- HÀM GỌI API (STREAMING & AUTO-OPTIMIZED) -----------------
 def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     clean_key = api_key.strip()
     
-    # 1. Chuẩn hóa kích thước ảnh (1600px sắc nét từng ô ly 1mm)
+    # 1. Tối ưu kích thước ảnh (1400px sắc nét từng ô 1mm, nén nhẹ để truyền trong 0.5s)
     img_to_send = image.copy()
-    max_dimension = 1600
+    max_dimension = 1400
     if max(img_to_send.size) > max_dimension:
         img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     
     buf = io.BytesIO()
-    img_to_send.convert("RGB").save(buf, format="JPEG", quality=85)
+    img_to_send.convert("RGB").save(buf, format="JPEG", quality=80)
     img_bytes = buf.getvalue()
 
-    # 2. Đặt timeout 120s
+    # 2. Khởi tạo Client với Timeout 45 giây
     client = genai.Client(
         api_key=clean_key,
-        http_options={'timeout': 120.0}
+        http_options={'timeout': 45.0}
     )
 
     contents = [
@@ -141,43 +138,28 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
         prompt
     ]
 
-    # 3. ÉP TẮT HOÀN TOÀN SUY NGHĨ NGẦM (thinking_budget = 0)
-    # Nhờ vậy AI sẽ xuất chữ ra ngay lập tức, không làm kẹt luồng stream
+    # 3. Tắt thinking ngầm để tránh nghẽn luồng và đẩy kết quả ra ngay
     config = types.GenerateContentConfig(
         thinking_config=types.ThinkingConfig(thinking_budget=0),
         temperature=0.1
     )
 
-    models_to_try = [model_name]
-    fallback_model = "gemini-2.0-flash" if model_name != "gemini-2.0-flash" else "gemini-1.5-flash"
-    models_to_try.append(fallback_model)
+    response = client.models.generate_content_stream(
+        model=model_name,
+        contents=contents,
+        config=config
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
 
-    last_error = None
-    for current_model in models_to_try:
-        try:
-            response = client.models.generate_content_stream(
-                model=current_model,
-                contents=contents,
-                config=config
-            )
-            for chunk in response:
-                if chunk.text:
-                    yield chunk.text
-            return  # Hoàn thành, thoát hàm
-        except Exception as e:
-            last_error = e
-            # Nếu model không hỗ trợ, thử model tiếp theo trong danh sách
-            continue
-
-    if last_error:
-        raise last_error
 def encode_image_to_base64(pil_image):
     buffered = io.BytesIO()
     rgb_image = pil_image.convert('RGB')
-    max_dimension = 2048
+    max_dimension = 1400
     if max(rgb_image.size) > max_dimension:
         rgb_image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
-    rgb_image.save(buffered, format="JPEG", quality=90)
+    rgb_image.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 def analyze_with_openai_stream(api_key, model_name, base64_image, prompt):
@@ -236,10 +218,10 @@ with st.sidebar:
         gemini_model = st.selectbox(
             "Phiên bản Gemini:",
             [
-                "gemini-3.8-flash",       # Phiên bản chuẩn hiện hành
-                "gemini-3.8-pro",
-                "gemini-3-flash",
-                "gemini-2.0-flash"
+                "gemini-2.0-flash",       # Ưu tiên tính ổn định cao, không timeout
+                "gemini-3.8-flash",
+                "gemini-2.5-flash",
+                "gemini-1.5-flash"
             ],
             index=0
         )
@@ -325,7 +307,7 @@ if uploaded_file is not None:
         final_image_to_analyze = raw_image
         st.image(raw_image, caption="Ảnh ECG sử dụng trực tiếp", width="stretch")
 
-# Chuẩn bị Prompt
+# Chuẩn bị Prompt kết hợp lâm sàng
 full_prompt = SYSTEM_PROMPT
 if clinical_history or patient_age:
     full_prompt += f"\n\n### BỐI CẢNH LÂM SÀNG CỦA CA BỆNH:\n- Tuổi: {patient_age}\n- Giới tính: {patient_sex}\n- Thông tin thêm: {clinical_history if clinical_history else 'Không có'}\nHãy kết hợp bối cảnh này để biện luận các biến đổi trên ECG."
@@ -336,20 +318,33 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
     if final_image_to_analyze is None:
         st.warning("Vui lòng tải lên hoặc chụp một ảnh ECG trước khi phân tích!")
     else:
-        # 1. Chế độ Gemini mặc định
+        # 1. Chế độ Google Gemini
         if provider == "Google Gemini (Mặc định - Miễn phí)":
             if not active_gemini_key:
                 st.error("Chưa có Gemini API Key! Hãy cấu hình trong Secrets hoặc nhập ở menu bên trái.")
             else:
-                st.subheader(f"📋 Báo Cáo Phân Tích ({gemini_model})")
-                try:
-                    st.write_stream(
-                        analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
-                    )
-                except Exception as e:
-                    st.error(f"Lỗi: {e}")
+                fallback_candidates = [gemini_model]
+                for fb in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.8-flash"]:
+                    if fb not in fallback_candidates:
+                        fallback_candidates.append(fb)
 
-        # 2. Chế độ OpenAI
+                success = False
+                for target_model in fallback_candidates:
+                    try:
+                        st.subheader(f"📋 Báo Cáo Phân Tích ({target_model})")
+                        st.write_stream(
+                            analyze_with_gemini_stream(active_gemini_key, target_model, final_image_to_analyze, full_prompt)
+                        )
+                        success = True
+                        break
+                    except Exception as e:
+                        st.warning(f"⚠️ {target_model} phản hồi chậm hoặc nghẽn kết nối. Đang tự động chuyển sang mô hình dự phòng...")
+                        continue
+
+                if not success:
+                    st.error("Không thể kết nối đến máy chủ Google lúc này. Vui lòng thử lại sau ít phút.")
+
+        # 2. Chế độ OpenAI GPT-4o
         elif provider == "OpenAI GPT-4o (Yêu cầu Key cá nhân)":
             if not active_openai_key:
                 st.warning("Vui lòng nhập OpenAI API Key cá nhân của bạn ở thanh bên trái.")
