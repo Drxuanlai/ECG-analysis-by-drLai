@@ -8,6 +8,13 @@ import numpy as np
 from google import genai
 from openai import OpenAI
 
+# Hỗ trợ đọc file ảnh định dạng HEIC/HEIF từ iPhone
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 # ----------------- CẤU HÌNH TRANG -----------------
 st.set_page_config(
     page_title="AI 12-Lead ECG Expert",
@@ -107,25 +114,37 @@ Hãy tiến hành đọc một cách chặt chẽ, tuần tự theo các bước
 *Lưu ý: Luôn bắt đầu phần kết luận bằng lời nhắc: Đây là công cụ AI hỗ trợ đọc dữ liệu thô, quyết định lâm sàng cuối cùng thuộc về bác sĩ trực tiếp khám bệnh.*
 """
 
+# ----------------- HÀM GỌI API (STREAMING & RESIZING) -----------------
+def analyze_with_gemini_stream(api_key, model_name, image, prompt):
+    clean_key = api_key.strip()
+    client = genai.Client(api_key=clean_key)
+    
+    # Tự động nén ảnh về kích thước chuẩn tránh nghẽn luồng
+    img_to_send = image.copy()
+    max_dimension = 2048
+    if max(img_to_send.size) > max_dimension:
+        img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    
+    # Truyền phát dữ liệu thời gian thực
+    response = client.models.generate_content_stream(
+        model=model_name,
+        contents=[img_to_send, prompt]
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+
 def encode_image_to_base64(pil_image):
     buffered = io.BytesIO()
     rgb_image = pil_image.convert('RGB')
-    rgb_image.save(buffered, format="JPEG", quality=95)
+    max_dimension = 2048
+    if max(rgb_image.size) > max_dimension:
+        rgb_image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    rgb_image.save(buffered, format="JPEG", quality=90)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-def analyze_with_gemini(api_key, model_name, image, prompt):
-    clean_key = api_key.strip()
-    # Khởi tạo client truyền trực tiếp api_key
-    client = genai.Client(api_key=clean_key)
-    
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[image, prompt]
-    )
-    return response.text
-
-def analyze_with_openai(api_key, model_name, base64_image, prompt):
-    client = OpenAI(api_key=api_key)
+def analyze_with_openai_stream(api_key, model_name, base64_image, prompt):
+    client = OpenAI(api_key=api_key.strip())
     response = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -144,13 +163,16 @@ def analyze_with_openai(api_key, model_name, base64_image, prompt):
             }
         ],
         max_tokens=2500,
-        temperature=0.2
+        temperature=0.2,
+        stream=True
     )
-    return response.choices[0].message.content
+    for chunk in response:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
 
 # ----------------- GIAO DIỆN CHÍNH -----------------
 st.title("🫀 Phân Tích Điện Tâm Đồ 12 Chuyển Đạo")
-st.caption("Ứng dụng AI phân tích ECG - Tích hợp tiền xử lý ảnh và đối chiếu đa mô hình")
+st.caption("Hệ thống AI chuyên khoa Tim mạch - Phân tích sóng thời gian thực & Tiền xử lý ảnh")
 
 # --- SIDEBAR: Cấu hình mô hình & Quản lý API Key ---
 with st.sidebar:
@@ -166,7 +188,6 @@ with st.sidebar:
         index=0
     )
     
-    # Lấy key mặc định từ secrets của chủ web
     system_gemini_key = st.secrets.get("GEMINI_API_KEY", "")
     system_openai_key = st.secrets.get("OPENAI_API_KEY", "")
     
@@ -175,33 +196,33 @@ with st.sidebar:
 
     # 1. Cấu hình Gemini
     if provider in ["Google Gemini (Mặc định - Miễn phí)", "So sánh song song (Cần Key OpenAI)"]:
-        gemini_model = st.selectbox("Phiên bản Gemini:", ["gemini-3.8-flash",       # Phiên bản mới nhất được khuyến nghị
-        "gemini-3.8-pro",
-        "gemini-3-flash",
-        "gemini-2.0-flash"])
+        gemini_model = st.selectbox(
+            "Phiên bản Gemini:",
+            [
+                "gemini-3.8-flash",       # Phiên bản chuẩn hiện hành
+                "gemini-3.8-pro",
+                "gemini-3-flash",
+                "gemini-2.0-flash"
+            ],
+            index=0
+        )
         if system_gemini_key:
-            st.success("🟢 Đang dùng Gemini API Key hệ thống (Miễn phí)")
+            st.success("🟢 Đang dùng Gemini API Key hệ thống")
         else:
             active_gemini_key = st.text_input("Nhập Google Gemini API Key:", type="password")
 
-    # 2. Cấu hình OpenAI (Bảo vệ tài khoản cá nhân)
+    # 2. Cấu hình OpenAI
     if provider in ["OpenAI GPT-4o (Yêu cầu Key cá nhân)", "So sánh song song (Cần Key OpenAI)"]:
         openai_model = st.selectbox("Phiên bản OpenAI:", ["gpt-4o", "gpt-4o-mini"])
-        
-        # Nếu chủ web có cấu hình sẵn key OpenAI trong secrets thì cho phép dùng, ngược lại bắt buộc nhập
         if system_openai_key:
-            use_system_openai = st.checkbox("Dùng key OpenAI hệ thống", value=True)
-            if use_system_openai:
-                active_openai_key = system_openai_key
-            else:
-                active_openai_key = st.text_input("Nhập OpenAI API Key cá nhân:", type="password")
+            use_sys_openai = st.checkbox("Dùng key OpenAI hệ thống", value=True)
+            active_openai_key = system_openai_key if use_sys_openai else st.text_input("Nhập OpenAI API Key cá nhân:", type="password")
         else:
             active_openai_key = st.text_input(
                 "Nhập OpenAI API Key cá nhân (sk-...):", 
                 type="password",
-                help="Key này chỉ lưu tạm thời trên phiên duyệt web của bạn, không bị lưu trữ lại."
+                help="Key chỉ lưu tạm trên phiên duyệt web của bạn, không bị lưu trữ."
             )
-            st.caption("ℹ️ *Chế độ này yêu cầu key cá nhân để tránh phát sinh chi phí cho chủ ứng dụng.*")
 
     st.markdown("---")
     st.header("🛠️ Bộ Tiền Xử Lý Ảnh")
@@ -226,12 +247,15 @@ with st.sidebar:
     patient_sex = st.selectbox("Giới tính:", ["Nam", "Nữ", "Không xác định"])
     clinical_history = st.text_area(
         "Bệnh sử / Triệu chứng lâm sàng:",
-        placeholder="VD: Đau ngực trái sau xương ức 30 phút, vã mồ hôi, tiền căn tăng huyết áp..."
+        placeholder="VD: Đau ngực trái dữ dội lan ra vai trái 2 giờ trước, tiền căn tăng huyết áp..."
     )
 
 # --- KHUNG TẢI ẢNH & HIỂN THỊ ---
 st.subheader("1. Tải ảnh hoặc Chụp trực tiếp")
-uploaded_file = st.file_uploader("Chọn ảnh ECG 12 chuyển đạo (JPG/PNG)", type=["jpg", "jpeg", "png", "jfif", "webp", "bmp"])
+uploaded_file = st.file_uploader(
+    "Chọn ảnh ECG 12 chuyển đạo", 
+    type=["jpg", "jpeg", "png", "jfif", "webp", "bmp", "heic", "heif"]
+)
 enable_cam = st.checkbox("Sử dụng Camera")
 if enable_cam:
     cam_file = st.camera_input("Chụp ảnh ECG")
@@ -257,12 +281,12 @@ if uploaded_file is not None:
         
         col_raw, col_proc = st.columns(2)
         with col_raw:
-            st.image(raw_image, caption="Ảnh gốc (Raw Image)", use_container_width=True)
+            st.image(raw_image, caption="Ảnh gốc (Raw Image)", width="stretch")
         with col_proc:
-            st.image(processed_image, caption="Ảnh sau tiền xử lý (Sẽ gửi vào AI)", use_container_width=True)
+            st.image(processed_image, caption="Ảnh sau tiền xử lý (Sẽ gửi vào AI)", width="stretch")
     else:
         final_image_to_analyze = raw_image
-        st.image(raw_image, caption="Ảnh ECG sử dụng trực tiếp", use_container_width=True)
+        st.image(raw_image, caption="Ảnh ECG sử dụng trực tiếp", width="stretch")
 
 # Chuẩn bị Prompt
 full_prompt = SYSTEM_PROMPT
@@ -271,37 +295,36 @@ if clinical_history or patient_age:
 
 # --- NÚT BẮT ĐẦU PHÂN TÍCH ---
 st.markdown("---")
-if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", use_container_width=True):
+if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch"):
     if final_image_to_analyze is None:
         st.warning("Vui lòng tải lên hoặc chụp một ảnh ECG trước khi phân tích!")
     else:
-        base64_img = encode_image_to_base64(final_image_to_analyze)
-        
         # 1. Chế độ Gemini mặc định
         if provider == "Google Gemini (Mặc định - Miễn phí)":
             if not active_gemini_key:
                 st.error("Chưa có Gemini API Key! Hãy cấu hình trong Secrets hoặc nhập ở menu bên trái.")
             else:
-                with st.spinner(f"Đang phân tích qua {gemini_model}..."):
-                    try:
-                        res = analyze_with_gemini(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
-                        st.subheader(f"📋 Báo Cáo Phân Tích ({gemini_model})")
-                        st.markdown(res)
-                    except Exception as e:
-                        st.error(f"Lỗi: {e}")
+                st.subheader(f"📋 Báo Cáo Phân Tích ({gemini_model})")
+                try:
+                    st.write_stream(
+                        analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                    )
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
 
-        # 2. Chế độ OpenAI (Người dùng tự nhập key)
+        # 2. Chế độ OpenAI
         elif provider == "OpenAI GPT-4o (Yêu cầu Key cá nhân)":
             if not active_openai_key:
-                st.warning("Vui lòng nhập OpenAI API Key cá nhân của bạn ở thanh bên trái để sử dụng mô hình này.")
+                st.warning("Vui lòng nhập OpenAI API Key cá nhân của bạn ở thanh bên trái.")
             else:
-                with st.spinner(f"Đang phân tích qua {openai_model}..."):
-                    try:
-                        res = analyze_with_openai(active_openai_key, openai_model, base64_img, full_prompt)
-                        st.subheader(f"📋 Báo Cáo Phân Tích ({openai_model})")
-                        st.markdown(res)
-                    except Exception as e:
-                        st.error(f"Lỗi: {e}")
+                base64_img = encode_image_to_base64(final_image_to_analyze)
+                st.subheader(f"📋 Báo Cáo Phân Tích ({openai_model})")
+                try:
+                    st.write_stream(
+                        analyze_with_openai_stream(active_openai_key, openai_model, base64_img, full_prompt)
+                    )
+                except Exception as e:
+                    st.error(f"Lỗi: {e}")
 
         # 3. Chế độ So sánh song song
         elif provider == "So sánh song song (Cần Key OpenAI)":
@@ -310,20 +333,21 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", use_container_
             elif not active_openai_key:
                 st.warning("Chế độ so sánh yêu cầu bạn nhập thêm OpenAI API Key cá nhân ở cột bên trái.")
             else:
+                base64_img = encode_image_to_base64(final_image_to_analyze)
                 c1, c2 = st.columns(2)
                 with c1:
-                    with st.spinner(f"Đang tải {gemini_model}..."):
-                        try:
-                            gemini_res = analyze_with_gemini(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
-                            st.subheader(f"🔹 {gemini_model}")
-                            st.markdown(gemini_res)
-                        except Exception as e:
-                            st.error(f"Gemini Lỗi: {e}")
+                    st.subheader(f"🔹 {gemini_model}")
+                    try:
+                        st.write_stream(
+                            analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
+                        )
+                    except Exception as e:
+                        st.error(f"Gemini Lỗi: {e}")
                 with c2:
-                    with st.spinner(f"Đang tải {openai_model}..."):
-                        try:
-                            openai_res = analyze_with_openai(active_openai_key, openai_model, base64_img, full_prompt)
-                            st.subheader(f"🔸 {openai_model}")
-                            st.markdown(openai_res)
-                        except Exception as e:
-                            st.error(f"OpenAI Lỗi: {e}")
+                    st.subheader(f"🔸 {openai_model}")
+                    try:
+                        st.write_stream(
+                            analyze_with_openai_stream(active_openai_key, openai_model, base64_img, full_prompt)
+                        )
+                    except Exception as e:
+                        st.error(f"OpenAI Lỗi: {e}")
