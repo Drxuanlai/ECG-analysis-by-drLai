@@ -8,6 +8,11 @@ from openai import OpenAI
 import io
 import base64
 import time
+import csv
+import hashlib
+import re
+import shutil
+import subprocess
 
 # Hỗ trợ ảnh chụp iPhone (HEIC/HEIF)
 try:
@@ -21,6 +26,69 @@ st.set_page_config(
     page_icon="🫀",
     layout="wide"
 )
+
+# OCR runs locally. It detects readable ECG labels, not waveform polarity.
+# Angles are COUNTERCLOCKWISE relative to the EXIF-corrected image.
+def rotate_quarter_turn(image, angle):
+    rotations = {
+        90: Image.Transpose.ROTATE_90,
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_270,
+    }
+    return image.transpose(rotations[angle]) if angle in rotations else image.copy()
+
+
+def score_ecg_labels(tsv):
+    weights = {"avr": 4, "avl": 4, "avf": 4,
+               "v1": 2.5, "v2": 2.5, "v3": 2.5,
+               "v4": 2.5, "v5": 2.5, "v6": 2.5,
+               "rhythm": 5, "bpm": 4, "mmmv": 4, "mv": 2,
+               "filter": 3, "mms": 3}
+    hits = {}
+    for row in csv.DictReader(io.StringIO(tsv), delimiter="\t"):
+        try:
+            confidence = float(row.get("conf", -1))
+        except (TypeError, ValueError):
+            continue
+        token = re.sub(r"[^a-z0-9]", "", row.get("text", "").lower())
+        if confidence >= 30 and token in weights:
+            hits[token] = max(hits.get(token, 0), weights[token] * confidence / 100)
+    return sum(hits.values()), len(hits)
+
+
+def detect_ecg_orientation(image):
+    executable = shutil.which("tesseract")
+    if not executable:
+        return {"angle": 0, "detected": False,
+                "message": "Chưa có bộ nhận diện chiều ảnh. Thêm packages.txt rồi Reboot app; hiện có thể xoay tay."}
+    probe = image.convert("RGB")
+    probe.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+    candidates = []
+    failed = 0
+    for angle in (0, 90, 180, 270):
+        buffer = io.BytesIO()
+        rotate_quarter_turn(probe, angle).save(buffer, format="PNG")
+        try:
+            result = subprocess.run(
+                [executable, "stdin", "stdout", "--psm", "11", "-l", "eng", "tsv"],
+                input=buffer.getvalue(), capture_output=True, timeout=5, check=True,
+            )
+            score, count = score_ecg_labels(result.stdout.decode("utf-8", errors="replace"))
+            candidates.append((score, count, angle))
+        except (subprocess.SubprocessError, OSError):
+            failed += 1
+    candidates.sort(reverse=True)
+    # If a candidate could not be tested, don't silently choose among the rest.
+    if failed or len(candidates) != 4:
+        return {"angle": 0, "detected": False,
+                "message": "Nhận diện chữ chưa hoàn tất. Giữ nguyên ảnh; em có thể xoay tay bên dưới."}
+    best, second = candidates[0], candidates[1]
+    if best[0] < 6 or best[1] < 2 or best[0] - second[0] < 3:
+        return {"angle": 0, "detected": False,
+                "message": "Chưa đủ dấu hiệu để tự xác định chiều. Giữ nguyên ảnh; hãy kiểm tra và xoay tay."}
+    return {"angle": best[2], "detected": True,
+            "message": "Đã nhận diện chiều dựa trên chữ và nhãn ECG. Hãy kiểm tra ảnh trước khi phân tích."}
+
 
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
@@ -64,7 +132,7 @@ SYSTEM_PROMPT = """
 Bạn là một chuyên gia Tim mạch can thiệp và Điện sinh lý học tim.
 Hãy đọc và phân tích hình ảnh Điện tâm đồ 12 chuyển đạo tiêu chuẩn theo trình tự:
 
-1. ĐÁNH GIÁ KỸ THUẬT: Test biên độ (mm/mV), Tốc độ kéo giấy (mm/s), Độ nhiễu, Mắc ngược điện cực (aVR).
+1. ĐÁNH GIÁ KỸ THUẬT: Đọc chuẩn biên độ (mm/mV) RIÊNG từng nhóm chuyển đạo; có thể chuyển đạo chi là 10 mm/mV, chuyển đạo ngực là 5 mm/mV. Quy đổi về mV hoặc chuẩn 10 mm/mV trước khi áp dụng tiêu chuẩn điện thế. Không mặc định toàn bộ bản ghi dùng cùng độ khuếch đại. Test biên độ (mm/mV), Tốc độ kéo giấy (mm/s), Độ nhiễu, Mắc ngược điện cực (aVR).
 2. TẦN SỐ & NHỊP: Tần số (ck/p), Nhịp xoang hay rối loạn nhịp (Rung nhĩ, cuồng nhĩ, ngoại tâm thu...).
 3. TRỤC ĐIỆN TIM: Bình thường, lệch trái, lệch phải hay vô định.
 4. HÌNH THÁI SÓNG & KHOẢNG:
@@ -74,8 +142,8 @@ Hãy đọc và phân tích hình ảnh Điện tâm đồ 12 chuyển đạo ti
    - Đoạn ST (đẳng điện, chênh lên, chênh xuống, vị trí thành cơ tim tổn thương, hình ảnh soi gương).
    - Sóng T và khoảng QTc.
 5. KẾT LUẬN & GỢI Ý XỬ TRÍ:
-   - Chẩn đoán ECG chính.
-   - Mức độ khẩn cấp (TỐI KHẨN CẤP / KHẨN CẤP / THƯỜNG QUY).
+   - Chẩn đoán ECG chính, kèm bằng chứng. Nếu nghi LVH phải nêu tiêu chuẩn và số đo sau quy đổi; không kết luận LV strain nếu không mô tả được ST chênh xuống/T âm ở chuyển đạo bên cụ thể.
+   - Mức độ khẩn cấp dựa trên ECG VÀ triệu chứng, dấu hiệu sinh tồn. Nếu thiếu lâm sàng, ghi chưa đủ dữ kiện phân tầng; không kết luận thường quy hay loại trừ hội chứng vành cấp chỉ từ ECG.
    - Đề xuất cận lâm sàng kết hợp (Troponin hs, Siêu âm tim, Khí máu...).
 
 Không bịa số đo khi lưới, nhãn chuyển đạo hoặc chuẩn biên độ/tốc độ không đọc rõ; ghi rõ không xác định được.
@@ -268,7 +336,7 @@ def get_secret(name, default=""):
 
 # ----------------- GIAO DIỆN CHÍNH -----------------
 st.title("🫀 Phân Tích Điện Tâm Đồ 12 Chuyển Đạo")
-st.caption("Bản kiểm tra API v2 · AI hỗ trợ đọc ECG 12 chuyển đạo")
+st.caption("Bản v3 · Tự nhận diện chiều ảnh ECG")
 
 with st.sidebar:
     st.header("⚙️ Lựa chọn Mô hình AI")
@@ -357,7 +425,30 @@ raw_image = None
 final_image_to_analyze = None
 
 if uploaded_file is not None:
-    raw_image = ImageOps.exif_transpose(Image.open(uploaded_file)).convert("RGB")
+    uploaded_bytes = uploaded_file.getvalue()
+    image_id = hashlib.sha256(uploaded_bytes).hexdigest()[:16]
+    original_image = ImageOps.exif_transpose(Image.open(io.BytesIO(uploaded_bytes))).convert("RGB")
+    st.markdown("**Chiều ảnh ECG**")
+    auto_orientation = st.checkbox("Tự nhận diện và xoay đúng chiều", value=True)
+    if auto_orientation:
+        cache = st.session_state.get("orientation_result", {})
+        if cache.get("image_id") != image_id:
+            with st.spinner("Đang nhận diện chiều ảnh trên máy chủ, không gọi AI..."):
+                cache = {"image_id": image_id, **detect_ecg_orientation(original_image)}
+            st.session_state["orientation_result"] = cache
+        auto_angle = cache["angle"]
+        if cache["detected"]:
+            st.caption(cache["message"] + f" Góc tự xoay: {auto_angle}° ngược chiều kim đồng hồ.")
+        else:
+            st.warning(cache["message"])
+    else:
+        auto_angle = 0
+    manual_angle = st.selectbox(
+        "Xoay thêm bằng tay (ngược chiều kim đồng hồ):",
+        [0, 90, 180, 270], format_func=lambda value: f"{value}°",
+        key=f"manual_rotation_{image_id}",
+    )
+    raw_image = rotate_quarter_turn(original_image, (auto_angle + manual_angle) % 360)
     raw_image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
     if enable_preprocessing:
         processed_image = preprocess_ecg(
@@ -371,12 +462,12 @@ if uploaded_file is not None:
         final_image_to_analyze = processed_image
         c_raw, c_proc = st.columns(2)
         with c_raw:
-            st.image(raw_image, caption="Ảnh gốc (Raw Image)", width="stretch")
+            st.image(raw_image, caption="Ảnh sau chỉnh chiều, chưa tăng tương phản", width="stretch")
         with c_proc:
             st.image(processed_image, caption="Ảnh sau tiền xử lý (Sẽ gửi vào AI)", width="stretch")
     else:
         final_image_to_analyze = raw_image
-        st.image(raw_image, caption="Ảnh ECG sử dụng trực tiếp", width="stretch")
+        st.image(raw_image, caption="Ảnh sau chỉnh chiều — sẽ gửi để phân tích", width="stretch")
 
 if provider in ["Google Gemini (Theo quota tài khoản)", "So sánh lần lượt (Cần Key OpenAI)"]:
     with st.expander("🔎 Kiểm tra API khi phân tích bị timeout", expanded=False):
