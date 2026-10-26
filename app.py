@@ -160,7 +160,7 @@ MAX_IMAGE_EDGE = 2400
 def gemini_config(model_name, thinking_level="medium"):
     options = {"max_output_tokens": 8192}
     # Only apply controls documented for this exact model.
-    if model_name.removeprefix("models/") == "gemini-3.8-flash":
+    if model_name.removeprefix("models/") == "gemini-3.6-flash":
         options["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
     return types.GenerateContentConfig(**options)
 
