@@ -117,22 +117,54 @@ Hãy tiến hành đọc một cách chặt chẽ, tuần tự theo các bước
 # ----------------- HÀM GỌI API (STREAMING & RESIZING) -----------------
 def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     clean_key = api_key.strip()
-    client = genai.Client(api_key=clean_key)
     
-    # Tự động nén ảnh về kích thước chuẩn tránh nghẽn luồng
+    # Tối ưu kích thước & nén ảnh sang Bytes (tránh nghẽn mạng)
     img_to_send = image.copy()
-    max_dimension = 2048
+    max_dimension = 1800
     if max(img_to_send.size) > max_dimension:
         img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     
-    # Truyền phát dữ liệu thời gian thực
-    response = client.models.generate_content_stream(
-        model=model_name,
-        contents=[img_to_send, prompt]
+    buf = io.BytesIO()
+    img_to_send.convert("RGB").save(buf, format="JPEG", quality=85)
+    img_bytes = buf.getvalue()
+
+    client = genai.Client(
+        api_key=clean_key,
+        http_options={'timeout': 30.0}
     )
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
+
+    contents = [
+        genai.types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+        prompt
+    ]
+
+    # Danh sách dự phòng: nếu model chính bị 503 (quá tải), tự nhảy sang model phụ
+    models_to_try = [model_name]
+    fallback_model = "gemini-2.0-flash" if model_name != "gemini-2.0-flash" else "gemini-1.5-flash"
+    models_to_try.append(fallback_model)
+
+    last_error = None
+    for current_model in models_to_try:
+        try:
+            response = client.models.generate_content_stream(
+                model=current_model,
+                contents=contents
+            )
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+            return  # Chạy thành công thì kết thúc hàm
+        except Exception as e:
+            err_msg = str(e)
+            last_error = e
+            # Nếu gặp lỗi quá tải 503 hoặc 429 thì thử model dự phòng tiếp theo
+            if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg:
+                continue
+            else:
+                raise e
+
+    if last_error:
+        raise last_error
 
 def encode_image_to_base64(pil_image):
     buffered = io.BytesIO()
