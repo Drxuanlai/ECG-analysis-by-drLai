@@ -114,7 +114,10 @@ def encode_image_to_base64(pil_image):
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 def analyze_with_gemini(api_key, model_name, image, prompt):
-    client = genai.Client(api_key=api_key)
+    clean_key = api_key.strip()
+    # Khởi tạo client truyền trực tiếp api_key
+    client = genai.Client(api_key=clean_key)
+    
     response = client.models.generate_content(
         model=model_name,
         contents=[image, prompt]
