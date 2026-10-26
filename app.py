@@ -118,19 +118,20 @@ Hãy tiến hành đọc một cách chặt chẽ, tuần tự theo các bước
 def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     clean_key = api_key.strip()
     
-    # Tối ưu kích thước & nén ảnh sang Bytes (tránh nghẽn mạng)
+    # 1. Tối ưu kích thước ảnh chuẩn tốc độ cao (1400px đủ đọc rõ lưới mm)
     img_to_send = image.copy()
-    max_dimension = 1800
+    max_dimension = 1400
     if max(img_to_send.size) > max_dimension:
         img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     
     buf = io.BytesIO()
-    img_to_send.convert("RGB").save(buf, format="JPEG", quality=85)
+    img_to_send.convert("RGB").save(buf, format="JPEG", quality=80)
     img_bytes = buf.getvalue()
 
+    # 2. Tăng thời gian chờ lên 90 giây
     client = genai.Client(
         api_key=clean_key,
-        http_options={'timeout': 30.0}
+        http_options={'timeout': 90.0}
     )
 
     contents = [
@@ -138,7 +139,7 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
         prompt
     ]
 
-    # Danh sách dự phòng: nếu model chính bị 503 (quá tải), tự nhảy sang model phụ
+    # Danh sách dự phòng: nếu model chính bị nghẽn/timeout, tự chuyển sang model khác
     models_to_try = [model_name]
     fallback_model = "gemini-2.0-flash" if model_name != "gemini-2.0-flash" else "gemini-1.5-flash"
     models_to_try.append(fallback_model)
@@ -153,19 +154,18 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
             for chunk in response:
                 if chunk.text:
                     yield chunk.text
-            return  # Chạy thành công thì kết thúc hàm
+            return  # Hoàn tất thành công
         except Exception as e:
-            err_msg = str(e)
+            err_msg = str(e).lower()
             last_error = e
-            # Nếu gặp lỗi quá tải 503 hoặc 429 thì thử model dự phòng tiếp theo
-            if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg:
+            # Tự động nhảy sang model dự phòng nếu gặp lỗi quá tải (503), nghẽn mạng (timed out), hoặc giới hạn (429)
+            if any(err_code in err_msg for err_code in ["503", "unavailable", "429", "timed out", "timeout"]):
                 continue
             else:
                 raise e
 
     if last_error:
         raise last_error
-
 def encode_image_to_base64(pil_image):
     buffered = io.BytesIO()
     rgb_image = pil_image.convert('RGB')
