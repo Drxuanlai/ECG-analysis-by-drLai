@@ -115,23 +115,25 @@ Hãy tiến hành đọc một cách chặt chẽ, tuần tự theo các bước
 """
 
 # ----------------- HÀM GỌI API (STREAMING & RESIZING) -----------------
+from google.genai import types  # Đảm bảo có import types ở đầu file hoặc dùng trực tiếp
+
 def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     clean_key = api_key.strip()
     
-    # 1. Tối ưu kích thước ảnh chuẩn tốc độ cao (1400px đủ đọc rõ lưới mm)
+    # 1. Tối ưu kích thước ảnh (1200px là lý tưởng nhất để vừa nét vừa truyền siêu tốc)
     img_to_send = image.copy()
-    max_dimension = 1400
+    max_dimension = 1800
     if max(img_to_send.size) > max_dimension:
         img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     
     buf = io.BytesIO()
-    img_to_send.convert("RGB").save(buf, format="JPEG", quality=80)
+    img_to_send.convert("RGB").save(buf, format="JPEG", quality=85)
     img_bytes = buf.getvalue()
 
-    # 2. Tăng thời gian chờ lên 90 giây
+    # 2. Khởi tạo Client
     client = genai.Client(
         api_key=clean_key,
-        http_options={'timeout': 90.0}
+        http_options={'timeout': 60.0}
     )
 
     contents = [
@@ -139,7 +141,12 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
         prompt
     ]
 
-    # Danh sách dự phòng: nếu model chính bị nghẽn/timeout, tự chuyển sang model khác
+    # 3. QUAN TRỌNG: Tắt Thinking để AI nhả kết quả ngay lập tức
+    config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),  # Tắt suy luận ngầm
+        temperature=0.1
+    )
+
     models_to_try = [model_name]
     fallback_model = "gemini-2.0-flash" if model_name != "gemini-2.0-flash" else "gemini-1.5-flash"
     models_to_try.append(fallback_model)
@@ -147,22 +154,30 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     last_error = None
     for current_model in models_to_try:
         try:
+            # Thử gọi có tắt thinking
             response = client.models.generate_content_stream(
                 model=current_model,
-                contents=contents
+                contents=contents,
+                config=config
             )
             for chunk in response:
                 if chunk.text:
                     yield chunk.text
-            return  # Hoàn tất thành công
+            return
         except Exception as e:
-            err_msg = str(e).lower()
-            last_error = e
-            # Tự động nhảy sang model dự phòng nếu gặp lỗi quá tải (503), nghẽn mạng (timed out), hoặc giới hạn (429)
-            if any(err_code in err_msg for err_code in ["503", "unavailable", "429", "timed out", "timeout"]):
+            # Nếu model không hỗ trợ tắt thinking, thử lại với config mặc định
+            try:
+                response = client.models.generate_content_stream(
+                    model=current_model,
+                    contents=contents
+                )
+                for chunk in response:
+                    if chunk.text:
+                        yield chunk.text
+                return
+            except Exception as e2:
+                last_error = e2
                 continue
-            else:
-                raise e
 
     if last_error:
         raise last_error
