@@ -6,6 +6,7 @@ from google import genai
 from openai import OpenAI
 import io
 import base64
+import time
 
 # Hỗ trợ ảnh chụp iPhone (HEIC/HEIF)
 try:
@@ -79,23 +80,38 @@ Hãy đọc và phân tích hình ảnh Điện tâm đồ 12 chuyển đạo ti
 Lưu ý: Bắt đầu kết luận với lưu ý đây là công cụ AI hỗ trợ, quyết định lâm sàng cuối cùng thuộc về bác sĩ điều trị.
 """
 
-# ----------------- HÀM GỌI GEMINI STREAM (CHUẨN TỐC ĐỘ CAO) -----------------
-def analyze_with_gemini_stream(api_key, model_name, image, prompt):
-    client = genai.Client(api_key=api_key.strip())
+# ----------------- HÀM GỌI GEMINI STREAM VỚI AUTO-RETRY -----------------
+def analyze_with_gemini_stream(api_key, model_name, image, prompt, max_retries=3):
+    client = genai.Client(
+        api_key=api_key.strip(),
+        http_options={'timeout': 60.0}
+    )
     
-    # Nén nhanh kích thước ảnh về tối đa 1600px để truyền dữ liệu trong tích tắc
     img_to_send = image.copy()
     if max(img_to_send.size) > 1600:
         img_to_send.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
     
-    # Truyền phát dữ liệu trực tiếp, không can thiệp tham số gây xung đột
-    response = client.models.generate_content_stream(
-        model=model_name,
-        contents=[img_to_send, prompt]
-    )
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content_stream(
+                model=model_name,
+                contents=[img_to_send, prompt]
+            )
+            has_content = False
+            for chunk in response:
+                if chunk.text:
+                    has_content = True
+                    yield chunk.text
+            if has_content:
+                return  # Thành công, thoát hàm
+        except Exception as e:
+            err_msg = str(e).lower()
+            # Nếu máy chủ quá tải (503) hoặc nghẽn kết nối (timeout), tự động thử lại
+            if any(k in err_msg for k in ["503", "unavailable", "timed out", "timeout"]) and attempt < max_retries - 1:
+                time.sleep(2.5 * (attempt + 1))  # Chờ 2.5s rồi thử lại
+                continue
+            else:
+                raise e
 
 def encode_image_to_base64(pil_image):
     buffered = io.BytesIO()
@@ -151,9 +167,10 @@ with st.sidebar:
     active_openai_key = ""
 
     if provider in ["Google Gemini (Mặc định - Miễn phí)", "So sánh song song (Cần Key OpenAI)"]:
+        # Khóa cứng model gemini-3.8-flash là mô hình khả dụng duy nhất của tài khoản
         gemini_model = st.selectbox(
             "Phiên bản Gemini:",
-            ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"],
+            ["gemini-3.8-flash"],
             index=0
         )
         if system_gemini_key:
@@ -240,7 +257,7 @@ if st.button("🚀 Bắt đầu Phân tích ECG", type="primary", width="stretch
                         analyze_with_gemini_stream(active_gemini_key, gemini_model, final_image_to_analyze, full_prompt)
                     )
                 except Exception as e:
-                    st.error(f"Lỗi phân tích: {e}")
+                    st.error(f"Máy chủ Google đang quá tải tạm thời. Vui lòng bấm thử lại sau vài giây: {e}")
 
         elif provider == "OpenAI GPT-4o (Yêu cầu Key cá nhân)":
             if not active_openai_key:
