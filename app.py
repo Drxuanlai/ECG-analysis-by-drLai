@@ -172,7 +172,10 @@ with st.sidebar:
 
     # 1. Cấu hình Gemini
     if provider in ["Google Gemini (Mặc định - Miễn phí)", "So sánh song song (Cần Key OpenAI)"]:
-        gemini_model = st.selectbox("Phiên bản Gemini:", ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-2.5-pro"])
+        gemini_model = st.selectbox("Phiên bản Gemini:", ["gemini-3.8-flash",       # Phiên bản mới nhất được khuyến nghị
+        "gemini-3.8-pro",
+        "gemini-3-flash",
+        "gemini-2.0-flash"])
         if system_gemini_key:
             st.success("🟢 Đang dùng Gemini API Key hệ thống (Miễn phí)")
         else:
