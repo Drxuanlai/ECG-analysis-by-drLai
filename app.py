@@ -120,9 +120,9 @@ from google.genai import types  # Đảm bảo có import types ở đầu file 
 def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     clean_key = api_key.strip()
     
-    # 1. Tối ưu kích thước ảnh (1200px là lý tưởng nhất để vừa nét vừa truyền siêu tốc)
+    # 1. Chuẩn hóa kích thước ảnh (1600px sắc nét từng ô ly 1mm)
     img_to_send = image.copy()
-    max_dimension = 1800
+    max_dimension = 1600
     if max(img_to_send.size) > max_dimension:
         img_to_send.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     
@@ -130,10 +130,10 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     img_to_send.convert("RGB").save(buf, format="JPEG", quality=85)
     img_bytes = buf.getvalue()
 
-    # 2. Khởi tạo Client
+    # 2. Đặt timeout 120s
     client = genai.Client(
         api_key=clean_key,
-        http_options={'timeout': 60.0}
+        http_options={'timeout': 120.0}
     )
 
     contents = [
@@ -141,9 +141,10 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
         prompt
     ]
 
-    # 3. QUAN TRỌNG: Tắt Thinking để AI nhả kết quả ngay lập tức
+    # 3. ÉP TẮT HOÀN TOÀN SUY NGHĨ NGẦM (thinking_budget = 0)
+    # Nhờ vậy AI sẽ xuất chữ ra ngay lập tức, không làm kẹt luồng stream
     config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_budget=1024),  # Tắt suy luận ngầm
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
         temperature=0.1
     )
 
@@ -154,7 +155,6 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
     last_error = None
     for current_model in models_to_try:
         try:
-            # Thử gọi có tắt thinking
             response = client.models.generate_content_stream(
                 model=current_model,
                 contents=contents,
@@ -163,21 +163,11 @@ def analyze_with_gemini_stream(api_key, model_name, image, prompt):
             for chunk in response:
                 if chunk.text:
                     yield chunk.text
-            return
+            return  # Hoàn thành, thoát hàm
         except Exception as e:
-            # Nếu model không hỗ trợ tắt thinking, thử lại với config mặc định
-            try:
-                response = client.models.generate_content_stream(
-                    model=current_model,
-                    contents=contents
-                )
-                for chunk in response:
-                    if chunk.text:
-                        yield chunk.text
-                return
-            except Exception as e2:
-                last_error = e2
-                continue
+            last_error = e
+            # Nếu model không hỗ trợ, thử model tiếp theo trong danh sách
+            continue
 
     if last_error:
         raise last_error
