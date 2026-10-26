@@ -225,7 +225,7 @@ with st.sidebar:
 
 # --- KHUNG TẢI ẢNH & HIỂN THỊ ---
 st.subheader("1. Tải ảnh hoặc Chụp trực tiếp")
-uploaded_file = st.file_uploader("Chọn ảnh ECG 12 chuyển đạo (JPG/PNG)", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Chọn ảnh ECG 12 chuyển đạo (JPG/PNG)", type=["jpg", "jpeg", "png", "jfif", "webp", "bmp"])
 enable_cam = st.checkbox("Sử dụng Camera")
 if enable_cam:
     cam_file = st.camera_input("Chụp ảnh ECG")
