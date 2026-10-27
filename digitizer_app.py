@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.5"
-METHOD = "ink-graph-selection-review-v5"
+VERSION = "Digitizer 0.6"
+METHOD = "ink-graph-bridge-preview-v6"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -482,6 +482,114 @@ def segment_hints(graph, size):
     return hints
 
 
+def bridge_guard(graph, selected_ids, sid):
+    """Conservative geometry checks, NOT evidence that the segment is grid.
+
+    Removal must retain y extrema in narrow 7-column windows and an existing
+    pixel path between the segment endpoints. Does not certify the waveform.
+    """
+    chosen=set(selected_ids)
+    if sid not in chosen:return False,'Đoạn không có trong lựa chọn hiện tại.'
+    counts={}
+    for i,seg in enumerate(graph['segments'],1):
+        if i in chosen:
+            for p in set(map(tuple,seg['points'])):counts[p]=counts.get(p,0)+1
+    seg=graph['segments'][sid-1];pts=list(map(tuple,seg['points']))
+    start,end=pts[0],pts[-1]
+    if start==end or counts.get(start,0)<2 or counts.get(end,0)<2:
+        return False,'Hai đầu chưa gắn vào các đoạn khác đang giữ.'
+    removed={p for p in pts if counts[p]==1}
+    if not removed:return False,'Không có điểm riêng của đoạn để xem thử bỏ.'
+    remaining=set(counts)-removed
+    by_x={};after_x={}
+    for x,y in counts:by_x.setdefault(x,[]).append(y)
+    for x,y in remaining:after_x.setdefault(x,[]).append(y)
+    affected={u for x,y in removed for u in range(x-3,x+4)}
+    for x in affected:
+        before=[y for u in range(x-3,x+4) for y in by_x.get(u,[])]
+        after=[y for u in range(x-3,x+4) for y in after_x.get(u,[])]
+        if before and (not after or min(before)!=min(after) or max(before)!=max(after)):
+            return False,'Bỏ đoạn sẽ đổi biên trên/dưới trong cửa sổ hẹp 7 cột.'
+    # Traverse only edges that existed before removal, never create a new bridge.
+    stack=[start];seen={start}
+    while stack:
+        x,y=stack.pop()
+        if (x,y)==end:return True,'Có đường đi khác giữa hai đầu và giữ biên y trong cửa sổ 7 cột; vẫn cần đối chiếu ảnh gốc.'
+        for dy in (-1,0,1):
+            for dx in (-1,0,1):
+                q=(x+dx,y+dy)
+                if (not dx and not dy) or q not in remaining or q in seen:continue
+                if dx and dy and ((x+dx,y) in counts or (x,y+dy) in counts):continue
+                seen.add(q);stack.append(q)
+    return False,'Bỏ đoạn làm mất đường đi thay thế giữa hai đầu.'
+
+
+def bridge_candidates(graph, selected_ids, size):
+    candidates=[];chosen=set(selected_ids)
+    for sid,seg in enumerate(graph['segments'],1):
+        if sid not in chosen:continue
+        a,b,c,d=segment_bounds(seg);dx=c-a;dy=d-b
+        if not (3<=dx<=max(12,min(40,int(size[0]*.04))) and dy<=2 and dx>=3*max(1,dy)):
+            continue
+        if len(seg['points'])>2*dx+4:continue
+        safe,reason=bridge_guard(graph,selected_ids,sid)
+        if safe:candidates.append({'segment_id':sid,'bounds_work_px':[a,b,c,d],
+            'reason':reason,'classification':'horizontal_loop_review_hint_not_proven_grid'})
+    return candidates
+
+
+def bridge_preview(graph, selected_ids, removal_ids):
+    """Recheck sequentially: individual safe deletions need not be safe together."""
+    kept=set(selected_ids);removed=[];blocked=[]
+    for sid in sorted(set(removal_ids)):
+        if not 1<=sid<=len(graph['segments']):
+            blocked.append({'segment_id':sid,'reason':'ID không hợp lệ.'});continue
+        safe,reason=bridge_guard(graph,kept,sid)
+        if safe:kept.remove(sid);removed.append(sid)
+        else:blocked.append({'segment_id':sid,'reason':reason})
+    return sorted(kept),removed,blocked
+
+
+def bridge_review_ui(image, graph, selected, state_key, key, window, audit_key):
+    applied=st.session_state.get(audit_key,[])
+    if not st.checkbox('Xem thử lọc thanh nối ngang',value=False,key=key+'_bridge_open'):
+        return {'enabled':False,'applied_events':applied}
+    candidates=bridge_candidates(graph,selected,image.size)
+    st.warning('Đây chỉ là gợi ý hình học; chưa chứng minh đoạn là lưới. Bản xem thử không đổi CSV. Chỉ áp dụng đoạn em xác định rõ trên ảnh gốc.')
+    st.caption('Chỉ gợi ý đoạn ngang ngắn nằm trong vòng có đường đi khác. Không gợi ý nếu việc bỏ làm đổi biên trên/dưới trong cửa sổ hẹp 7 cột. Kiểm tra này vẫn có thể bỏ sót thay đổi hình dạng và không chứng minh giữ đúng ECG.')
+    local=[c for c in candidates if c['bounds_work_px'][0]<window[1] and c['bounds_work_px'][2]>=window[0]]
+    st.write(f'{len(local)} thanh nối gợi ý trong cửa sổ hiện tại; {len(candidates)} trong toàn vùng.')
+    ids=[c['segment_id'] for c in local]
+    choices_key=key+'_bridge_choices_'+hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:12]
+    # None selected by default. Each explicit ID remains visible for review.
+    removal=st.multiselect('Đánh dấu thanh nối để xem thử bỏ',ids,
+        format_func=lambda sid:f'#{sid} · '+str(segment_bounds(graph['segments'][sid-1])),key=choices_key)
+    preview_ids,removed,blocked=bridge_preview(graph,selected,removal)
+    def apply_preview():
+        current=st.session_state.get(state_key,selected)
+        kept,accepted,rejected=bridge_preview(graph,current,removal)
+        st.session_state[state_key]=kept
+        events=list(st.session_state.get(audit_key,[]))
+        events.append({'time_utc':datetime.now(timezone.utc).isoformat(),
+                       'action':'explicit_user_apply','requested_ids':list(removal),
+                       'removed_ids':accepted,'blocked':rejected})
+        st.session_state[audit_key]=events[-30:]
+    if removal:
+        st.image(review_image(image,graph,selected,window=window),caption='Trước: các nét đang được xuất.',width='stretch')
+        st.image(review_image(image,graph,preview_ids,window=window),caption='Xem thử sau: nét dự kiến bỏ chuyển xám. CSV vẫn theo lựa chọn hiện tại cho đến khi bấm áp dụng.',width='stretch')
+        st.write('ID dự kiến bỏ: '+(', '.join('#'+str(i) for i in removed) or 'Không có'))
+        if blocked:st.info('ID bị chặn: '+json.dumps(blocked,ensure_ascii=False))
+        st.button('Áp dụng các thanh nối đã xem',key=key+'_bridge_apply',
+                  disabled=not removed,on_click=apply_preview)
+    else:
+        st.caption('Chưa đánh dấu đoạn nào; lựa chọn và CSV không thay đổi.')
+    return {'enabled':True,'candidate_count_full_region':len(candidates),
+            'candidates_current_window':local,'preview_requested_ids':list(removal),
+            'preview_removed_ids':removed,'preview_blocked':blocked,
+            'preview_is_exported':False,'applied_events':applied,
+            'limits':'Geometry-only hints, not grid classification or clinical validation; no automatic removal.'}
+
+
 def review_panel(result):
     graph=result['graph'];image=Image.open(io.BytesIO(result['original_png'])).convert('RGB')
     key='dg_review_'+result['signature'][:16]
@@ -495,7 +603,12 @@ def review_panel(result):
         if keep:current.add(sid)
         else:current.discard(sid)
         st.session_state[state_key]=sorted(current)
-    def restore_selection():st.session_state[state_key]=list(defaults)
+    audit_key=key+'_selection_events'
+    def restore_selection():
+        st.session_state[state_key]=list(defaults)
+        events=list(st.session_state.get(audit_key,[]))
+        events.append({'time_utc':datetime.now(timezone.utc).isoformat(),'action':'restore_initial_selection'})
+        st.session_state[audit_key]=events[-30:]
     selected=list(st.session_state[state_key]);chosen=set(selected)
     st.caption('Xanh: đang giữ; xám: chưa giữ; hồng: đoạn đang xem. Gợi ý nhánh ngắn chỉ để kiểm tra, không xác định đó là nhiễu. Không tự xóa hoặc nối sóng.')
     st.button('Khôi phục lựa chọn ban đầu',key=key+'_reset',on_click=restore_selection)
@@ -536,6 +649,7 @@ def review_panel(result):
     original=image.crop((left,0,right,image.height))
     factor=max(1,min(6,1800//max(1,right-left),1200//image.height))
     st.image(original.resize((original.width*factor,original.height*factor),Image.Resampling.NEAREST),caption='Ảnh gốc cùng cửa sổ, không vẽ lại hoặc làm mượt sóng.',width='stretch')
+    bridge_review=bridge_review_ui(image,graph,selected,state_key,key,(left,right),audit_key)
     reviewed=select_graph(graph,selected);overview=review_image(image,graph,selected)
     st.image(overview,caption='Lựa chọn đang xuất: xanh được giữ; xám chỉ để đối chiếu, không có trong CSV.',width='stretch')
     notes=st.text_area('Ghi chú đoạn còn sai hoặc chưa rõ',key=key+'_notes')
@@ -545,6 +659,7 @@ def review_panel(result):
         'all_segments':[{'segment_id':sid,'component_id':seg['component_id'],
             **hints[sid],'initial_suggestion':seg.get('suggested',True)} for sid,seg in enumerate(graph['segments'],1)],
         'notes':notes,'zoom_window_work_px':[left,right],'local_filter':filter_label,
+        'bridge_review':bridge_review,
         'hint_meaning':'Short attached segment is only a review hint; no ECG/noise classification, no automatic removal.'}
     return reviewed,review,overview
 
@@ -691,8 +806,8 @@ def main():
     st.download_button("Tải mặt nạ PNG",result["mask_png"],"digitizer_mask.png","image/png",key="dg_mask_download")
     st.subheader("6. Bước tiếp theo")
     st.write("1. Ảnh sạch: dùng cách 0.3 để đối chiếu. Ảnh chụp lưới đỏ: chọn chế độ tương ứng, thử mặc định với 3–5 nhát của một chuyển đạo.")
-    st.write("2. Chọn cửa sổ quanh QRS. Dùng bộ lọc Nhánh ngắn cần xem; giữ/bỏ chỉ khi thấy rõ trên ảnh gốc. Đánh giá các đoạn đang giữ cập nhật sau mỗi thao tác.")
-    st.write("3. Thử lại đúng vùng cắt và tham số của 0.4, xuất đủ 4 file trước khi chỉnh nhánh. Nếu chỉnh tay, xuất lượt riêng sau chỉnh. Chưa cần ảnh mới hoặc đo PR/QRS/ST.")
+    st.write("2. Chọn cửa sổ quanh QRS, mở Xem thử lọc thanh nối ngang. Đánh dấu từng ID nghi lưới, so ảnh trước/sau và ảnh gốc; chỉ áp dụng khi nhìn chắc.")
+    st.write("3. Giữ đúng vùng cắt và thông số cũ. Xuất đủ 4 file trước áp dụng và một lượt riêng sau áp dụng nếu có. Chưa cần ảnh mới hoặc đo PR/QRS/ST.")
     st.caption("Chọn nhánh chỉ là thao tác đối chiếu của người dùng, không phải xác nhận tín hiệu đúng. Khoảng mất không được nối tự động.")
 
 
