@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.7"
-METHOD = "ink-graph-manual-calipers-v7"
+VERSION = "Digitizer 0.8-auto"
+METHOD = "ink-graph-auto-roi-v8"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -37,6 +37,63 @@ def orient(image, angle):
     turns = {90:Image.Transpose.ROTATE_90,180:Image.Transpose.ROTATE_180,270:Image.Transpose.ROTATE_270}
     return image.transpose(turns[angle]) if angle in turns else image.copy()
 
+
+
+def auto_deskew(image):
+    """Conservative deskew for photographed/scan ECG pages; never warps aggressively."""
+    rgb=np.asarray(image.convert("RGB")); gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+    small=gray
+    scale=1.0
+    if gray.shape[1]>1600:
+        scale=1600/gray.shape[1]; small=cv2.resize(gray,None,fx=scale,fy=scale,interpolation=cv2.INTER_AREA)
+    edges=cv2.Canny(small,60,160)
+    lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(80,small.shape[1]//8),minLineLength=small.shape[1]//4,maxLineGap=20)
+    angles=[]
+    if lines is not None:
+        for x1,y1,x2,y2 in lines[:,0]:
+            a=np.degrees(np.arctan2(y2-y1,x2-x1))
+            if -12 <= a <= 12: angles.append(a)
+    angle=float(np.median(angles)) if len(angles)>=2 else 0.0
+    if abs(angle)<0.25: return image.copy(),0.0
+    arr=np.asarray(image.convert("RGB")); h,w=arr.shape[:2]
+    m=cv2.getRotationMatrix2D((w/2,h/2),angle,1.0)
+    out=cv2.warpAffine(arr,m,(w,h),flags=cv2.INTER_CUBIC,borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(out),angle
+
+
+def auto_row_candidates(image, max_rows=4):
+    """Suggest ECG row ROIs from horizontal dark-ink energy. Suggestions only."""
+    work=image.convert("RGB").copy(); work.thumbnail((1800,1400),Image.Resampling.LANCZOS)
+    arr=np.asarray(work); gray=np.max(arr,axis=2).astype(np.uint8)
+    ink=(gray<205).astype(np.uint8)
+    # Suppress very long horizontal/vertical rules before row scoring.
+    horiz=cv2.morphologyEx(ink,cv2.MORPH_OPEN,np.ones((1,max(30,ink.shape[1]//3)),np.uint8))
+    vert=cv2.morphologyEx(ink,cv2.MORPH_OPEN,np.ones((max(20,ink.shape[0]//3),1),np.uint8))
+    signal=np.clip(ink-horiz-vert,0,1)
+    score=signal.mean(axis=1).astype(np.float32)
+    k=max(9,(len(score)//45)|1); score=cv2.GaussianBlur(score.reshape(-1,1),(1,k),0).ravel()
+    threshold=max(float(np.percentile(score,62)),float(score.mean()+.15*score.std()))
+    active=score>=threshold
+    bands=[]; start=None
+    for i,v in enumerate(active.tolist()+[False]):
+        if v and start is None:start=i
+        elif not v and start is not None:
+            if i-start>=max(5,work.height//80): bands.append((start,i-1,float(score[start:i].mean())))
+            start=None
+    # Merge close bands belonging to one waveform row.
+    merged=[]; gap=max(8,work.height//30)
+    for a,b,sc in bands:
+        if merged and a-merged[-1][1]<=gap:
+            pa,pb,psc=merged[-1]; merged[-1]=(pa,b,max(psc,sc))
+        else: merged.append((a,b,sc))
+    result=[]
+    pad=max(8,work.height//45)
+    for a,b,sc in sorted(merged,key=lambda z:z[2],reverse=True):
+        a=max(0,a-pad); b=min(work.height-1,b+pad)
+        if b-a < work.height*.035 or b-a > work.height*.35: continue
+        result.append((0,a/work.height*100,98,b/work.height*100,sc))
+        if len(result)>=max_rows:break
+    return sorted(result,key=lambda r:r[1])
 
 def crop_region(image, x_range, y_range):
     left,right = x_range
@@ -824,8 +881,8 @@ def clear_result():
 def main():
     st.set_page_config(page_title="ECG Digitizer — by dr. Lai",page_icon="📈",layout="wide")
     st.title("📈 ECG Digitizer — by dr. Lai")
-    st.caption(VERSION+" · Đo thủ công trên ảnh gốc và đối chiếu trích nét · Không cần API")
-    st.info("Bản thử nghiệm: mốc đo và hiệu chuẩn do bác sĩ đặt trên ảnh gốc. Trích nét là luồng đối chiếu riêng, chưa tự xác nhận tín hiệu hoặc chẩn đoán ECG.")
+    st.caption(VERSION+" · Auto-first digitization + manual fallback · Không cần API")
+    st.info("Bản 0.8 ưu tiên tự động: tự gợi ý hàng ECG và trích nét; thao tác thủ công chỉ là fallback/QC. Chưa phải thiết bị đo đã kiểm chứng lâm sàng và không tự chẩn đoán ECG.")
     st.caption("Ảnh được xử lý trên máy chủ Streamlit của app. Code này không gửi ảnh đến Gemini/GPT hay dịch vụ số hóa bên ngoài; không ghi ảnh vào đĩa hay bộ nhớ dùng chung giữa các phiên.")
     uploaded = st.file_uploader("Tải ảnh ECG",type=["jpg","jpeg","png","webp","heic","heif"],key="dg_upload",on_change=clear_result)
     if uploaded is None:
@@ -848,10 +905,24 @@ def main():
     st.subheader("1. Chọn đúng một chuyển đạo")
     rotation = st.selectbox("Xoay ngược chiều kim đồng hồ",[0,90,180,270],key="dg_rot_"+suffix)
     oriented = orient(source,rotation)
-    frame = suffix+str(rotation)
+    auto_straight=st.checkbox("Tự sửa nghiêng nhẹ",value=True,key="dg_deskew_"+suffix)
+    deskew_angle=0.0
+    if auto_straight:
+        oriented,deskew_angle=auto_deskew(oriented)
+        if abs(deskew_angle)>=0.25: st.caption(f"Đã sửa nghiêng nhẹ khoảng {deskew_angle:+.2f}°; hãy kiểm tra ảnh xem có hợp lý không.")
+    frame = suffix+str(rotation)+f"_{deskew_angle:.2f}"
     lead = st.selectbox("Nhãn chuyển đạo do em chọn",["II","I","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6","Chưa xác định"],key="dg_lead_"+frame)
-    x_range = st.slider("Vùng dò: trái — phải (%)",0.,100.,(0.,95.),.1,key="dg_roi_x_"+frame)
-    y_range = st.slider("Vùng dò: trên — dưới (%)",0.,100.,(40.,58.),.1,key="dg_roi_y_"+frame)
+    auto_rows=auto_row_candidates(oriented)
+    auto_roi=st.checkbox("Tự gợi ý vùng hàng ECG",value=True,key="dg_autoroi_"+frame)
+    if auto_roi and auto_rows:
+        row_idx=st.selectbox("Hàng ECG gợi ý",range(len(auto_rows)),format_func=lambda i:f"Hàng {i+1}: {auto_rows[i][1]:.1f}–{auto_rows[i][3]:.1f}%",key="dg_row_"+frame)
+        ar=auto_rows[row_idx]; default_x=(float(ar[0]),float(ar[2])); default_y=(float(ar[1]),float(ar[3]))
+    else:
+        default_x=(0.,95.); default_y=(40.,58.)
+        if auto_roi: st.warning("Chưa tự tìm được hàng ECG đủ chắc. Dùng vùng thủ công bên dưới.")
+    with st.expander("Chỉnh vùng thủ công / fallback",expanded=not(auto_roi and auto_rows)):
+        x_range = st.slider("Vùng dò: trái — phải (%)",0.,100.,default_x,.1,key="dg_roi_x_"+frame)
+        y_range = st.slider("Vùng dò: trên — dưới (%)",0.,100.,default_y,.1,key="dg_roi_y_"+frame)
     try:
         crop,box = crop_region(oriented,x_range,y_range)
     except ValueError as exc:
@@ -896,7 +967,7 @@ def main():
             work = candidate["work"]
             metadata = {"version":VERSION,"method":METHOD,"validation_status":"unverified_candidate",
                 "time_utc":datetime.now(timezone.utc).isoformat(),"source_sha256":sha,
-                "original_exif_corrected_size":list(source.size),"rotation_ccw":rotation,
+                "original_exif_corrected_size":list(source.size),"rotation_ccw":rotation,"deskew_degrees":deskew_angle,
                 "oriented_size":list(oriented.size),"crop_box_oriented_pixels":list(box),
                 "crop_size":list(crop.size),"working_size":list(work.size),"chosen_lead":lead,
                 "parameters":params,"column_status_counts":candidate["counts"],
