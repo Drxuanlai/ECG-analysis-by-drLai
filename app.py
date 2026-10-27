@@ -14,9 +14,6 @@ import re
 import shutil
 import subprocess
 import json
-import zipfile
-import uuid
-import importlib.metadata
 from datetime import datetime, timezone
 
 # Hỗ trợ ảnh chụp iPhone (HEIC/HEIF)
@@ -27,7 +24,7 @@ except ImportError:
     pass
 
 st.set_page_config(
-    page_title="AI 12-Lead ECG Expert",
+    page_title="Phân tích ECG — by dr. Lai",
     page_icon="🫀",
     layout="wide"
 )
@@ -133,8 +130,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- PROMPT LÂM SÀNG -----------------
-APP_VERSION = "v6"
-PROMPT_VERSION = "ecg-evidence-v6"
+APP_VERSION = "v7"
+PROMPT_VERSION = "ecg-evidence-v7"
 SYSTEM_PROMPT = """
 Bạn hỗ trợ bác sĩ mô tả ECG từ ảnh. Đây là bản phân tích chưa được bác sĩ xác minh.
 Không có chẩn đoán đích được gợi sẵn. Không mặc định ECG bình thường hay bệnh lý.
@@ -183,7 +180,7 @@ TRÌNH TỰ BÁO CÁO (trình bày ngắn gọn, không viết suy luận nội 
    Không đưa đơn thuốc, liều thuốc, năng lượng sốc hoặc chỉ định can thiệp bắt buộc.
    Chỉ nêu bước xác minh phù hợp, có điều kiện. Không coi thiếu bệnh sử là không có triệu chứng.
 
-QUY TẮC SỐ ĐO V6
+QUY TẮC SỐ ĐO
 - Mọi số do AI ước lượng đều phải ghi “AI ước lượng — chưa kiểm chứng”.
 - Không xác định được tốc độ giấy từ ảnh hoặc thông tin người dùng đã xác nhận:
   chỉ mô tả ô lưới/hình thái; không giả định 25 mm/s và không kết luận thời gian
@@ -192,6 +189,8 @@ QUY TẮC SỐ ĐO V6
 - Chỉ nói “hình thái gợi ý” nếu chưa xác định đủ độ rộng QRS, không loại trừ block
   chỉ từ phần đỉnh nhọn. Nếu không phân biệt được tận cùng QRS với ST/T, ghi rõ.
 - Không tự ghi “Bác sĩ đã xác minh” cho bất kỳ số đo hoặc kết luận nào.
+- Tần số và RR phải nhất quán (bpm = 60000 / RR_ms). Khi không xác định được
+  một chu kỳ hoặc các số mâu thuẫn, ghi chưa đo được; không đếm T như QRS.
 
 Kết thúc bằng: Báo cáo AI chưa được xác minh; bác sĩ cần kiểm tra lại dạng sóng và số đo.
 """
@@ -223,17 +222,6 @@ def build_verified_context(speed, limb_gain, chest_gain, qrs_ms):
             + "\n".join(rows) + "\nNếu thấy mâu thuẫn với ảnh phải nêu mâu thuẫn; không âm thầm thay số.")
 
 
-def trial_zip(records):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for record in records:
-            directory = record["run_id"]
-            public = {key: value for key, value in record.items() if key != "image_png"}
-            archive.writestr(f"{directory}/record.json", json.dumps(public, ensure_ascii=False, indent=2))
-            archive.writestr(f"{directory}/image_sent.png", record["image_png"])
-            archive.writestr(f"{directory}/report.txt", record["report"])
-            archive.writestr(f"{directory}/prompt.txt", record["prompt"])
-    return buffer.getvalue()
 
 
 def build_clinical_context(age, sex, history):
@@ -259,35 +247,6 @@ def gemini_config(model_name, thinking_level="medium"):
     return types.GenerateContentConfig(**options)
 
 
-def probe_gemini(api_key, model_name, image=None):
-    """Small inference on the same host, key and model as the ECG request."""
-    started = time.monotonic()
-    config = gemini_config(model_name, "low")
-    config.max_output_tokens = 2048
-    contents = "Reply with only OK."
-    if image is not None:
-        # Same image and encoding as analysis; short output isolates input handling.
-        contents = [image, "Describe the image in one short sentence. Do not diagnose."]
-    try:
-        with genai.Client(
-            api_key=api_key.strip(),
-            http_options=types.HttpOptions(
-                timeout=20000, retry_options=types.HttpRetryOptions(attempts=1)
-            ),
-        ) as client:
-            result = client.models.generate_content(
-                model=model_name, contents=contents, config=config
-            )
-            answer = result.text or ""
-            if not answer.strip():
-                raise RuntimeError("API không trả văn bản; kiểm tra giới hạn token hoặc bộ lọc.")
-        return {"Model": model_name, "Bước": "Ảnh + yêu cầu ngắn" if image else "Văn bản ngắn",
-                "Kết quả": "Thành công", "Giây": round(time.monotonic()-started, 1),
-                "Chi tiết": answer}
-    except Exception as error:
-        return {"Model": model_name, "Bước": "Ảnh + yêu cầu ngắn" if image else "Văn bản ngắn",
-                "Kết quả": "Thất bại", "Giây": round(time.monotonic()-started, 1),
-                "Chi tiết": str(error)}
 
 
 def analyze_with_gemini_stream(api_key, model_name, image_bytes, prompt, thinking_level="medium"):
@@ -381,8 +340,6 @@ def display_analysis(generator):
         st.error(friendly_api_error(error))
         if first_text_seconds is not None:
             st.warning("Báo cáo bị gián đoạn, nội dung phía trên chưa phải báo cáo hoàn chỉnh.")
-        with st.expander("Chi tiết kỹ thuật"):
-            st.code(str(error))
 
     return {"report": "".join(fragments), "completed": completed,
             "error": error_message, "total_seconds": round(time.monotonic()-started, 2),
@@ -438,329 +395,166 @@ def get_secret(name, default=""):
         return default
 
 
-# ----------------- QUẢN LÝ CẤU HÌNH VÀ ĐỐI CHIẾU -----------------
-def config_hash(config):
-    return hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False,
-                                     separators=(",", ":")).encode()).hexdigest()
-
-
+# ----------------- GIAO DIỆN ĐỒNG NGHIỆP -----------------
 def crop_box_percent(size, horizontal, vertical):
     w, h = size
     left, right = horizontal
     top, bottom = vertical
     if not (0 <= left < right <= 100 and 0 <= top < bottom <= 100):
         raise ValueError("Vùng cắt phải có chiều rộng và chiều cao lớn hơn 0.")
-    box = (int(w * left / 100), int(h * top / 100),
-           int(w * right / 100), int(h * bottom / 100))
+    box = (int(w * left / 100), int(h * top / 100), int(w * right / 100), int(h * bottom / 100))
     if box[2] <= box[0] or box[3] <= box[1]:
         raise ValueError("Vùng cắt quá nhỏ.")
     return box
 
 
-def add_measurement_review(record, values, reviewer, attested, note):
-    """Human review is append-only and never validates the AI narrative."""
-    if not reviewer.strip() or not attested:
-        raise ValueError("Cần tên người kiểm tra và xác nhận đã đối chiếu số đo.")
-    present = {k: v for k, v in values.items() if v is not None}
-    if not present:
-        raise ValueError("Chưa có số đo để lưu.")
-    if not note.strip():
-        raise ValueError("Cần ghi chuyển đạo, mốc đo và cách đối chiếu; QTc cần công thức/nguồn.")
-    limits = {"hr_bpm": (1, 400), "pr_ms": (1, 1000), "qrs_ms": (1, 500),
-              "qt_ms": (1, 1500), "qtc_ms": (1, 1500)}
-    for key, value in present.items():
-        if key not in limits or not limits[key][0] <= value <= limits[key][1]:
-            raise ValueError("Số đo ngoài phạm vi nhập liệu.")
-    entry = {"review_id": uuid.uuid4().hex[:12], "reviewer": reviewer.strip(),
-             "utc_time": datetime.now(timezone.utc).isoformat(), "values": present,
-             "source": "Bác sĩ tự xác nhận đã đối chiếu", "note": note.strip(),
-             "ai_report_validated": False}
-    record.setdefault("measurement_reviews", []).append(entry)
-    return entry
+def request_fingerprint(image_bytes, prompt, service, model, thinking):
+    settings = json.dumps([service, model, thinking, prompt], ensure_ascii=False).encode()
+    return hashlib.sha256(image_bytes + settings).hexdigest()
 
 
-st.title("🫀 Phân tích điện tâm đồ 12 chuyển đạo")
-st.caption("Bản v6 · Gemini 3.6 Flash · Cấu hình có thể khóa, số đo có nguồn")
-st.info("Ứng dụng thử nghiệm. AI chưa có bộ đo tín hiệu ECG đã được kiểm chứng. Mọi số đo và chẩn đoán AI trả về đều chưa được xác minh.")
+def reset_case():
+    # Only this browser session. Never cache patient images across users.
+    for key in list(st.session_state):
+        if key.startswith("case_") or key.startswith("image_") or key in ("last_report_v7", "orientation_result"):
+            del st.session_state[key]
 
-locked = st.session_state.get("experiment_lock_v6") is not None
-if locked:
-    st.success("Đang khóa cấu hình nhóm: " + st.session_state["experiment_lock_v6"]["name"])
-    if st.button("Mở khóa để thiết lập nhóm mới", key="unlock_v6"):
-        st.session_state.pop("experiment_lock_v6", None)
-        st.rerun()
+
+st.title("🫀 Phân tích ECG — by dr. Lai")
+st.caption("Hỗ trợ bác sĩ mô tả điện tâm đồ 12 chuyển đạo.")
+st.info("Kết quả AI có thể sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; các số đo AI chưa được kiểm chứng.")
 
 with st.sidebar:
-    test_mode = st.checkbox("Chế độ thử nghiệm có khóa cấu hình", value=True, disabled=locked, key="test_mode_v6")
-    group_name = st.text_input("Tên nhóm cấu hình", value="case01_A", disabled=locked, key="group_v6")
-    st.caption("Mỗi nhóm khóa một cấu hình. Mở khóa khi chuyển A sang B hoặc đổi chuẩn ghi. Thay API key không được ghi vào nhật ký.")
-    provider = st.radio("Chọn chế độ phân tích:",
-        ["Google Gemini", "OpenAI", "So sánh lần lượt"], disabled=locked, key="provider_v6")
-    gemini_model = GEMINI_MODEL
-    gemini_thinking = st.selectbox("Mức suy luận Gemini 3.6 Flash:",
-        ["medium", "low", "high"], disabled=locked, key="thinking_v6")
-    st.caption("Model Google cố định: " + GEMINI_MODEL)
-    active_gemini_key = get_secret("GEMINI_API_KEY", "")
-    if provider != "OpenAI":
-        if active_gemini_key:
-            st.caption("Đang dùng Gemini key trong Secrets.")
+    st.header("Thông tin ca bệnh")
+    st.caption("Không nhập họ tên, mã hồ sơ hoặc thông tin định danh người bệnh.")
+    patient_age = st.number_input("Tuổi", 0, 120, value=None, step=1, key="case_age")
+    patient_sex = st.selectbox("Giới tính", ["Chưa cung cấp", "Nam", "Nữ", "Khác"], key="case_sex")
+    clinical_history = st.text_area("Triệu chứng / bệnh sử / sinh hiệu", placeholder="Chưa cung cấp", key="case_history")
+    with st.expander("Chuẩn ghi đã kiểm tra (tùy chọn)"):
+        st.caption("Để trống nếu chưa xác định. Có thể nhập chuẩn chi và ngực khác nhau; các giá trị này do người dùng cung cấp, không phải AI tự đo.")
+        known_speed = st.number_input("Tốc độ giấy (mm/s)", 1.0, 200.0, value=None, key="case_speed")
+        known_limb_gain = st.number_input("Chuẩn chuyển đạo chi (mm/mV)", 0.1, 100.0, value=None, key="case_limb")
+        known_chest_gain = st.number_input("Chuẩn ngực nếu đồng nhất V1–V6 (mm/mV)", 0.1, 100.0, value=None, key="case_chest")
+        st.caption("Nếu chuẩn khác nhau giữa các chuyển đạo ngực, ghi rõ trong thông tin ca bệnh thay vì nhập một giá trị chung.")
+    with st.expander("Thiết lập AI"):
+        provider = st.selectbox("Dịch vụ", ["Google Gemini", "OpenAI"], key="service_v7")
+        if provider == "Google Gemini":
+            model = st.text_input("Tên model", value=get_secret("GEMINI_MODEL", GEMINI_MODEL), key="gmodel_v7").strip()
+            thinking = st.selectbox("Mức suy luận", ["medium", "low", "high"], key="thinking_v7")
+            if model.removeprefix("models/") != GEMINI_MODEL:
+                st.caption("Điều khiển mức suy luận chỉ áp dụng cho Gemini 3.6 Flash trong bản này; model khác dùng thiết lập mặc định của dịch vụ.")
+            api_key = get_secret("GEMINI_API_KEY", "")
+            if not api_key:
+                api_key = st.text_input("Gemini API key", type="password", key="gkey_v7")
         else:
-            active_gemini_key = st.text_input("Gemini API key", type="password", key="gkey_v6")
-    openai_model = "gpt-4o"
-    active_openai_key = get_secret("OPENAI_API_KEY", "")
-    if provider != "Google Gemini":
-        openai_model = st.selectbox("Model OpenAI", ["gpt-4o", "gpt-4o-mini"], disabled=locked)
-        if not active_openai_key:
-            active_openai_key = st.text_input("OpenAI API key", type="password", key="okey_v6")
+            model = st.text_input("Tên model", value=get_secret("OPENAI_MODEL", "gpt-4o"), key="omodel_v7").strip()
+            thinking = None
+            api_key = get_secret("OPENAI_API_KEY", "")
+            if not api_key:
+                api_key = st.text_input("OpenAI API key", type="password", key="okey_v7")
+        st.caption("Model cần hỗ trợ nhận ảnh và được tài khoản API cấp quyền truy cập.")
+    st.button("Xóa thông tin và kết quả ca hiện tại", on_click=reset_case, key="reset_v7")
 
-    st.subheader("Thiết lập lần thử")
-    reading_mode = st.radio("Cách đọc:", ["Đọc sóng độc lập", "Đối chiếu cả chữ/số máy in"], disabled=locked)
-    trial_label = st.text_input("Mã ca / lần thử", placeholder="VD: case01_A1", key="trial_v6")
-    mask_condition = st.selectbox("Thông tin che trên ảnh (nhật ký, không tự che ảnh):", [
-        "Chưa gắn nhãn", "Không che", "Che kết luận/chữ chẩn đoán",
-        "Che kết luận và số đo máy", "Che thêm chữ chuẩn ghi", "Khác"])
+st.subheader("Ảnh điện tâm đồ")
+st.caption("Che thông tin định danh trước khi tải. Chọn ảnh rõ, đúng chiều và giữ đủ nhãn chuyển đạo, lưới, xung chuẩn cùng đầu–cuối đường sóng.")
+uploaded_file = st.file_uploader("Tải ảnh ECG", type=["jpg", "jpeg", "png", "jfif", "webp", "bmp", "heic", "heif"], key="upload_v7", on_change=reset_case)
+if st.checkbox("Chụp bằng camera", key="camera_enabled_v7"):
+    camera_file = st.camera_input("Chụp ECG", key="camera_v7", on_change=reset_case)
+    if camera_file is not None:
+        uploaded_file = camera_file
 
-    st.subheader("Tiền xử lý ảnh")
-    enable_preprocessing = st.checkbox("Bật tiền xử lý ảnh nâng cao", value=False, disabled=locked)
-    remove_shadow = apply_clahe = False
-    clahe_clip, sharpen_lvl, rot_angle = 2.0, 0.0, 0
-    if enable_preprocessing:
-        remove_shadow = st.checkbox("Khử bóng và đều nền", value=True, disabled=locked)
-        apply_clahe = st.checkbox("Tăng tương phản CLAHE", value=True, disabled=locked)
-        clahe_clip = st.slider("Mức CLAHE", 1.0, 5.0, 2.0, 0.5, disabled=locked)
-        sharpen_lvl = st.slider("Độ sắc nét", 0.0, 3.0, 1.0, 0.5, disabled=locked)
-        st.caption("Xoay nhỏ góc bị tắt để tránh nội suy/cắt mất bờ tín hiệu. Có thể xoay 90° ở vùng ảnh.")
-
-    st.subheader("Thông tin người bệnh")
-    patient_age = st.number_input("Tuổi", 0, 120, value=None, step=1, disabled=locked)
-    patient_sex = st.selectbox("Giới tính", ["Chưa cung cấp", "Nam", "Nữ", "Khác"], disabled=locked)
-    clinical_history = st.text_area("Bệnh sử / triệu chứng", disabled=locked,
-        placeholder="Để trống nếu chưa được cung cấp")
-
-    st.subheader("Chuẩn ghi đã kiểm tra")
-    st.caption("Không có giá trị mặc định. Trong bài test che chữ, để Chưa xác định nếu muốn thử AI độc lập.")
-    speed_choice = st.selectbox("Tốc độ giấy (mm/s)", ["Chưa xác định", "25", "50", "Khác"], disabled=locked)
-    known_speed = None
-    if speed_choice == "Khác":
-        known_speed = st.number_input("Tốc độ khác (mm/s)", 1.0, 200.0, value=None, disabled=locked)
-    elif speed_choice != "Chưa xác định":
-        known_speed = float(speed_choice)
-    known_limb_gain = st.number_input("Chuẩn chuyển đạo chi (mm/mV)", 0.1, 100.0, value=None, disabled=locked)
-    known_chest_gain = st.number_input("Chuẩn ngực đồng nhất V1–V6 (mm/mV)", 0.1, 100.0, value=None, disabled=locked)
-    calibration_source = st.selectbox("Nguồn kiểm tra chuẩn ghi", ["Chưa xác định", "Đọc từ bản ECG gốc", "Cài đặt máy đã kiểm tra", "Khác"], disabled=locked)
-    confirm_calibration = st.checkbox("Tôi đã kiểm tra các chuẩn ghi vừa nhập", disabled=locked)
-    st.caption("Nếu V1–V6 có chuẩn khác nhau, không nhập một giá trị chung. Ghi rõ khác biệt trong bệnh sử/thông tin kỹ thuật.")
-
-st.subheader("1. Chọn ảnh, chiều đọc và vùng ECG")
-uploaded_file = st.file_uploader("Ảnh ECG", type=["jpg", "jpeg", "png", "jfif", "webp", "bmp", "heic", "heif"])
-if st.checkbox("Sử dụng camera"):
-    cam = st.camera_input("Chụp ECG")
-    if cam is not None:
-        uploaded_file = cam
-
-final_image_to_analyze = None
-payload = None
-settings = None
-current_config = None
 if uploaded_file is not None:
     try:
-        uploaded_bytes = uploaded_file.getvalue()
-        upload_sha = hashlib.sha256(uploaded_bytes).hexdigest()
-        original_image = ImageOps.exif_transpose(Image.open(io.BytesIO(uploaded_bytes))).convert("RGB")
+        original = ImageOps.exif_transpose(Image.open(io.BytesIO(uploaded_file.getvalue()))).convert("RGB")
     except Exception:
         st.error("Không đọc được ảnh. Hãy xuất JPEG/PNG rồi tải lại.")
         st.stop()
-    auto_orientation = st.checkbox("Tự nhận diện chiều (OCR cục bộ)", value=True, disabled=locked)
-    auto_angle = 0
-    if auto_orientation:
-        cache = st.session_state.get("orientation_result", {})
-        if cache.get("image_id") != upload_sha:
-            with st.spinner("Đang kiểm tra chiều chữ, không gọi API..."):
-                cache = {"image_id": upload_sha, **detect_ecg_orientation(original_image)}
-            st.session_state["orientation_result"] = cache
-        auto_angle = cache["angle"]
-        st.caption(cache["message"] + f" Góc tự xoay: {auto_angle}°.")
-    manual_angle = st.selectbox("Xoay thêm ngược chiều kim đồng hồ", [0, 90, 180, 270], disabled=locked)
-    oriented = rotate_quarter_turn(original_image, (auto_angle + manual_angle) % 360)
-    crop_enabled = st.checkbox("Chọn vùng tờ ECG để gửi AI", value=False, disabled=locked)
-    horizontal, vertical = (0, 100), (0, 100)
-    if crop_enabled:
-        st.caption("Tọa độ % tính trên ảnh đã xoay. Giữ đủ 12 chuyển đạo, nhãn, dải nhịp và xung chuẩn. Ảnh cắt sẽ được gửi thật vào AI.")
-        horizontal = st.slider("Biên trái — phải (%)", 0, 100, (0, 100), disabled=locked)
-        vertical = st.slider("Biên trên — dưới (%)", 0, 100, (0, 100), disabled=locked)
+    image_id = hashlib.sha256(uploaded_file.getvalue()).hexdigest()[:16]
+    with st.expander("Chỉnh chiều và vùng ảnh"):
+        auto_orientation = st.checkbox("Tự nhận diện chiều ảnh", value=True, key="image_auto_" + image_id)
+        auto_angle = 0
+        if auto_orientation:
+            cache = st.session_state.get("orientation_result", {})
+            if cache.get("image_id") != image_id:
+                with st.spinner("Đang kiểm tra chiều ảnh..."):
+                    cache = {"image_id": image_id, **detect_ecg_orientation(original)}
+                st.session_state["orientation_result"] = cache
+            auto_angle = cache["angle"]
+            if not cache["detected"]:
+                st.caption("Chưa tự xác định được chiều. Hãy xem ảnh và xoay tay nếu cần.")
+        manual_angle = st.selectbox("Xoay thêm ngược chiều kim đồng hồ", [0, 90, 180, 270], key="image_rotation_" + image_id)
+        crop_enabled = st.checkbox("Cắt vùng tờ ECG", value=False, key="image_crop_" + image_id)
+        horizontal, vertical = (0, 100), (0, 100)
+        if crop_enabled:
+            horizontal = st.slider("Biên trái — phải (%)", 0, 100, (0, 100), key="image_x_" + image_id)
+            vertical = st.slider("Biên trên — dưới (%)", 0, 100, (0, 100), key="image_y_" + image_id)
+        enhance = st.checkbox("Tăng tương phản ảnh", value=False, key="image_enhance_" + image_id)
+        if enhance:
+            st.caption("Hãy đối chiếu ảnh trước/sau vì tăng tương phản có thể làm thay đổi chi tiết đường sóng.")
+    oriented = rotate_quarter_turn(original, (auto_angle + manual_angle) % 360)
     try:
-        crop_box = crop_box_percent(oriented.size, horizontal, vertical)
+        box = crop_box_percent(oriented.size, horizontal, vertical)
     except ValueError as error:
         st.error(str(error))
         st.stop()
-    raw_image = oriented.crop(crop_box)
+    raw_image = oriented.crop(box)
     raw_image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.Resampling.LANCZOS)
-    final_image_to_analyze = preprocess_ecg(raw_image, remove_shadow, apply_clahe, clahe_clip, sharpen_lvl, 0) if enable_preprocessing else raw_image
-    payload = image_to_png(final_image_to_analyze)
-    image_sha = hashlib.sha256(payload).hexdigest()
-    with st.expander("Xem ảnh toàn cảnh đã xoay"):
-        st.image(oriented, caption="Ảnh toàn cảnh; có thể khác vùng gửi AI", width="stretch")
-    before, after = st.columns(2)
-    with before:
-        st.image(raw_image, caption="Vùng đã chọn, trước tăng tương phản", width="stretch")
-    with after:
-        st.image(payload, caption="ĐÚNG ẢNH SẼ GỬI AI", width="stretch")
-    st.caption(f"Ảnh gửi {final_image_to_analyze.width} × {final_image_to_analyze.height} px · SHA256 {image_sha[:16]}")
-    with st.expander("Phóng to để bác sĩ xem — KHÔNG gửi thêm ảnh này"):
-        zoom_x = st.slider("Vùng xem ngang (%)", 0, 100, (0, 100), key="zoom_x_v6")
-        zoom_y = st.slider("Vùng xem dọc (%)", 0, 100, (0, 100), key="zoom_y_v6")
+    final_image = preprocess_ecg(raw_image, True, True, 2.0, 1.0, 0) if enhance else raw_image
+    payload = image_to_png(final_image)
+    st.image(payload, caption="Ảnh sẽ gửi để phân tích", width="stretch")
+    if enhance:
+        with st.expander("Đối chiếu ảnh trước tăng tương phản"):
+            st.image(raw_image, width="stretch")
+    with st.expander("Phóng to để xem"):
+        zoom_x = st.slider("Vùng xem ngang (%)", 0, 100, (0, 100), key="image_zoom_x_" + image_id)
+        zoom_y = st.slider("Vùng xem dọc (%)", 0, 100, (0, 100), key="image_zoom_y_" + image_id)
         try:
-            zoom_box = crop_box_percent(final_image_to_analyze.size, zoom_x, zoom_y)
-            st.image(final_image_to_analyze.crop(zoom_box), width="stretch", caption="Chỉ để xem; không thay ảnh hoặc cấu hình gửi AI")
+            st.image(final_image.crop(crop_box_percent(final_image.size, zoom_x, zoom_y)), width="stretch")
         except ValueError:
-            st.caption("Chọn vùng xem có chiều rộng và chiều cao lớn hơn 0.")
+            st.caption("Chọn vùng có chiều rộng và chiều cao lớn hơn 0.")
+        st.caption("Phóng to chỉ để xem, không thay ảnh gửi phân tích.")
 
-has_calibration = any(v is not None for v in (known_speed, known_limb_gain, known_chest_gain))
-calibration_valid = not has_calibration or (confirm_calibration and calibration_source != "Chưa xác định")
-if has_calibration and not calibration_valid:
-    st.warning("Đã nhập chuẩn ghi: cần chọn nguồn và xác nhận đã kiểm tra trước khi phân tích.")
-verified = {"speed_mm_s": known_speed, "limb_mm_mv": known_limb_gain,
-            "chest_mm_mv": known_chest_gain, "qrs_ms": None}
-full_prompt = SYSTEM_PROMPT + build_clinical_context(patient_age, patient_sex, clinical_history)
-full_prompt += build_verified_context(known_speed, known_limb_gain, known_chest_gain, None)
-if has_calibration:
-    full_prompt += "\nNguồn chuẩn ghi do người dùng xác nhận: " + calibration_source
-full_prompt += ("\nCHẾ ĐỘ ĐỌC SÓNG ĐỘC LẬP: Không dùng kết luận máy, chữ chẩn đoán viết tay hay số PR/QRS/QTc/trục/tần số máy in. Được đọc nhãn và chuẩn ghi. Đây là chỉ dẫn, không phải công cụ che chữ tự động."
-                if reading_mode == "Đọc sóng độc lập" else
-                "\nCHẾ ĐỘ ĐỐI CHIẾU: Tách số máy in/chữ chẩn đoán khỏi quan sát dạng sóng, không coi là đáp án đúng.")
-
-if payload is not None:
-    current_config = {
-        "app_version": APP_VERSION, "prompt_version": PROMPT_VERSION,
-        "provider": provider, "gemini_model": gemini_model, "thinking_level": gemini_thinking,
-        "openai_model": openai_model if provider != "Google Gemini" else None,
-        "reading_mode": reading_mode, "prompt_sha256": hashlib.sha256(full_prompt.encode()).hexdigest(),
-        "uploaded_size": list(original_image.size), "oriented_size": list(oriented.size),
-        "sent_size": list(final_image_to_analyze.size), "max_image_edge": MAX_IMAGE_EDGE,
-        "auto_orientation_enabled": auto_orientation, "auto_rotation_ccw": auto_angle,
-        "manual_rotation_ccw": manual_angle,
-        "crop": {"enabled": crop_enabled, "horizontal_percent": list(horizontal),
-                 "vertical_percent": list(vertical), "box_pixels": list(crop_box)},
-        "preprocessing": {"enabled": enable_preprocessing, "remove_shadow": remove_shadow,
-            "clahe": apply_clahe, "clahe_clip": clahe_clip, "sharpen": sharpen_lvl, "fine_rotation": 0},
-        "verified_values": verified, "calibration_source": calibration_source if has_calibration else None,
-        "calibration_confirmed": bool(has_calibration and calibration_valid),
-        "clinical_context": {"age": patient_age, "sex": patient_sex, "history": clinical_history},
-        "generation_options": {"Gemini": gemini_config(gemini_model, gemini_thinking).model_dump(mode="json", exclude_none=True),
-                               "OpenAI": {"max_tokens": 2500, "temperature": 0.2}},
-    }
-    current_hash = config_hash(current_config)
-    st.subheader("2. Kiểm tra và khóa cấu hình")
-    with st.expander("Chi tiết cấu hình hiện tại"):
-        st.json(current_config)
-    lock = st.session_state.get("experiment_lock_v6")
-    if test_mode and not locked:
-        if st.button("Khóa cấu hình nhóm này", disabled=not calibration_valid):
-            if not group_name.strip():
-                st.warning("Cần tên nhóm cấu hình.")
-            else:
-                st.session_state["experiment_lock_v6"] = {"name": group_name.strip(),
-                    "config_id": uuid.uuid4().hex[:12], "config_sha256": current_hash,
-                    "locked_utc": datetime.now(timezone.utc).isoformat(), "config": current_config}
-                st.rerun()
-    lock_matches = bool(lock and lock["config_sha256"] == current_hash)
-    if locked and not lock_matches:
-        st.error("Ảnh hoặc cấu hình hiện tại khác nhóm đã khóa (ví dụ kích thước/góc OCR). Không gửi API. Hãy mở khóa và tạo nhóm mới.")
-    if lock:
-        st.caption(f"Mã cấu hình: {lock['config_id']} · {lock['config_sha256'][:16]}")
-        st.download_button("Tải cấu hình nhóm JSON", json.dumps(lock, ensure_ascii=False, indent=2),
-                           "ecg_config_v6.json", "application/json")
-        st.caption("Cấu hình có thể chứa bệnh sử đã nhập. Không chứa API key. Khóa chỉ tồn tại trong phiên hiện tại; tải nhật ký trước khi đóng.")
-    confirmed_image = st.checkbox("Tôi đã xem đúng ảnh sẽ gửi, đủ vùng cần đọc và đúng chiều", key="confirmed_" + image_sha)
-    can_analyze = calibration_valid and confirmed_image and (not test_mode or (locked and lock_matches))
-    st.subheader("3. Phân tích")
-    st.warning("Số đo trong báo cáo AI = ước lượng chưa kiểm chứng. Xác nhận chuẩn ghi không xác nhận các số đo hay chẩn đoán AI.")
-    if st.button("🚀 Bắt đầu phân tích ECG", type="primary", disabled=not can_analyze, key="analyze_v6"):
-        if test_mode and not trial_label.strip():
-            st.warning("Cần mã ca/lần thử để lưu nhật ký.")
-        elif ((provider != "OpenAI" and not active_gemini_key) or
-              (provider != "Google Gemini" and not active_openai_key)):
-            st.warning("Thiếu API key của dịch vụ đã chọn.")
-        elif len(st.session_state.get("ecg_runs_v6", [])) >= 8:
-            st.warning("Đã đủ 8 lượt. Tải ZIP và xóa nhật ký trước khi chạy tiếp; app không tự xóa lượt cũ.")
-        elif provider == "So sánh lần lượt" and len(st.session_state.get("ecg_runs_v6", [])) > 6:
-            st.warning("So sánh cần 2 vị trí nhật ký trống. Hãy tải ZIP và xóa nhật ký trước.")
+    prompt = SYSTEM_PROMPT + build_clinical_context(patient_age, patient_sex, clinical_history)
+    prompt += build_verified_context(known_speed, known_limb_gain, known_chest_gain, None)
+    prompt += "\nĐọc dạng sóng độc lập. Không dùng kết luận máy, chẩn đoán viết tay hoặc các số máy in để suy ra đáp án. Được đọc nhãn chuyển đạo và chuẩn ghi. Không coi nhịp nhanh QRS rộng đồng nghĩa nhịp nhanh thất; tách mô tả, chẩn đoán phân biệt và mức độ khẩn cấp."
+    signature = request_fingerprint(payload, prompt, provider, model, thinking)
+    st.caption("Khi bấm Phân tích, ảnh và thông tin ca bệnh được gửi đến dịch vụ AI đã chọn. App giữ kết quả trong phiên làm việc; nên tải về trước khi đóng.")
+    if st.button("Phân tích ECG", type="primary", key="analyze_v7"):
+        if not api_key or not model:
+            st.warning("Cần thiết lập dịch vụ và API key trong mục Thiết lập AI.")
         else:
-            settings = {**current_config, "configuration": current_config,
-                "trial_label": trial_label.strip(), "mask_condition": mask_condition,
-                "uploaded_file_sha256": upload_sha, "config_sha256": current_hash,
-                "experiment": lock if test_mode else None, "measurement_reviews": [],
-                "ai_measurement_status": "Chưa được bác sĩ xác minh", "image_confirmed_by_user": True}
-            services = []
-            if provider != "OpenAI":
-                services.append(("Gemini", gemini_model, active_gemini_key))
-            if provider != "Google Gemini":
-                services.append(("OpenAI", openai_model, active_openai_key))
-            for service, model, api_key in services:
-                st.subheader(f"Báo cáo AI chưa xác minh ({model})")
-                if service == "Gemini":
-                    generator = analyze_with_gemini_stream(api_key, model, payload, full_prompt, gemini_thinking)
-                else:
-                    generator = analyze_with_openai_stream(api_key, model, base64.b64encode(payload).decode("ascii"), full_prompt)
-                outcome = display_analysis(generator)
-                record = {**settings, **outcome, "measurement_reviews": [], "run_id": uuid.uuid4().hex[:12],
-                    "utc_time": datetime.now(timezone.utc).isoformat(), "service": service,
-                    "requested_model": model, "thinking_level": gemini_thinking if service == "Gemini" else None,
-                    "generation_options": current_config["generation_options"][service],
-                    "prompt": full_prompt, "image_png": payload, "image_sha256": image_sha,
-                    "sdk_versions": {p: importlib.metadata.version(p) for p in ("google-genai", "openai", "streamlit")}}
-                st.session_state.setdefault("ecg_runs_v6", []).append(record)
-else:
-    st.caption("Tải ảnh để chọn vùng ECG, kiểm tra ảnh gửi và khóa cấu hình.")
+            st.session_state.pop("last_report_v7", None)
+            st.subheader("Đang phân tích")
+            st.caption("Nội dung đang nhận là báo cáo AI chưa được bác sĩ kiểm tra.")
+            if provider == "Google Gemini":
+                generator = analyze_with_gemini_stream(api_key, model, payload, prompt, thinking)
+            else:
+                generator = analyze_with_openai_stream(api_key, model, base64.b64encode(payload).decode("ascii"), prompt)
+            outcome = display_analysis(generator)
+            st.session_state["last_report_v7"] = {**outcome, "signature": signature,
+                "provider": provider, "model": model, "image_png": payload,
+                "time_utc": datetime.now(timezone.utc).isoformat(),
+                "image_sha256": hashlib.sha256(payload).hexdigest(),
+                "app_version": APP_VERSION}
+            st.rerun()
 
-records = st.session_state.get("ecg_runs_v6", [])
-if st.session_state.get("ecg_runs_v5"):
-    st.download_button("Tải nhật ký v5 còn trong phiên", trial_zip(st.session_state["ecg_runs_v5"]), "ecg_trials_v5.zip", "application/zip")
-if records:
-    st.subheader("4. Nhật ký và số đo bác sĩ đối chiếu")
-    st.caption("Tối đa 8 lượt/phiên. ZIP chứa ảnh, bệnh sử, cấu hình và kết quả; không chứa API key. Tải trước khi đóng phiên hoặc Reboot.")
-    st.dataframe([{"Lượt": r["trial_label"], "ID": r["run_id"], "Model": r["requested_model"],
-        "Cấu hình": r["config_sha256"][:12], "Tiền xử lý": r["preprocessing"]["enabled"],
-        "Hoàn tất API": r["completed"], "Giây": r["total_seconds"], "Ảnh": r["image_sha256"][:12]}
-        for r in records], hide_index=True)
-    index = st.selectbox("Chọn lượt để đối chiếu", range(len(records)),
-        format_func=lambda i: f"{records[i]['trial_label']} · {records[i]['run_id']}", key="selected_run_v6")
-    selected = records[index]
-    rid = selected["run_id"]
-    with st.expander("Ảnh thực sự đã gửi của lượt được chọn"):
-        st.image(selected["image_png"], width="stretch")
-    st.warning("Báo cáo AI: toàn bộ số đo/diễn giải chưa kiểm chứng, kể cả khi AI tự viết 'có cơ sở'.")
-    if not selected["completed"]:
-        st.error("Luồng API không hoàn tất. " + (selected.get("error") or ""))
-    st.markdown(selected["report"] or "Không có nội dung trả về.")
-    values = selected["verified_values"]
-    source_rows = [{"Thông tin": label, "Giá trị": str(values.get(key)) if values.get(key) is not None else "Chưa xác định",
-        "Nguồn / trạng thái": "Người dùng xác nhận trước phân tích" if values.get(key) is not None else "Chưa được người dùng xác nhận"}
-        for key, label in [("speed_mm_s", "Tốc độ giấy (mm/s)"), ("limb_mm_mv", "Chuẩn chi (mm/mV)"), ("chest_mm_mv", "Chuẩn ngực (mm/mV)")]]
-    st.dataframe(source_rows, hide_index=True)
-    with st.expander("Bác sĩ ghi số đo đã tự đối chiếu — không xác nhận toàn bộ báo cáo"):
-        st.caption("Nhập kết quả tự đo/đối chiếu với ECG gốc. Để trống số chưa kiểm tra. Các lần lưu được giữ lại trong lịch sử; đây là ghi nhận tự xác nhận, không xác thực danh tính bác sĩ.")
-        with st.form("review_" + rid):
-            reviewer = st.text_input("Tên bác sĩ kiểm tra")
-            hr = st.number_input("Tần số đã kiểm tra (bpm)", 1, 400, value=None)
-            pr = st.number_input("PR đã kiểm tra (ms)", 1, 1000, value=None)
-            qrs = st.number_input("QRS đã kiểm tra (ms)", 1, 500, value=None)
-            qt = st.number_input("QT đã kiểm tra (ms)", 1, 1500, value=None)
-            qtc = st.number_input("QTc đã kiểm tra (ms)", 1, 1500, value=None)
-            note = st.text_area("Chuyển đạo, mốc đo, tốc độ và cách đo; công thức QTc nếu có")
-            attested = st.checkbox("Tôi là bác sĩ đã đối chiếu các số vừa nhập với ECG gốc")
-            save_review = st.form_submit_button("Lưu lần đối chiếu số đo")
-        if save_review:
-            try:
-                add_measurement_review(selected, {"hr_bpm": hr, "pr_ms": pr, "qrs_ms": qrs, "qt_ms": qt, "qtc_ms": qtc}, reviewer, attested, note)
-                st.success("Đã lưu số đo đối chiếu riêng. Nội dung AI và trạng thái chưa xác minh được giữ nguyên.")
-            except ValueError as error:
-                st.error(str(error))
-    for review in selected.get("measurement_reviews", []):
-        st.caption(f"Người tự xác nhận: {review['reviewer']} · {review['utc_time']} (UTC)")
-        st.json(review)
-    st.download_button("Tải ZIP: ảnh gửi + cấu hình + prompt + báo cáo + đối chiếu", trial_zip(records), "ecg_trials_v6.zip", "application/zip", key="zip_v6")
-    if st.button("Xóa nhật ký trong phiên sau khi đã tải ZIP", key="clear_v6"):
-        st.session_state.pop("ecg_runs_v6", None)
-        st.session_state.pop("selected_run_v6", None)
-        st.rerun()
+    result = st.session_state.get("last_report_v7")
+    if result and result["signature"] != signature:
+        st.info("Ảnh, thông tin ca bệnh hoặc thiết lập AI đã thay đổi. Bấm Phân tích để tạo báo cáo phù hợp với dữ liệu hiện tại.")
+    elif result:
+        st.subheader("Kết quả phân tích")
+        st.caption(f"{result['provider']} · {result['model']} · {result['total_seconds']:.1f} giây")
+        if not result["completed"]:
+            st.error(result.get("error") or "Phân tích chưa hoàn tất.")
+            if result["report"]:
+                st.warning("Nội dung dưới đây bị gián đoạn, không phải báo cáo hoàn chỉnh.")
+        st.markdown(result["report"] or "Chưa có nội dung trả về.")
+        st.caption("Báo cáo do AI tạo; cần bác sĩ xác minh số đo, dạng sóng và kết luận.")
+        if result["report"]:
+            state = "API đã trả nội dung hoàn chỉnh; chưa được bác sĩ xác minh" if result["completed"] else "BÁO CÁO BỊ GIÁN ĐOẠN — KHÔNG HOÀN CHỈNH"
+            download = (f"# Phân tích ECG — by dr. Lai\n\n{state}\n\n"
+                f"Dịch vụ: {result['provider']} | Model: {result['model']}\n\n"
+                f"Thời gian tạo (UTC): {result['time_utc']}\n\n" + result["report"])
+            st.download_button("Tải báo cáo", download, "ecg_by_dr_lai.md", "text/markdown", key="download_v7")
+else:
+    st.caption("Tải ảnh hoặc chụp điện tâm đồ để bắt đầu.")
