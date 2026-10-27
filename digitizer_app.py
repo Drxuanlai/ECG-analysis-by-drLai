@@ -50,9 +50,20 @@ def auto_deskew(image):
     lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(80,small.shape[1]//8),minLineLength=small.shape[1]//4,maxLineGap=20)
     angles=[]
     if lines is not None:
-        for x1,y1,x2,y2 in lines[:,0]:
+        # OpenCV builds may return (N, 1, 4), (N, 4), or another
+        # equivalent contiguous shape. Normalize before unpacking so
+        # Streamlit Cloud/OpenCV version differences cannot crash the app.
+        try:
+            line_rows = np.asarray(lines).reshape(-1, 4)
+        except (TypeError, ValueError):
+            line_rows = np.empty((0, 4), dtype=np.float32)
+        for row in line_rows:
+            x1, y1, x2, y2 = map(float, row)
+            if not np.all(np.isfinite([x1, y1, x2, y2])):
+                continue
             a=np.degrees(np.arctan2(y2-y1,x2-x1))
-            if -12 <= a <= 12: angles.append(a)
+            if -12 <= a <= 12:
+                angles.append(float(a))
     angle=float(np.median(angles)) if len(angles)>=2 else 0.0
     if abs(angle)<0.25: return image.copy(),0.0
     arr=np.asarray(image.convert("RGB")); h,w=arr.shape[:2]
