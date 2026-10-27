@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.11-auto-12lead"
-METHOD = "auto-12lead-layout-centerline-dp-v11"
+VERSION = "Digitizer 0.12-final-auto-grid"
+METHOD = "auto-grid-12lead-centerline-dp-v12"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -1138,33 +1138,70 @@ STANDARD_12_LAYOUT = [
     ["III", "aVF", "V3", "V6"],
 ]
 
-def standard_12lead_boxes(image, paper_box):
-    """Conservative standard 3x4 ECG layout boxes inside detected paper.
-    This is geometry-based, not OCR. Boxes deliberately trim labels and borders.
-    Returns 12 diagnostic leads plus a bottom rhythm-strip candidate.
+def detect_ecg_grid_bbox(image, paper_box=None):
+    """Detect the pink/red ECG graph-paper region inside the photographed page.
+    Falls back conservatively to the detected bright paper when red-grid evidence is weak.
     """
-    x0,y0,x1,y1=paper_box
-    pw=max(1,x1-x0); ph=max(1,y1-y0)
-    # Header is commonly above traces; bottom margin may contain footer.
-    left=x0+int(.035*pw); right=x1-int(.018*pw)
-    top=y0+int(.20*ph); bottom=y0+int(.80*ph)
-    trace_h=max(1,bottom-top)
-    row_h=trace_h/4.0
+    rgb=np.asarray(image.convert("RGB"))
+    h,w=rgb.shape[:2]
+    if paper_box is None: paper_box=detect_paper_bbox(image)
+    px0,py0,px1,py1=map(int,paper_box)
+    roi=rgb[py0:py1,px0:px1]
+    if roi.size==0: return paper_box
+    r=roi[:,:,0].astype(np.int16); g=roi[:,:,1].astype(np.int16); b=roi[:,:,2].astype(np.int16)
+    # Red/pink grid: R tends to exceed G/B, including faint photographed grid lines.
+    red=((r-g)>7)&((r-b)>5)&(r>105)
+    m=(red.astype(np.uint8)*255)
+    # Join the dense grid-line network into its rectangular print region.
+    kx=max(15,roi.shape[1]//90); ky=max(9,roi.shape[0]//70)
+    m=cv2.morphologyEx(m,cv2.MORPH_CLOSE,np.ones((ky,kx),np.uint8))
+    m=cv2.dilate(m,np.ones((max(3,ky//2),max(3,kx//2)),np.uint8),iterations=1)
+    contours,_=cv2.findContours(m,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    best=None; best_score=0.0
+    for c in contours:
+        x,y,bw,bh=cv2.boundingRect(c)
+        if bw < roi.shape[1]*.45 or bh < roi.shape[0]*.25: continue
+        density=float(red[y:y+bh,x:x+bw].mean())
+        score=bw*bh*(0.35+density)
+        if score>best_score: best_score=score; best=(x,y,x+bw,y+bh)
+    if best is None:
+        # Projection fallback: grid usually spans most page width and has repeated red pixels.
+        row=red.mean(axis=1); col=red.mean(axis=0)
+        ys=np.flatnonzero(row>max(.008,float(np.percentile(row,55))*.35))
+        xs=np.flatnonzero(col>max(.008,float(np.percentile(col,55))*.35))
+        if len(xs)>20 and len(ys)>20:
+            best=(int(xs[0]),int(ys[0]),int(xs[-1]+1),int(ys[-1]+1))
+        else:
+            return paper_box
+    x0,y0,x1,y1=best
+    pad_x=int(.006*roi.shape[1]); pad_y=int(.010*roi.shape[0])
+    return (max(px0,px0+x0-pad_x),max(py0,py0+y0-pad_y),
+            min(px1,px0+x1+pad_x),min(py1,py0+y1+pad_y))
+
+
+def standard_12lead_boxes(image, paper_box):
+    """Map the standard 3x4 layout inside the detected ECG GRID, not the whole page.
+    Geometry is still a hypothesis (not OCR), but header/footer no longer drive row positions.
+    """
+    gx0,gy0,gx1,gy1=detect_ecg_grid_bbox(image,paper_box)
+    gw=max(1,gx1-gx0); gh=max(1,gy1-gy0)
+    # The diagnostic 3x4 block occupies the upper ~72% of the grid; the long rhythm
+    # strip occupies the lower band. Small trims avoid labels/calibration pulses at edges.
+    left=gx0+int(.018*gw); right=gx1-int(.012*gw)
+    diag_top=gy0+int(.115*gh); diag_bottom=gy0+int(.705*gh)
+    rhythm_top=gy0+int(.735*gh); rhythm_bottom=gy0+int(.925*gh)
+    row_h=(diag_bottom-diag_top)/3.0
+    col_w=(right-left)/4.0
     boxes=[]
-    # First three rows are 4 simultaneous 2.5-s lead blocks.
     for r,names in enumerate(STANDARD_12_LAYOUT):
-        cy0=top+r*row_h
-        cy1=top+(r+1)*row_h
+        cy0=diag_top+r*row_h; cy1=diag_top+(r+1)*row_h
         for c,name in enumerate(names):
-            cx0=left+c*(right-left)/4.0
-            cx1=left+(c+1)*(right-left)/4.0
-            # Trim label/calibration area at each cell edge but retain QRS extremes.
-            bx0=int(cx0+.055*(cx1-cx0)); bx1=int(cx1-.018*(cx1-cx0))
-            by0=int(cy0+.05*row_h); by1=int(cy1-.05*row_h)
+            cx0=left+c*col_w; cx1=left+(c+1)*col_w
+            # Keep most waveform width; trim only the label/start and calibration/end slivers.
+            bx0=int(cx0+.045*col_w); bx1=int(cx1-.025*col_w)
+            by0=int(cy0+.07*row_h); by1=int(cy1-.07*row_h)
             boxes.append({"lead":name,"box":(bx0,by0,bx1,by1),"row":r,"col":c,"kind":"diagnostic"})
-    # Long rhythm strip candidate, usually lead II.
-    ry0=int(top+3*row_h+.05*row_h); ry1=int(top+4*row_h-.05*row_h)
-    boxes.append({"lead":"II-rhythm","box":(left,ry0,right,ry1),"row":3,"col":0,"kind":"rhythm"})
+    boxes.append({"lead":"II-rhythm","box":(left,int(rhythm_top),right,int(rhythm_bottom)),"row":3,"col":0,"kind":"rhythm"})
     return boxes
 
 def crop_box_image(image, box):
@@ -1197,7 +1234,7 @@ def main():
     st.set_page_config(page_title="ECG Digitizer — by dr. Lai",page_icon="📈",layout="wide")
     st.title("📈 ECG Digitizer — by dr. Lai")
     st.caption(VERSION+" · Auto-first digitization + manual fallback · Không cần API")
-    st.info("Bản 0.11 ưu tiên toàn ECG: tự chia layout 12 chuyển đạo chuẩn và trích từng lead; chọn/crop một lead thủ công chỉ còn là fallback. Chưa phải thiết bị đo đã kiểm chứng lâm sàng và không tự chẩn đoán ECG.")
+    st.info("Bản 0.12 ưu tiên toàn ECG: tự tìm vùng lưới ECG, chia layout 12 chuyển đạo và tự trích centerline ngay; crop thủ công chỉ còn là fallback. Chưa phải thiết bị đo đã kiểm chứng lâm sàng và không tự chẩn đoán ECG.")
     st.caption("Ảnh được xử lý trên máy chủ Streamlit của app. Code này không gửi ảnh đến Gemini/GPT hay dịch vụ số hóa bên ngoài; không ghi ảnh vào đĩa hay bộ nhớ dùng chung giữa các phiên.")
     uploaded = st.file_uploader("Tải ảnh ECG",type=["jpg","jpeg","png","webp","heic","heif"],key="dg_upload",on_change=clear_result)
     if uploaded is None:
@@ -1251,20 +1288,21 @@ def main():
         mask_label=st.selectbox("Cách tách nét",["Ảnh chụp lưới đỏ (thử nghiệm)","Ảnh sạch / cách 0.3"],key="dg_batch_mask_"+frame)
         mask_mode='photo_red' if mask_label.startswith('Ảnh chụp') else 'legacy'
         params=dict(max_gray=185,local_contrast=10,suppress_color=True,remove_grid=True,continuity=.12,seed_percent=50.,mask_mode=mask_mode,photo_contrast=55,red_tolerance=6)
-        if st.button("Tự trích cụm đã chọn",type="primary",key="dg_batch_run_"+frame):
-            batch=[]; started=time.monotonic()
-            prog=st.progress(0.0)
-            for i,item in enumerate(selected):
-                crop=crop_box_image(oriented,item["box"])
-                try:
-                    cand=analyze_crop(crop,params)
-                    batch.append({**item,"crop":crop,"centerline":cand["centerline"],"overlay":centerline_overlay(cand["work"],cand["centerline"]),"stats":cand["centerline"]["stats"],"error":None})
-                except Exception as exc:
-                    batch.append({**item,"crop":crop,"centerline":None,"overlay":crop,"stats":{},"error":str(exc)})
-                prog.progress((i+1)/max(1,len(selected)))
-            st.session_state["dg_batch_result"]={"frame":frame,"group":group,"items":batch,"seconds":time.monotonic()-started}
+        run_key=f"{frame}|{group}|{mask_mode}"
         br=st.session_state.get("dg_batch_result")
-        if br and br.get("frame")==frame and br.get("group")==group:
+        if not br or br.get("run_key")!=run_key:
+            batch=[]; started=time.monotonic()
+            with st.spinner("Đang tự tách và trích centerline từng chuyển đạo..."):
+                for item in selected:
+                    crop=crop_box_image(oriented,item["box"])
+                    try:
+                        cand=analyze_crop(crop,params)
+                        batch.append({**item,"crop":crop,"centerline":cand["centerline"],"overlay":centerline_overlay(cand["work"],cand["centerline"]),"stats":cand["centerline"]["stats"],"error":None})
+                    except Exception as exc:
+                        batch.append({**item,"crop":crop,"centerline":None,"overlay":crop,"stats":{},"error":str(exc)})
+            br={"run_key":run_key,"frame":frame,"group":group,"items":batch,"seconds":time.monotonic()-started}
+            st.session_state["dg_batch_result"]=br
+        if br and br.get("run_key")==run_key:
             st.subheader("2. Kết quả từng chuyển đạo")
             st.write(f"Đã xử lý {len(br['items'])} vùng trong {br['seconds']:.2f} giây.")
             cols=st.columns(2)
@@ -1276,7 +1314,7 @@ def main():
                         st.image(item["overlay"],width="stretch")
                         ss=item["stats"]; st.caption(f"Ink support {ss.get('supported_fraction',0)*100:.1f}% · median confidence {ss.get('median_confidence_supported',0):.2f}")
             st.download_button("Tải CSV centerline của cụm",batch_centerline_csv(br["items"]),"digitizer_12lead_centerlines.csv","text/csv",key="dg_batch_csv_"+frame)
-            st.warning("v0.11 mới tự động hóa chia lead theo layout chuẩn; tên lead chưa được OCR xác nhận. Không dùng số hóa này để quyết định lâm sàng nếu khung/overlay chưa được kiểm tra.")
+            st.warning("v0.12 tự tìm vùng lưới rồi chia lead theo layout chuẩn và tự trích; tên lead vẫn chưa được OCR xác nhận. Không dùng số hóa này để quyết định lâm sàng nếu khung/overlay chưa được kiểm tra.")
         return
     st.subheader("1. Fallback: chọn đúng một chuyển đạo")
     lead = st.selectbox("Nhãn chuyển đạo do em chọn",["II","I","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6","Chưa xác định"],key="dg_lead_"+frame)
