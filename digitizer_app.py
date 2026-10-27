@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.10-centerline"
-METHOD = "auto-orient-row-centerline-dp-v10"
+VERSION = "Digitizer 0.11-auto-12lead"
+METHOD = "auto-12lead-layout-centerline-dp-v11"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -1131,11 +1131,73 @@ def clear_result():
     st.session_state.pop("digitizer_result",None)
 
 
+
+STANDARD_12_LAYOUT = [
+    ["I", "aVR", "V1", "V4"],
+    ["II", "aVL", "V2", "V5"],
+    ["III", "aVF", "V3", "V6"],
+]
+
+def standard_12lead_boxes(image, paper_box):
+    """Conservative standard 3x4 ECG layout boxes inside detected paper.
+    This is geometry-based, not OCR. Boxes deliberately trim labels and borders.
+    Returns 12 diagnostic leads plus a bottom rhythm-strip candidate.
+    """
+    x0,y0,x1,y1=paper_box
+    pw=max(1,x1-x0); ph=max(1,y1-y0)
+    # Header is commonly above traces; bottom margin may contain footer.
+    left=x0+int(.035*pw); right=x1-int(.018*pw)
+    top=y0+int(.20*ph); bottom=y0+int(.80*ph)
+    trace_h=max(1,bottom-top)
+    row_h=trace_h/4.0
+    boxes=[]
+    # First three rows are 4 simultaneous 2.5-s lead blocks.
+    for r,names in enumerate(STANDARD_12_LAYOUT):
+        cy0=top+r*row_h
+        cy1=top+(r+1)*row_h
+        for c,name in enumerate(names):
+            cx0=left+c*(right-left)/4.0
+            cx1=left+(c+1)*(right-left)/4.0
+            # Trim label/calibration area at each cell edge but retain QRS extremes.
+            bx0=int(cx0+.055*(cx1-cx0)); bx1=int(cx1-.018*(cx1-cx0))
+            by0=int(cy0+.05*row_h); by1=int(cy1-.05*row_h)
+            boxes.append({"lead":name,"box":(bx0,by0,bx1,by1),"row":r,"col":c,"kind":"diagnostic"})
+    # Long rhythm strip candidate, usually lead II.
+    ry0=int(top+3*row_h+.05*row_h); ry1=int(top+4*row_h-.05*row_h)
+    boxes.append({"lead":"II-rhythm","box":(left,ry0,right,ry1),"row":3,"col":0,"kind":"rhythm"})
+    return boxes
+
+def crop_box_image(image, box):
+    x0,y0,x1,y1=map(int,box)
+    x0=max(0,min(image.width-1,x0)); x1=max(x0+2,min(image.width,x1))
+    y0=max(0,min(image.height-1,y0)); y1=max(y0+2,min(image.height,y1))
+    return image.crop((x0,y0,x1,y1))
+
+def layout_preview(image, boxes):
+    out=image.copy(); d=ImageDraw.Draw(out)
+    for item in boxes:
+        x0,y0,x1,y1=item["box"]
+        d.rectangle((x0,y0,x1,y1),outline=(0,190,255),width=max(2,image.width//900))
+        d.rectangle((x0,y0,min(x1,x0+max(45,image.width//30)),min(y1,y0+max(22,image.height//45))),fill=(255,255,255))
+        d.text((x0+3,y0+2),item["lead"],fill=(0,0,0))
+    return out
+
+def batch_centerline_csv(batch):
+    out=io.StringIO(); w=csv.writer(out)
+    w.writerow(["lead","x_work_px","y_work_px","confidence","status","crop_x0","crop_y0","crop_x1","crop_y1"])
+    for item in batch:
+        lead=item["lead"]; box=item["box"]; cl=item.get("centerline")
+        if not cl: continue
+        for x,y in enumerate(cl["y"]):
+            if not np.isfinite(y): continue
+            w.writerow([lead,x,round(float(y),3),round(float(cl["confidence"][x]),4),cl["status"][x],*box])
+    return out.getvalue().encode("utf-8")
+
 def main():
     st.set_page_config(page_title="ECG Digitizer — by dr. Lai",page_icon="📈",layout="wide")
     st.title("📈 ECG Digitizer — by dr. Lai")
     st.caption(VERSION+" · Auto-first digitization + manual fallback · Không cần API")
-    st.info("Bản 0.8 ưu tiên tự động: tự gợi ý hàng ECG và trích nét; thao tác thủ công chỉ là fallback/QC. Chưa phải thiết bị đo đã kiểm chứng lâm sàng và không tự chẩn đoán ECG.")
+    st.info("Bản 0.11 ưu tiên toàn ECG: tự chia layout 12 chuyển đạo chuẩn và trích từng lead; chọn/crop một lead thủ công chỉ còn là fallback. Chưa phải thiết bị đo đã kiểm chứng lâm sàng và không tự chẩn đoán ECG.")
     st.caption("Ảnh được xử lý trên máy chủ Streamlit của app. Code này không gửi ảnh đến Gemini/GPT hay dịch vụ số hóa bên ngoài; không ghi ảnh vào đĩa hay bộ nhớ dùng chung giữa các phiên.")
     uploaded = st.file_uploader("Tải ảnh ECG",type=["jpg","jpeg","png","webp","heic","heif"],key="dg_upload",on_change=clear_result)
     if uploaded is None:
@@ -1171,6 +1233,52 @@ def main():
         oriented,deskew_angle=auto_deskew(oriented)
         if abs(deskew_angle)>=0.25: st.caption(f"Đã sửa nghiêng nhẹ khoảng {deskew_angle:+.2f}°; hãy kiểm tra ảnh xem có hợp lý không.")
     frame = suffix+str(rotation)+f"_{deskew_angle:.2f}"
+    mode=st.radio("Chế độ digitize",["Tự động 12 chuyển đạo (khuyên dùng)","Một chuyển đạo / fallback thủ công"],horizontal=True,key="dg_mode_"+frame)
+    if mode.startswith("Tự động"):
+        paper_box=detect_paper_bbox(oriented)
+        boxes=standard_12lead_boxes(oriented,paper_box)
+        st.subheader("1. Tự nhận layout 12 chuyển đạo")
+        st.image(layout_preview(oriented,boxes),caption="Khung xanh là 12 ô theo layout 3×4 chuẩn + strip nhịp II. Đây là nhận dạng hình học, chưa dùng OCR; hãy kiểm tra khung trước khi chạy.",width="stretch")
+        st.caption("Mapping chuẩn đang dùng: I–aVR–V1–V4 / II–aVL–V2–V5 / III–aVF–V3–V6; hàng dài dưới cùng = II-rhythm. Nếu máy in dùng layout khác, chuyển sang fallback thủ công.")
+        group=st.selectbox("Cụm cần trích",["Tất cả 12 chuyển đạo","Chuyển đạo chi (I, II, III, aVR, aVL, aVF)","Trước ngực (V1–V6)","Strip nhịp II"],key="dg_group_"+frame)
+        wanted={
+            "Tất cả 12 chuyển đạo":set([x for row in STANDARD_12_LAYOUT for x in row]),
+            "Chuyển đạo chi (I, II, III, aVR, aVL, aVF)":set(["I","II","III","aVR","aVL","aVF"]),
+            "Trước ngực (V1–V6)":set(["V1","V2","V3","V4","V5","V6"]),
+            "Strip nhịp II":set(["II-rhythm"]),
+        }[group]
+        selected=[b for b in boxes if b["lead"] in wanted]
+        mask_label=st.selectbox("Cách tách nét",["Ảnh chụp lưới đỏ (thử nghiệm)","Ảnh sạch / cách 0.3"],key="dg_batch_mask_"+frame)
+        mask_mode='photo_red' if mask_label.startswith('Ảnh chụp') else 'legacy'
+        params=dict(max_gray=185,local_contrast=10,suppress_color=True,remove_grid=True,continuity=.12,seed_percent=50.,mask_mode=mask_mode,photo_contrast=55,red_tolerance=6)
+        if st.button("Tự trích cụm đã chọn",type="primary",key="dg_batch_run_"+frame):
+            batch=[]; started=time.monotonic()
+            prog=st.progress(0.0)
+            for i,item in enumerate(selected):
+                crop=crop_box_image(oriented,item["box"])
+                try:
+                    cand=analyze_crop(crop,params)
+                    batch.append({**item,"crop":crop,"centerline":cand["centerline"],"overlay":centerline_overlay(cand["work"],cand["centerline"]),"stats":cand["centerline"]["stats"],"error":None})
+                except Exception as exc:
+                    batch.append({**item,"crop":crop,"centerline":None,"overlay":crop,"stats":{},"error":str(exc)})
+                prog.progress((i+1)/max(1,len(selected)))
+            st.session_state["dg_batch_result"]={"frame":frame,"group":group,"items":batch,"seconds":time.monotonic()-started}
+        br=st.session_state.get("dg_batch_result")
+        if br and br.get("frame")==frame and br.get("group")==group:
+            st.subheader("2. Kết quả từng chuyển đạo")
+            st.write(f"Đã xử lý {len(br['items'])} vùng trong {br['seconds']:.2f} giây.")
+            cols=st.columns(2)
+            for i,item in enumerate(br["items"]):
+                with cols[i%2]:
+                    st.markdown(f"**{item['lead']}**")
+                    if item["error"]: st.error(item["error"]); st.image(item["crop"],width="stretch")
+                    else:
+                        st.image(item["overlay"],width="stretch")
+                        ss=item["stats"]; st.caption(f"Ink support {ss.get('supported_fraction',0)*100:.1f}% · median confidence {ss.get('median_confidence_supported',0):.2f}")
+            st.download_button("Tải CSV centerline của cụm",batch_centerline_csv(br["items"]),"digitizer_12lead_centerlines.csv","text/csv",key="dg_batch_csv_"+frame)
+            st.warning("v0.11 mới tự động hóa chia lead theo layout chuẩn; tên lead chưa được OCR xác nhận. Không dùng số hóa này để quyết định lâm sàng nếu khung/overlay chưa được kiểm tra.")
+        return
+    st.subheader("1. Fallback: chọn đúng một chuyển đạo")
     lead = st.selectbox("Nhãn chuyển đạo do em chọn",["II","I","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6","Chưa xác định"],key="dg_lead_"+frame)
     auto_rows=auto_row_candidates(oriented)
     auto_roi=st.checkbox("Tự gợi ý vùng hàng ECG",value=True,key="dg_autoroi_"+frame)
