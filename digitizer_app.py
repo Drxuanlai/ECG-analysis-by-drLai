@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.6"
-METHOD = "ink-graph-bridge-preview-v6"
+VERSION = "Digitizer 0.7"
+METHOD = "ink-graph-manual-calipers-v7"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -664,6 +664,159 @@ def review_panel(result):
     return reviewed,review,overview
 
 
+def manual_calibration(points, horizontal_mm, vertical_mm, speed, gain):
+    """Local affine grid calibration from user-supplied O, X and Y anchors."""
+    if speed not in (25,50) or gain not in (2.5,5,10,20):
+        raise ValueError('Chưa xác nhận tốc độ giấy hoặc chuẩn biên độ.')
+    if horizontal_mm<=0 or vertical_mm<=0:raise ValueError('Khoảng lưới phải lớn hơn 0 mm.')
+    o=np.asarray(points['O'],float);vx=np.asarray(points['X'],float)-o;vy=np.asarray(points['Y'],float)-o
+    if not np.all(np.isfinite(np.concatenate([o,vx,vy,[horizontal_mm,vertical_mm]]))):
+        raise ValueError('Mốc và khoảng mm phải là số hữu hạn.')
+    if vx[0]<=0 or vy[1]<=0:raise ValueError('X cần nằm bên phải O; Y cần nằm phía dưới O trên ảnh đã xoay đúng chiều.')
+    if min(np.linalg.norm(vx),np.linalg.norm(vy))<5:
+        raise ValueError('Các mốc hiệu chuẩn quá sát; chọn khoảng lưới dài hơn.')
+    sine=float(np.linalg.det(np.column_stack([vx,vy]))/(np.linalg.norm(vx)*np.linalg.norm(vy)))
+    if sine<.25:raise ValueError('Mốc X cần theo chiều thời gian sang phải, Y đi xuống trên lưới; hai trục không được gần trùng nhau.')
+    basis=np.column_stack([vx/float(horizontal_mm),vy/float(vertical_mm)])
+    inverse=np.linalg.inv(basis)
+    return {'origin_crop_px':o.tolist(),'axis_x_crop_px':np.asarray(points['X'],float).tolist(),
+            'axis_y_crop_px':np.asarray(points['Y'],float).tolist(),
+            'horizontal_mm':float(horizontal_mm),'vertical_mm':float(vertical_mm),
+            'inverse_mm_per_px':inverse.tolist(),'speed_mm_s':float(speed),
+            'gain_mm_mV':float(gain),'status':'user_calibration_unverified',
+            'limits':'Local affine assumption only; curved/perspective paper may invalidate scale elsewhere.'}
+
+
+def manual_value(a,b,kind,calibration):
+    delta=np.asarray(b,float)-np.asarray(a,float)
+    if not np.all(np.isfinite(delta)):raise ValueError('Mốc A/B phải hữu hạn.')
+    mm=np.asarray(calibration['inverse_mm_per_px'])@delta
+    if kind in ('RR','PR','QRS','QT','Khoảng thời gian khác'):
+        if mm[0]<=0:raise ValueError('Mốc B phải nằm sau A theo trục thời gian đã hiệu chuẩn.')
+        value=1000*float(mm[0])/calibration['speed_mm_s'];unit='ms'
+        extra={'derived_rate_bpm':60000/value} if kind=='RR' else {}
+    else:
+        # Grid y points down, ECG voltage is positive upward.
+        value=-float(mm[1])/calibration['gain_mm_mV'];unit='mV';extra={}
+    return {'measurement':kind,'value':round(value,3),'unit':unit,
+            'delta_grid_mm':mm.tolist(),'a_crop_px':list(a),'b_crop_px':list(b),
+            'status':'manual_unverified','derived':extra}
+
+
+def caliper_image(image,points,active,window=None):
+    out=image.convert('RGB').copy();draw=ImageDraw.Draw(out)
+    colors={'O':'#8a2be2','X':'#e08b00','Y':'#00a078','A':'#0066ff','B':'#df0050'}
+    for name,p in points.items():
+        x,y=map(int,p);color=colors[name]
+        draw.ellipse((x-3,y-3,x+3,y+3),outline=color,width=2)
+        draw.text((min(x+5,out.width-14),max(0,y-14)),name,fill=color)
+    x,y=map(int,points[active]);color=colors[active]
+    draw.line((max(0,x-15),y,min(out.width-1,x+15),y),fill=color,width=1)
+    draw.line((x,max(0,y-15),x,min(out.height-1,y+15)),fill=color,width=1)
+    if window:
+        out=out.crop(window)
+        scale=max(1,min(6,1800//max(1,out.width),1000//max(1,out.height)))
+        out=out.resize((out.width*scale,out.height*scale),Image.Resampling.NEAREST)
+    return out
+
+
+def manual_csv(rows):
+    def safe(v):
+        if isinstance(v,str) and v.startswith(('=','+','-','@','\t','\r')):return "'"+v
+        return v
+    out=io.StringIO(newline='');writer=csv.writer(out)
+    writer.writerow(['id','lead','measurement','value','unit','derived_rate_bpm','a_x_crop_px',
+        'a_y_crop_px','b_x_crop_px','b_y_crop_px','status','notes'])
+    for row in rows:
+        writer.writerow([safe(v) for v in [row['id'],row['lead'],row['measurement'],row['value'],row['unit'],
+            row['derived'].get('derived_rate_bpm',''),*row['a_crop_px'],*row['b_crop_px'],row['status'],row['notes']]])
+    return out.getvalue().encode('utf-8-sig')
+
+
+def manual_html(rows,context,image):
+    import html,base64
+    esc=lambda v:html.escape(str(v))
+    data=base64.b64encode(png_bytes(image)).decode('ascii')
+    body=''.join('<tr>'+''.join('<td>'+esc(v)+'</td>' for v in [r['id'],r['lead'],r['measurement'],
+            f"{r['value']:.3f}",r['unit'],r['a_crop_px'],r['b_crop_px'],r['notes']])+'</tr>' for r in rows)
+    return '<!doctype html><html lang="vi"><meta charset="utf-8"><title>ECG — by dr. Lai</title><style>body{font:16px sans-serif;max-width:1100px;margin:24px auto;padding:16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #bbb;padding:8px}img{max-width:100%}.warn{padding:12px;background:#fff0d0} @media print{body{margin:0}}</style><h1>ECG — by dr. Lai</h1><p class="warn">BẢNG ĐO THỦ CÔNG THỬ NGHIỆM — CHƯA KIỂM CHỨNG. Không có chẩn đoán tự động. Mốc và hiệu chuẩn do người dùng đặt.</p><p>SHA256 ảnh: '+esc(context['source_sha256'])+'</p><p>Chuyển đạo: '+esc(context['lead'])+' · Vùng cắt: '+esc(context['crop_box_oriented_pixels'])+'</p><img alt="Vùng ảnh gốc đã chọn" src="data:image/png;base64,'+data+'"><table><tr><th>ID</th><th>Đạo</th><th>Số đo</th><th>Giá trị</th><th>Đơn vị</th><th>A (px)</th><th>B (px)</th><th>Ghi chú</th></tr>'+body+'</table><p>Các tọa độ thuộc vùng ảnh gốc sau xoay/cắt, chưa thu nhỏ. Số chữ số thập phân không đại diện độ chính xác. Xem JSON để truy nguyên hiệu chuẩn mỗi dòng. Ảnh nghiêng/phối cảnh hoặc giấy cong có thể gây sai số.</p></html>'
+
+
+def manual_measure_ui(crop,context):
+    st.subheader('2. Đặt mốc trên ảnh gốc')
+    st.caption('Không cần trích nét hoặc xóa nhánh trước. Dùng tọa độ pixel để dịch dấu chữ thập, phóng to kiểm tra rồi khóa hiệu chuẩn. App chưa hỗ trợ chạm trực tiếp vào ảnh.')
+    key='mm_'+hashlib.sha256(json.dumps(context,sort_keys=True).encode()).hexdigest()[:16]
+    w,h=crop.size
+    if key+'_points' not in st.session_state:
+        st.session_state[key+'_points']={'O':[int(w*.1),int(h*.1)],'X':[int(w*.2),int(h*.1)],
+            'Y':[int(w*.1),min(h-1,int(h*.6))],'A':[int(w*.3),int(h*.5)],'B':[int(w*.5),int(h*.5)]}
+    points=dict(st.session_state[key+'_points'])
+    active=st.selectbox('Mốc đang di chuyển',['O','X','Y','A','B'],key=key+'_active')
+    x=int(st.number_input('Tọa độ x của mốc (pixel)',min_value=0,max_value=w-1,value=int(points[active][0]),step=1,key=key+'_x_'+active))
+    y=int(st.number_input('Tọa độ y của mốc (pixel)',min_value=0,max_value=h-1,value=int(points[active][1]),step=1,key=key+'_y_'+active))
+    points[active]=[x,y];st.session_state[key+'_points']=points
+    st.image(caliper_image(crop,points,active),caption='O/X/Y: hiệu chuẩn lưới · A/B: hai mốc đo do người dùng đặt.',width='stretch')
+    with st.expander('Phóng to quanh mốc đang di chuyển',expanded=True):
+        span=st.slider('Chiều rộng cửa sổ xem (pixel)',min_value=32,max_value=max(32,min(w,800)),value=min(max(32,w//5),max(32,min(w,800))),key=key+'_span')
+        left=max(0,min(w-span,x-span//2));right=min(w,left+span)
+        half=max(16,min(h//2,int(span*.4)));top=max(0,min(h-2*half,y-half));bottom=min(h,top+2*half)
+        st.image(caliper_image(crop,points,active,(left,top,right,bottom)),caption='Pixel phóng to; vị trí mốc vẫn tính trên ảnh gốc của vùng cắt.',width='stretch')
+    st.subheader('3. Hiệu chuẩn lưới và chuẩn ghi')
+    st.write('Đặt O tại giao điểm lưới. X nằm sang phải trên cùng hàng lưới; Y nằm phía dưới trên cùng cột lưới. Nhập đúng khoảng cách giấy từ O đến X/Y. Dùng vùng lưới gần nhát đang đo.')
+    xmm=st.number_input('Khoảng O–X trên giấy (mm)',min_value=1.,max_value=50.,value=5.,step=1.,key=key+'_xmm')
+    ymm=st.number_input('Khoảng O–Y trên giấy (mm)',min_value=1.,max_value=50.,value=5.,step=1.,key=key+'_ymm')
+    speed=st.selectbox('Tốc độ giấy đã xác nhận (mm/s)',['Chưa xác nhận',25,50],key=key+'_speed')
+    gain=st.selectbox('Chuẩn biên độ của chuyển đạo này (mm/mV)',['Chưa xác nhận',2.5,5,10,20],key=key+'_gain')
+    config={'anchors':{k:points[k] for k in ['O','X','Y']},'horizontal_mm':xmm,'vertical_mm':ymm,'speed':speed,'gain':gain}
+    fingerprint=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest()
+    confirmed=st.checkbox('Tôi đã kiểm tra mốc O/X/Y đúng lưới, khoảng mm và chuẩn ghi đúng cho vùng đo này',value=False,key=key+'_check_'+fingerprint[:12])
+    if st.button('Khóa hiệu chuẩn đang đặt',key=key+'_lock',disabled=not confirmed):
+        try:
+            cal=manual_calibration(points,xmm,ymm,speed,gain)
+            st.session_state[key+'_cal']={'fingerprint':fingerprint,'calibration':cal}
+        except ValueError as exc:st.error(str(exc))
+    locked=st.session_state.get(key+'_cal')
+    valid=bool(locked and locked['fingerprint']==fingerprint and confirmed)
+    if not valid:st.info('Chưa có hiệu chuẩn hợp lệ cho cấu hình hiện tại. App chỉ hiện vị trí pixel, chưa tính ms/mV.')
+    else:st.caption('Đã khóa hiệu chuẩn do người dùng đặt. Đây không phải xác minh độ chính xác; giấy cong hoặc phối cảnh thay đổi có thể làm sai tỷ lệ.')
+    st.subheader('4. Đo thủ công và lưu bảng')
+    kind=st.selectbox('Loại số đo',['RR','PR','QRS','QT','Khoảng thời gian khác','Biên độ / chênh ST'],key=key+'_kind')
+    st.caption('Khoảng thời gian: A là đầu, B là cuối do bác sĩ chọn. Biên độ/ST: A trên đường nền tham chiếu, B tại điểm cần so; dương là B cao hơn A theo trục lưới. App không nhận diện mốc PQRST hoặc điểm J.')
+    note=st.text_input('Ghi chú nhát đo / vị trí mốc',key=key+'_note')
+    confirmed_points=st.checkbox('Tôi đã đối chiếu A/B với ảnh gốc cho số đo này',value=False,
+        key=key+'_abcheck_'+hashlib.sha256(json.dumps([points['A'],points['B'],kind,fingerprint]).encode()).hexdigest()[:12])
+    current=None
+    if valid:
+        try:
+            current=manual_value(points['A'],points['B'],kind,locked['calibration'])
+            st.write(f"Kết quả thử nghiệm: {current['value']:.3f} {current['unit']} — CHƯA KIỂM CHỨNG")
+            if kind=='RR':st.caption(f"Tần số suy từ riêng RR này: {current['derived']['derived_rate_bpm']:.1f}/phút; không phải tần số trung bình toàn ECG.")
+        except ValueError as exc:st.info(str(exc))
+    rows=list(st.session_state.get(key+'_rows',[]))
+    if st.button('Lưu số đo vào bảng',key=key+'_save',disabled=not(valid and current and confirmed_points)):
+        row=dict(current,id=max((r['id'] for r in rows),default=0)+1,lead=context['lead'],notes=note,
+            time_utc=datetime.now(timezone.utc).isoformat(),calibration_fingerprint=fingerprint,
+            calibration=locked['calibration'])
+        rows.append(row);st.session_state[key+'_rows']=rows[-100:]
+    if st.button('Xóa bảng số đo trong phiên',key=key+'_clear'):
+        st.session_state[key+'_rows']=[];rows=[]
+    else:rows=list(st.session_state.get(key+'_rows',[]))
+    if rows:
+        st.dataframe([{'ID':r['id'],'Đạo':r['lead'],'Số đo':r['measurement'],'Giá trị':r['value'],
+            'Đơn vị':r['unit'],'Hiệu chuẩn':'hiện tại' if valid and r['calibration_fingerprint']==fingerprint else 'đã lưu trước đó',
+            'Trạng thái':'chưa kiểm chứng','Ghi chú':r['notes']} for r in rows],hide_index=True)
+        report={'version':VERSION,'mode':'manual_image_calipers','status':'manual_unverified',
+            'context':context,'crop_size_pixels':list(crop.size),'measurements':rows,
+            'limits':'User placed anchors/landmarks, local affine scale, no clinical validation or automated ECG diagnosis.'}
+        st.download_button('Tải bảng số đo CSV',manual_csv(rows),'ecg_manual_measurements.csv','text/csv',key=key+'_csv')
+        st.download_button('Tải hồ sơ đo JSON',json.dumps(report,ensure_ascii=False,indent=2),'ecg_manual_record.json','application/json',key=key+'_json')
+        st.download_button('Tải báo cáo HTML',manual_html(rows,context,crop),'ecg_manual_report.html','text/html',key=key+'_html')
+        st.caption('CSV/JSON/HTML chứa dữ liệu đã lưu cùng hiệu chuẩn của từng dòng. Thay mốc hiện tại không tự sửa số đo cũ. Tải trước khi đóng phiên.')
+    st.subheader('5. Một lượt kiểm thử trọn luồng')
+    st.write('Đo cùng một khoảng RR bằng app và đếm ô trên ảnh gốc; ghi cả hai để đối chiếu. Sau đó thử QRS và chênh biên độ do bác sĩ chọn. Gửi JSON + CSV + ảnh vị trí mốc, không cần bỏ thêm nhánh trích nét.')
+    st.warning('Đây là công cụ đo thủ công thử nghiệm trên ảnh, chưa kiểm chứng lâm sàng. Không tự chẩn đoán và không biến nhánh nét 2D thành tín hiệu số chính xác.')
+
+
 def clear_result():
     st.session_state.pop("digitizer_result",None)
 
@@ -671,8 +824,8 @@ def clear_result():
 def main():
     st.set_page_config(page_title="ECG Digitizer — by dr. Lai",page_icon="📈",layout="wide")
     st.title("📈 ECG Digitizer — by dr. Lai")
-    st.caption(VERSION+" · Thử nghiệm trích nét của MỘT chuyển đạo · Không cần API")
-    st.info("Đường màu là nét tối ứng viên do xử lý ảnh tìm được, chưa được xác nhận là tín hiệu ECG. Bản này chưa đo PR/QRS/ST, chưa chẩn đoán và chưa dùng mô hình số hóa có trọng số.")
+    st.caption(VERSION+" · Đo thủ công trên ảnh gốc và đối chiếu trích nét · Không cần API")
+    st.info("Bản thử nghiệm: mốc đo và hiệu chuẩn do bác sĩ đặt trên ảnh gốc. Trích nét là luồng đối chiếu riêng, chưa tự xác nhận tín hiệu hoặc chẩn đoán ECG.")
     st.caption("Ảnh được xử lý trên máy chủ Streamlit của app. Code này không gửi ảnh đến Gemini/GPT hay dịch vụ số hóa bên ngoài; không ghi ảnh vào đĩa hay bộ nhớ dùng chung giữa các phiên.")
     uploaded = st.file_uploader("Tải ảnh ECG",type=["jpg","jpeg","png","webp","heic","heif"],key="dg_upload",on_change=clear_result)
     if uploaded is None:
@@ -706,6 +859,11 @@ def main():
     st.image(roi_preview(oriented,box),caption="Khung đỏ là vùng sẽ dò. Kiểm tra cả đỉnh R và đáy S không bị cắt.",width="stretch")
     st.image(crop,caption="Ảnh gốc của vùng chọn. Nên có 2–5 nhát, một hàng sóng; tránh chữ, hàng sóng khác và xung chuẩn.",width="stretch")
     st.caption("Nhãn do người dùng chọn, app chưa tự xác nhận đúng chuyển đạo. Vùng quá cao có thể khiến thuật toán bám nhầm hàng khác.")
+    workflow=st.radio('Công việc',['Đo thủ công trên ảnh gốc','Đối chiếu trích nét (nâng cao)'],key='dg_workflow')
+    if workflow=='Đo thủ công trên ảnh gốc':
+        manual_measure_ui(crop,{'source_sha256':sha,'rotation_ccw':rotation,
+            'oriented_size':list(oriented.size),'crop_box_oriented_pixels':list(box),'lead':lead})
+        return
     st.subheader("2. Trích nét thử nghiệm")
     mask_label=st.selectbox("Cách tách nét",["Ảnh sạch / cách 0.3","Ảnh chụp lưới đỏ (thử nghiệm)"],key="dg_mask_mode_"+frame)
     mask_mode='photo_red' if mask_label.startswith('Ảnh chụp') else 'legacy'
