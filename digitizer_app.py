@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.8-auto"
-METHOD = "ink-graph-auto-roi-v8"
+VERSION = "Digitizer 0.10-centerline"
+METHOD = "auto-orient-row-centerline-dp-v10"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -37,6 +37,64 @@ def orient(image, angle):
     turns = {90:Image.Transpose.ROTATE_90,180:Image.Transpose.ROTATE_180,270:Image.Transpose.ROTATE_270}
     return image.transpose(turns[angle]) if angle in turns else image.copy()
 
+
+
+
+
+def detect_paper_bbox(image):
+    """Return a conservative bright-page bbox (x0,y0,x1,y1) or full image.
+    Used only to keep auto-row scoring away from keyboard/table/background.
+    """
+    rgb=np.asarray(image.convert("RGB"))
+    h,w=rgb.shape[:2]
+    gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+    # Bright, weakly saturated areas are typical ECG paper.
+    mx=rgb.max(axis=2).astype(np.int16); mn=rgb.min(axis=2).astype(np.int16)
+    sat=mx-mn
+    mask=((gray>145)&(sat<75)).astype(np.uint8)*255
+    kx=max(9,w//80); ky=max(9,h//80)
+    mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((ky,kx),np.uint8))
+    mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+    contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    best=None; best_score=0.0
+    for c in contours:
+        x,y,bw,bh=cv2.boundingRect(c)
+        area=bw*bh
+        if area < 0.10*w*h: continue
+        roi=mask[y:y+bh,x:x+bw]
+        fill=float((roi>0).mean()) if roi.size else 0.0
+        score=area*fill
+        if score>best_score:
+            best_score=score; best=(x,y,x+bw,y+bh)
+    if best is None:
+        return (0,0,w,h)
+    x0,y0,x1,y1=best
+    pad_x=int(0.015*w); pad_y=int(0.015*h)
+    return (max(0,x0-pad_x),max(0,y0-pad_y),min(w,x1+pad_x),min(h,y1+pad_y))
+
+
+def auto_orient_page(image):
+    """Choose 0/90/180/270 orientation conservatively.
+    Primary cue: detected paper should be landscape for a standard 12-lead printout.
+    0 vs 180 cannot be proven reliably from morphology alone, so this routine
+    intentionally prefers the smaller rotation when their scores are close.
+    """
+    candidates=[]
+    for angle in (0,90,180,270):
+        im=orient(image,angle)
+        x0,y0,x1,y1=detect_paper_bbox(im)
+        pw=max(1,x1-x0); ph=max(1,y1-y0)
+        area=(pw*ph)/(im.width*im.height)
+        aspect=pw/ph
+        # ECG printouts are usually landscape; prefer a substantial detected page.
+        landscape=min(2.5,max(0.0,aspect))/2.5
+        score=2.0*landscape+1.2*area
+        # Slight stability preference to avoid gratuitous 180/270 flips.
+        score -= {0:0.0,90:0.01,180:0.04,270:0.02}[angle]
+        candidates.append((score,angle,im,(x0,y0,x1,y1)))
+    candidates.sort(key=lambda z:z[0],reverse=True)
+    _,angle,im,bbox=candidates[0]
+    return im,angle,bbox
 
 
 def auto_deskew(image):
@@ -73,8 +131,11 @@ def auto_deskew(image):
 
 
 def auto_row_candidates(image, max_rows=4):
-    """Suggest ECG row ROIs from horizontal dark-ink energy. Suggestions only."""
-    work=image.convert("RGB").copy(); work.thumbnail((1800,1400),Image.Resampling.LANCZOS)
+    """Suggest ECG row ROIs, first restricting scoring to the detected paper."""
+    full=image.convert("RGB")
+    px0,py0,px1,py1=detect_paper_bbox(full)
+    page=full.crop((px0,py0,px1,py1))
+    work=page.copy(); work.thumbnail((1800,1400),Image.Resampling.LANCZOS)
     arr=np.asarray(work); gray=np.max(arr,axis=2).astype(np.uint8)
     ink=(gray<205).astype(np.uint8)
     # Suppress very long horizontal/vertical rules before row scoring.
@@ -102,7 +163,12 @@ def auto_row_candidates(image, max_rows=4):
     for a,b,sc in sorted(merged,key=lambda z:z[2],reverse=True):
         a=max(0,a-pad); b=min(work.height-1,b+pad)
         if b-a < work.height*.035 or b-a > work.height*.35: continue
-        result.append((0,a/work.height*100,98,b/work.height*100,sc))
+        # Map page-relative percentages back to the complete oriented image.
+        y0_abs=(py0 + (a/work.height)*(py1-py0))/full.height*100
+        y1_abs=(py0 + (b/work.height)*(py1-py0))/full.height*100
+        x0_abs=px0/full.width*100
+        x1_abs=px1/full.width*100
+        result.append((x0_abs,y0_abs,x1_abs,y1_abs,sc))
         if len(result)>=max_rows:break
     return sorted(result,key=lambda r:r[1])
 
@@ -255,6 +321,181 @@ def trace_candidates(mask, gray, continuity=.12, seed_percent=50.):
             "vertical_span":vertical_span}
 
 
+
+def trace_centerline(mask, gray, continuity=.12, seed_percent=50.):
+    """Return one left-to-right image centerline candidate.
+
+    Unlike trace_candidates(), multiple dark runs in one x-column do NOT
+    automatically delete the chosen point. The dynamic-programming path resolves
+    one y candidate; ambiguity is carried as confidence/status metadata.
+    Missing ink is never silently interpolated: unsupported columns are NaN.
+    """
+    h,w = mask.shape
+    if not np.any(mask):
+        raise ValueError("Không có đủ nét tối để dò centerline.")
+
+    ink=mask.astype(bool)
+    rows=np.arange(h,dtype=np.float32)
+    indices=np.arange(h,dtype=np.int32)
+    parent=np.empty((w,h),dtype=np.uint16 if h < 65535 else np.uint32)
+
+    # Long straight rules are evidence of grid, but only a soft penalty: a real
+    # ECG can contain horizontal/near-vertical pieces, so pixels are never erased.
+    hk=max(15,min(w//18,61))
+    vk=max(9,min(h//4,51))
+    horizontal=cv2.morphologyEx(ink.astype(np.uint8),cv2.MORPH_OPEN,
+                                np.ones((1,hk),np.uint8)).astype(bool)
+    vertical=cv2.morphologyEx(ink.astype(np.uint8),cv2.MORPH_OPEN,
+                              np.ones((vk,1),np.uint8)).astype(bool)
+    grid_like=horizontal|vertical
+
+    darkness=1.0-gray.astype(np.float32)/255.0
+    # Local horizontal support rewards a stroke that persists across neighboring
+    # columns. It is deliberately weak so sharp QRS slopes are not suppressed.
+    local=cv2.boxFilter(ink.astype(np.float32),-1,(5,3),normalize=True)
+    seed=float(seed_percent)*(h-1)/100.0
+
+    def emission(x):
+        # Ink: dark pixels are cheapest; grid-like line evidence is penalized.
+        e=np.where(ink[:,x], 1.05-0.85*darkness[:,x]-0.25*local[:,x], 9.0)
+        e=e+0.55*grid_like[:,x].astype(np.float32)
+        return e.astype(np.float32)
+
+    cost=emission(0)+float(continuity)*0.15*np.abs(rows-seed)
+    parent[0]=indices
+    for x in range(1,w):
+        # Exact O(h) distance transform for min_j cost[j] + lambda*|i-j|.
+        fraw=cost-float(continuity)*rows
+        fmin=np.minimum.accumulate(fraw)
+        fparent=np.maximum.accumulate(np.where(fraw<=fmin,indices,0))
+        forward=fmin+float(continuity)*rows
+
+        braw=(cost+float(continuity)*rows)[::-1]
+        bmin=np.minimum.accumulate(braw)
+        bparent_rev=np.maximum.accumulate(np.where(braw<=bmin,indices,0))
+        bparent=(h-1-bparent_rev)[::-1]
+        backward=bmin[::-1]-float(continuity)*rows
+
+        use_f=forward<=backward
+        parent[x]=np.where(use_f,fparent,bparent)
+        cost=np.minimum(forward,backward)+emission(x)
+
+    path=np.empty(w,dtype=np.int32)
+    path[-1]=int(np.argmin(cost))
+    for x in range(w-1,0,-1):
+        path[x-1]=int(parent[x,path[x]])
+
+    run_count=ink[0].astype(np.int16)+np.sum(ink[1:] & ~ink[:-1],axis=0).astype(np.int16)
+    vertical_span=np.zeros(w,dtype=np.int32)
+    snapped=path.copy()
+    supported=np.zeros(w,dtype=bool)
+    snap_radius=max(2,min(5,h//80+2))
+
+    for x,y in enumerate(path):
+        ys=np.flatnonzero(ink[:,x])
+        if ys.size==0:
+            continue
+        nearest=int(ys[np.argmin(np.abs(ys-y))])
+        if abs(nearest-y)>snap_radius:
+            continue
+        supported[x]=True
+        lo=hi=nearest
+        while lo>0 and ink[lo-1,x]: lo-=1
+        while hi+1<h and ink[hi+1,x]: hi+=1
+        vertical_span[x]=hi-lo+1
+        snapped[x]=(lo+hi)//2
+
+    status=np.full(w,'centerline_candidate',dtype=object)
+    status[~supported]='no_ink_support'
+    # A photographed ECG grid creates many ink runs in almost every column.
+    # Judge unusual multiplicity relative to this image rather than using a
+    # fixed >3 rule that previously rejected nearly everything.
+    base_runs=float(np.median(run_count[supported])) if supported.any() else 0.0
+    mad_runs=float(np.median(np.abs(run_count[supported]-base_runs))) if supported.any() else 0.0
+    multi_threshold=max(5.0,base_runs+max(2.0,2.5*mad_runs))
+    unusual_multi=supported & (run_count>multi_threshold)
+    status[unusual_multi]='ambiguous_multiple_ink_runs'
+    very_vertical=supported & (vertical_span>max(14,int(h*.22)))
+    status[very_vertical]='ambiguous_near_vertical_stroke'
+    edge=supported & ((snapped<=1)|(snapped>=h-2))
+    status[edge]='touches_crop_edge'
+
+    # Confidence is an engineering review aid only; it is NOT an accuracy score.
+    conf=np.zeros(w,dtype=np.float32)
+    good=np.flatnonzero(supported)
+    if good.size:
+        yy=snapped[good]
+        base=0.35+0.55*darkness[yy,good]
+        excess=np.maximum(0.0,run_count[good]-multi_threshold)
+        base-=0.025*np.minimum(6.0,excess)
+        base-=0.30*(vertical_span[good]>max(14,int(h*.22)))
+        base-=0.12*grid_like[yy,good]
+        conf[good]=np.clip(base,0.05,0.99)
+
+    values=snapped.astype(float)
+    values[~supported]=np.nan
+
+    missing=np.flatnonzero(~supported)
+    longest_gap=0
+    if missing.size:
+        groups=np.split(missing,np.where(np.diff(missing)>1)[0]+1)
+        longest_gap=max((len(g) for g in groups),default=0)
+    low=supported & (conf<.35)
+    stats={
+        'supported_fraction':float(supported.mean()),
+        'low_confidence_fraction':float(low.mean()),
+        'median_confidence_supported':float(np.median(conf[supported])) if supported.any() else 0.0,
+        'longest_missing_run_px':int(longest_gap),
+        'multiple_ink_columns':int(np.sum(unusual_multi)),
+        'background_median_ink_runs_per_column':round(base_runs,3),
+        'multiple_ink_review_threshold':round(float(multi_threshold),3),
+        'near_vertical_columns':int(np.sum(very_vertical)),
+    }
+    reasons=[]
+    if stats['supported_fraction']<.80:
+        reasons.append('Centerline thiếu hỗ trợ mực ở nhiều cột.')
+    if stats['longest_missing_run_px']>max(8,int(w*.02)):
+        reasons.append('Có khoảng mất nét dài bên trong centerline.')
+    if stats['median_confidence_supported']<.45:
+        reasons.append('Độ tin cậy hình học trung vị thấp; lưới/chữ có thể đang cạnh tranh với sóng.')
+    stats['status']='not_ready' if reasons else 'needs_visual_review'
+    stats['reasons']=reasons
+    stats['meaning']='Heuristic image confidence only; not clinical or measurement validation.'
+    return {'y':values,'path_raw':path,'status':status,'confidence':conf,
+            'supported':supported,'run_count':run_count,'vertical_span':vertical_span,
+            'grid_like':grid_like,'stats':stats}
+
+
+def centerline_overlay(image, centerline):
+    out=image.convert('RGB').copy(); draw=ImageDraw.Draw(out)
+    prev=None
+    for x,y in enumerate(centerline['y']):
+        if not np.isfinite(y):
+            prev=None; continue
+        c=float(centerline['confidence'][x])
+        color='#00a6a6' if c>=.55 else ('#f0a000' if c>=.35 else '#d00000')
+        p=(x,float(y))
+        if prev is not None and abs(y-prev[1])<=max(16,image.height*.20):
+            draw.line((prev,p),fill=color,width=2)
+        else:
+            draw.ellipse((x-1,y-1,x+1,y+1),fill=color)
+        prev=p
+    return out
+
+
+def centerline_csv(centerline,crop_box,work_size,crop_size):
+    out=io.StringIO(newline=''); writer=csv.writer(out)
+    writer.writerow(['x_work_px','y_work_px_candidate','x_oriented_px','y_oriented_px_candidate',
+                     'confidence_heuristic','status'])
+    ww,wh=work_size; cw,ch=crop_size
+    for x,y in enumerate(centerline['y']):
+        x_src=crop_box[0]+(x+.5)*cw/ww-.5
+        y_src=crop_box[1]+(y+.5)*ch/wh-.5 if np.isfinite(y) else None
+        writer.writerow([x,round(float(y),3) if np.isfinite(y) else '',round(x_src,3),
+                         round(float(y_src),3) if y_src is not None else '',
+                         round(float(centerline['confidence'][x]),4),centerline['status'][x]])
+    return out.getvalue().encode('utf-8-sig')
+
 def trace_overlay(image, values):
     overlay = image.convert("RGB").copy()
     draw = ImageDraw.Draw(overlay)
@@ -294,9 +535,10 @@ def analyze_crop(crop, params):
     else:
         mask,gray,removed = ink_mask(work,params["max_gray"],params["local_contrast"],params["suppress_color"],params["remove_grid"])
     trace = trace_candidates(mask,gray,params["continuity"],params["seed_percent"])
+    centerline = trace_centerline(mask,gray,params["continuity"],params["seed_percent"])
     graph = trace_ink_graph(mask,trace,include_unanchored=True)
     statuses,counts = np.unique(trace["status"],return_counts=True)
-    return {"work":work,"mask":mask,"removed":removed,"graph":graph,**trace,
+    return {"work":work,"mask":mask,"removed":removed,"graph":graph,"centerline":centerline,**trace,
             "counts":dict(zip(statuses.tolist(),counts.tolist())),
             "quality":extraction_quality(mask,graph)}
 
@@ -914,8 +1156,15 @@ def main():
     sha = hashlib.sha256(blob).hexdigest()
     suffix = sha[:12]
     st.subheader("1. Chọn đúng một chuyển đạo")
-    rotation = st.selectbox("Xoay ngược chiều kim đồng hồ",[0,90,180,270],key="dg_rot_"+suffix)
-    oriented = orient(source,rotation)
+    auto_rotate=st.checkbox("Tự xoay ảnh 0/90/180/270°",value=True,key="dg_autorot_"+suffix)
+    if auto_rotate:
+        oriented,rotation,paper_box=auto_orient_page(source)
+        st.caption(f"Tự xoay đã chọn: {rotation}° ngược chiều kim đồng hồ. Nếu ảnh vẫn sai, tắt Tự xoay và chọn thủ công bên dưới.")
+        manual_rotation=st.selectbox("Xoay thủ công (chỉ dùng khi tắt Tự xoay)",[0,90,180,270],index=[0,90,180,270].index(rotation),key="dg_rot_manual_"+suffix,disabled=True)
+    else:
+        rotation=st.selectbox("Xoay thủ công ngược chiều kim đồng hồ",[0,90,180,270],key="dg_rot_manual_"+suffix)
+        oriented=orient(source,rotation)
+        paper_box=detect_paper_bbox(oriented)
     auto_straight=st.checkbox("Tự sửa nghiêng nhẹ",value=True,key="dg_deskew_"+suffix)
     deskew_angle=0.0
     if auto_straight:
@@ -925,15 +1174,20 @@ def main():
     lead = st.selectbox("Nhãn chuyển đạo do em chọn",["II","I","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6","Chưa xác định"],key="dg_lead_"+frame)
     auto_rows=auto_row_candidates(oriented)
     auto_roi=st.checkbox("Tự gợi ý vùng hàng ECG",value=True,key="dg_autoroi_"+frame)
+    row_token="manual"
     if auto_roi and auto_rows:
         row_idx=st.selectbox("Hàng ECG gợi ý",range(len(auto_rows)),format_func=lambda i:f"Hàng {i+1}: {auto_rows[i][1]:.1f}–{auto_rows[i][3]:.1f}%",key="dg_row_"+frame)
         ar=auto_rows[row_idx]; default_x=(float(ar[0]),float(ar[2])); default_y=(float(ar[1]),float(ar[3]))
+        row_token=f"row{row_idx}_{default_y[0]:.2f}_{default_y[1]:.2f}"
+        st.caption(f"Đang dùng ROI của Hàng {row_idx+1}: X {default_x[0]:.1f}–{default_x[1]:.1f}%, Y {default_y[0]:.1f}–{default_y[1]:.1f}%")
     else:
         default_x=(0.,95.); default_y=(40.,58.)
         if auto_roi: st.warning("Chưa tự tìm được hàng ECG đủ chắc. Dùng vùng thủ công bên dưới.")
     with st.expander("Chỉnh vùng thủ công / fallback",expanded=not(auto_roi and auto_rows)):
-        x_range = st.slider("Vùng dò: trái — phải (%)",0.,100.,default_x,.1,key="dg_roi_x_"+frame)
-        y_range = st.slider("Vùng dò: trên — dưới (%)",0.,100.,default_y,.1,key="dg_roi_y_"+frame)
+        # Include selected row in the widget key. Otherwise Streamlit preserves
+        # the previous slider value and silently ignores the new row defaults.
+        x_range = st.slider("Vùng dò: trái — phải (%)",0.,100.,default_x,.1,key="dg_roi_x_"+frame+"_"+row_token)
+        y_range = st.slider("Vùng dò: trên — dưới (%)",0.,100.,default_y,.1,key="dg_roi_y_"+frame+"_"+row_token)
     try:
         crop,box = crop_region(oriented,x_range,y_range)
     except ValueError as exc:
@@ -983,15 +1237,18 @@ def main():
                 "crop_size":list(crop.size),"working_size":list(work.size),"chosen_lead":lead,
                 "parameters":params,"column_status_counts":candidate["counts"],
                 "candidate_column_fraction":candidate["support_fraction"],"graph_stats":candidate["graph"]["stats"],
+                "centerline_stats":candidate["centerline"]["stats"],
                 "quality":candidate["quality"],
                 "seconds":round(time.monotonic()-started,3),
                 "coordinates":"CSV contains 2D segment points. Repeated x and backwards x are allowed. Segment order is graph traversal, NOT time order. No ms/mV.",
                 "limits":"Dark ink is not proven to be ECG. No gap filling. No P/QRS/T landmarks. No clinical validation."}
             st.session_state["digitizer_result"] = {"signature":signature,"metadata":metadata,
                 "original_png":png_bytes(work),"overlay_png":png_bytes(graph_overlay(work,candidate["graph"])),
+                "centerline_overlay_png":png_bytes(centerline_overlay(work,candidate["centerline"])),
                 "old_overlay_png":png_bytes(trace_overlay(work,candidate["y"])),
                 "mask_png":png_bytes(Image.fromarray(candidate["mask"].astype(np.uint8)*255)),
-                "graph":candidate["graph"],
+                "graph":candidate["graph"],"centerline":candidate["centerline"],
+                "centerline_csv":centerline_csv(candidate["centerline"],box,work.size,crop.size),
                 "csv":graph_csv(candidate["graph"],box,work.size,crop.size)}
         except (ValueError,cv2.error) as exc:
             st.error(str(exc))
@@ -1002,11 +1259,16 @@ def main():
         st.info("Ảnh, vùng chọn hoặc thiết lập đã đổi. Kết quả cũ không áp dụng; bấm trích lại.")
         return
     st.subheader("3. Đối chiếu với ảnh gốc")
-    tabs = st.tabs(["Tất cả nét 2D","Ảnh gốc","Mặt nạ nét tối","Cách cũ để đối chiếu"])
-    with tabs[0]:st.image(result["overlay_png"],caption="Gồm cả nét bổ sung chưa chọn; hãy chọn ở bước 4. Hồng: đoạn ứng viên. Cam: thành phần có nhánh/vòng/chạm biên. Cả hai chưa xác minh. Đường được vẽ từ pixel nét giữ lại, không nối khoảng mất.",width="stretch")
-    with tabs[1]:st.image(result["original_png"],width="stretch")
-    with tabs[2]:st.image(result["mask_png"],caption="Mặt nạ có thể còn chữ/lưới hoặc mất sóng thật.",width="stretch")
-    with tabs[3]:st.image(result["old_overlay_png"],caption="Cách 0.1: một điểm mỗi cột; giữ để thấy đoạn dọc bị bỏ hoặc co về giữa.",width="stretch")
+    tabs = st.tabs(["Centerline v0.10","Tất cả nét 2D","Ảnh gốc","Mặt nạ nét tối","Cách cũ để đối chiếu"])
+    with tabs[0]:
+        st.image(result["centerline_overlay_png"],caption="Centerline trái→phải: xanh = confidence hình học cao hơn, cam = cần xem kỹ, đỏ = mơ hồ. Không nối qua cột không có hỗ trợ mực.",width="stretch")
+        cs=result["metadata"].get("centerline_stats",{})
+        st.write(f"Hỗ trợ mực: {cs.get('supported_fraction',0)*100:.1f}% · confidence trung vị: {cs.get('median_confidence_supported',0):.2f} · khoảng mất dài nhất: {cs.get('longest_missing_run_px',0)} px")
+        if cs.get('reasons'): st.warning(' '.join(cs['reasons']))
+    with tabs[1]:st.image(result["overlay_png"],caption="Graph 2D dùng để chẩn đoán lưới/chữ/nhánh; không còn là output thời gian chính.",width="stretch")
+    with tabs[2]:st.image(result["original_png"],width="stretch")
+    with tabs[3]:st.image(result["mask_png"],caption="Mặt nạ có thể còn chữ/lưới hoặc mất sóng thật.",width="stretch")
+    with tabs[4]:st.image(result["old_overlay_png"],caption="Cách 0.1 để đối chiếu; tiêu chí nhiều nét/cột trước đây loại quá nhiều điểm trên ảnh lưới.",width="stretch")
     meta=result["metadata"];gs=meta["graph_stats"]
     background=meta.get('quality',{})
     if background.get('reasons'):
@@ -1040,13 +1302,15 @@ def main():
     review_csv = graph_csv(reviewed_graph,box,tuple(meta["working_size"]),tuple(meta["crop_size"]))
     st.subheader("5. Tải kết quả thử nghiệm — từng file riêng")
     st.caption("CSV mới chứa các đoạn nét 2D: có thể nhiều điểm cùng x, chưa phải tín hiệu theo thời gian. Các đoạn khác nhau không được tự nối hoặc lấy trung bình để đo. Ảnh có thể chứa thông tin ca bệnh; che định danh trước khi tải lên.")
-    st.download_button("Tải ảnh phủ màu đã chọn",png_bytes(review_overlay),"digitizer_overlay.png","image/png",key="dg_overlay_download")
-    st.download_button("Tải tọa độ CSV đã chọn",review_csv,"digitizer_trace_points.csv","text/csv",key="dg_csv_download")
+    st.download_button("Tải overlay centerline v0.10",result["centerline_overlay_png"],"digitizer_centerline_overlay.png","image/png",key="dg_centerline_overlay_download")
+    st.download_button("Tải centerline CSV (1 điểm/cột)",result["centerline_csv"],"digitizer_centerline.csv","text/csv",key="dg_centerline_csv_download")
+    st.download_button("Tải graph overlay đã chọn (đối chiếu)",png_bytes(review_overlay),"digitizer_overlay.png","image/png",key="dg_overlay_download")
+    st.download_button("Tải graph 2D CSV đã chọn (đối chiếu)",review_csv,"digitizer_trace_points.csv","text/csv",key="dg_csv_download")
     st.download_button("Tải cấu hình JSON",json.dumps(meta,ensure_ascii=False,indent=2),"digitizer_record.json","application/json",key="dg_json_download")
     st.download_button("Tải mặt nạ PNG",result["mask_png"],"digitizer_mask.png","image/png",key="dg_mask_download")
     st.subheader("6. Bước tiếp theo")
     st.write("1. Ảnh sạch: dùng cách 0.3 để đối chiếu. Ảnh chụp lưới đỏ: chọn chế độ tương ứng, thử mặc định với 3–5 nhát của một chuyển đạo.")
-    st.write("2. Chọn cửa sổ quanh QRS, mở Xem thử lọc thanh nối ngang. Đánh dấu từng ID nghi lưới, so ảnh trước/sau và ảnh gốc; chỉ áp dụng khi nhìn chắc.")
+    st.write("2. Xem tab Centerline v0.10 trước. Nếu đường xanh/cam bám đúng waveform trái→phải, tải centerline CSV. Graph 2D chỉ dùng để điều tra khi centerline sai hoặc bị lưới/chữ kéo lệch.")
     st.write("3. Giữ đúng vùng cắt và thông số cũ. Xuất đủ 4 file trước áp dụng và một lượt riêng sau áp dụng nếu có. Chưa cần ảnh mới hoặc đo PR/QRS/ST.")
     st.caption("Chọn nhánh chỉ là thao tác đối chiếu của người dùng, không phải xác nhận tín hiệu đúng. Khoảng mất không được nối tự động.")
 
