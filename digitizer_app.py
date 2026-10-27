@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.4"
-METHOD = "ink-graph-photo-review-v4"
+VERSION = "Digitizer 0.5"
+METHOD = "ink-graph-selection-review-v5"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -410,65 +410,142 @@ def review_image(image, graph, selected_ids, focus_id=None, window=None):
     return out
 
 
+def selected_quality(graph, selected_ids, size):
+    """Describe the current selection only. No waveform/medical accuracy score."""
+    width,height=size;chosen=set(selected_ids)
+    nodes={tuple(p) for sid,seg in enumerate(graph['segments'],1) if sid in chosen for p in seg['points']}
+    neighbors={}
+    for x,y in nodes:
+        adjacent=[]
+        for dy in (-1,0,1):
+            for dx in (-1,0,1):
+                q=(x+dx,y+dy)
+                if (not dx and not dy) or q not in nodes:continue
+                if dx and dy and ((x+dx,y) in nodes or (x,y+dy) in nodes):continue
+                adjacent.append(q)
+        neighbors[(x,y)]=adjacent
+    seen=set();components=0
+    for start in nodes:
+        if start in seen:continue
+        components+=1;stack=[start];seen.add(start)
+        while stack:
+            for q in neighbors[stack.pop()]:
+                if q not in seen:seen.add(q);stack.append(q)
+    columns={}
+    for x,y in nodes:columns.setdefault(x,[]).append(y)
+    xs=sorted(columns);gap_ranges=[]
+    if xs:
+        for a,b in zip(xs,xs[1:]):
+            if b-a>1:gap_ranges.append([a+1,b-1])
+    split_columns=0
+    for ys in columns.values():
+        ys=sorted(ys)
+        # A connected vertical stroke has many y but only one run.
+        if any(b-a>1 for a,b in zip(ys,ys[1:])):split_columns+=1
+    branches=sum(len(q)>2 for q in neighbors.values())
+    longest=max((b-a+1 for a,b in gap_ranges),default=0)
+    fraction=len(columns)/max(1,width);split_fraction=split_columns/max(1,len(columns))
+    reasons=[]
+    if not nodes:reasons.append('Chưa giữ đoạn nào.')
+    elif fraction<.65:reasons.append('Lựa chọn hiện tại bỏ nhiều cột ảnh.')
+    if longest>max(10,int(width*.02)):
+        reasons.append('Có khoảng thiếu cột dài bên trong lựa chọn.')
+    if split_fraction>.25:
+        reasons.append('Nhiều cột có các cụm nét tách rời; có thể giữ nhiều nhánh/hàng hoặc lưới.')
+    if branches>30 and branches/max(1,len(nodes))>.12:
+        reasons.append('Mật độ phân nhánh của các điểm đang giữ còn cao.')
+    # Absence of flags never promotes the selection to validated ECG.
+    return {'status':'not_ready' if reasons else 'needs_visual_review',
+        'reasons':reasons,'selected_segments':len(chosen),'unique_points':len(nodes),
+        'selected_x_columns':len(columns),'image_width_px':width,
+        'x_column_fraction':round(fraction,6),'connected_components':components,
+        'junctions':branches,'endpoints':sum(len(q)==1 for q in neighbors.values()),
+        'split_y_columns':split_columns,'split_y_column_fraction':round(split_fraction,6),
+        'longest_internal_missing_x_px':longest,'internal_missing_x_ranges':gap_ranges,
+        'meaning':'Image-graph heuristics only. Coverage is NOT accuracy. Multiple y are allowed; no time signal, no clinical approval.'}
+
+
+def segment_hints(graph, size):
+    """Short attached segments are review hints only, never auto-deleted."""
+    endpoint_counts={}
+    for seg in graph['segments']:
+        for p in {tuple(seg['points'][0]),tuple(seg['points'][-1])}:
+            endpoint_counts[p]=endpoint_counts.get(p,0)+1
+    limit=max(5,min(12,round(size[1]*.04)))
+    hints={}
+    for sid,seg in enumerate(graph['segments'],1):
+        a,b,c,d=segment_bounds(seg)
+        attached=any(endpoint_counts[tuple(p)]>1 for p in (seg['points'][0],seg['points'][-1]))
+        short=len(seg['points'])<=limit and attached
+        hints[sid]={'short_attached_review_hint':short,'point_count':len(seg['points']),
+                    'bounds_work_px':[a,b,c,d]}
+    return hints
+
+
 def review_panel(result):
     graph=result['graph'];image=Image.open(io.BytesIO(result['original_png'])).convert('RGB')
     key='dg_review_'+result['signature'][:16]
     ids=list(range(1,len(graph['segments'])+1))
-    if len(ids)>1500:
-        defaults=[i for i,seg in enumerate(graph['segments'],1) if seg.get('suggested',True)]
-        st.error('Trích nét chưa đạt: quá nhiều đoạn để sửa tay trên điện thoại. Không cần chọn hàng nghìn nhánh.')
-        notes=st.text_area('Ghi chú lỗi để gửi kiểm tra',key=key+'_diagnostic_notes')
-        st.caption('Các file dưới chỉ để kiểm tra lỗi; không phải đường ECG dùng đo. Thử chế độ ảnh chụp lưới đỏ hoặc chọn vùng chỉ 3–5 nhát rồi trích lại.')
-        return (select_graph(graph,defaults),
-                {'selection_type':'diagnostic_defaults_no_manual_review','selected_segment_ids':defaults,
-                 'manual_review_disabled':True,'notes':notes},
-                review_image(image,graph,defaults))
     defaults=[i for i,seg in enumerate(graph['segments'],1) if seg.get('suggested',True)]
-    def label(sid):
-        seg=graph['segments'][sid-1];a,b,c,d=segment_bounds(seg)
-        return f"#{sid} · x {a}–{c}, y {b}–{d} · {len(seg['points'])} điểm" + (" · nét bổ sung" if not seg.get('suggested',True) else "")
-    st.caption("Xanh: đoạn đang chọn; xám: chưa chọn; hồng: đoạn đang xem. Ô đỏ: đầu mút gần thành phần rời khác, chỉ là vị trí cần kiểm tra. Màu không biểu thị độ chính xác.")
-    # All choices use work-image coordinates, with a signature-specific state.
+    hints=segment_hints(graph,image.size)
+    state_key=key+'_selected'
+    if state_key not in st.session_state:st.session_state[state_key]=defaults
     def edit_selection(sid,keep):
-        current=set(st.session_state.get(key+'_ids',defaults))
+        current=set(st.session_state.get(state_key,defaults))
         if keep:current.add(sid)
         else:current.discard(sid)
-        st.session_state[key+'_ids']=sorted(current)
-    if key+'_ids' not in st.session_state:
-        st.session_state[key+'_ids']=defaults
-    selected=st.multiselect("Các đoạn giữ trong bản xuất",ids,format_func=label,key=key+'_ids')
-    mode=st.radio("Vùng phóng to",['Chọn cửa sổ ngang','Theo đoạn nét'],horizontal=True,key=key+'_mode')
+        st.session_state[state_key]=sorted(current)
+    def restore_selection():st.session_state[state_key]=list(defaults)
+    selected=list(st.session_state[state_key]);chosen=set(selected)
+    st.caption('Xanh: đang giữ; xám: chưa giữ; hồng: đoạn đang xem. Gợi ý nhánh ngắn chỉ để kiểm tra, không xác định đó là nhiễu. Không tự xóa hoặc nối sóng.')
+    st.button('Khôi phục lựa chọn ban đầu',key=key+'_reset',on_click=restore_selection)
+    mode=st.radio('Vùng phóng to',['Chọn cửa sổ ngang','Theo đoạn nét'],horizontal=True,key=key+'_mode')
     focus=None
+    def label(sid):
+        hint=hints[sid];a,b,c,d=hint['bounds_work_px']
+        flags=(' · đang giữ' if sid in chosen else ' · chưa giữ')
+        if hint['short_attached_review_hint']:flags+=' · nhánh ngắn cần xem'
+        return f'#{sid} · x {a}–{c}, y {b}–{d} · {hint["point_count"]} điểm'+flags
     if mode=='Theo đoạn nét' and ids:
-        focus=st.selectbox("Đoạn cần xem / thêm / bỏ",ids,format_func=label,key=key+'_focus')
-        a,b,c,d=segment_bounds(graph['segments'][focus-1])
+        focus=st.selectbox('Đoạn cần xem / thêm / bỏ',ids,format_func=label,key=key+'_focus_all')
+        a,b,c,d=hints[focus]['bounds_work_px']
         left=max(0,a-15);right=min(image.width,max(a+1,c)+16)
-        st.button("Giữ đoạn đang xem",key=key+'_keep',on_click=edit_selection,args=(focus,True))
-        st.button("Bỏ đoạn đang xem",key=key+'_drop',on_click=edit_selection,args=(focus,False))
-        st.caption("Đoạn đang xem được tô hồng dù có hoặc chưa có trong danh sách giữ. Dùng danh sách phía trên để thêm/bỏ đúng số đoạn.")
     else:
-        percent=st.slider("Cửa sổ QRS: trái — phải (%)",0.,100.,(5.,15.),.1,key=key+'_window')
-        left=int(percent[0]*image.width/100);right=max(left+1,int(percent[1]*image.width/100))
-        right=min(image.width,right);left=min(left,right-1)
-    shown=[i for i,seg in enumerate(graph['segments'],1) if segment_bounds(seg)[0]<right and segment_bounds(seg)[2]>=left]
-    st.write('Đoạn trong cửa sổ: '+(', '.join('#'+str(i) for i in shown[:80]) or 'Không có'))
-    if len(shown)>80:st.caption(f'Còn {len(shown)-80} đoạn khác; thu hẹp cửa sổ để xem rõ hơn.')
-    st.image(review_image(image,graph,selected,focus,(left,right)),caption="Phóng to pixel gốc; không làm mượt hay vẽ bù sóng.",width='stretch')
+        percent=st.slider('Cửa sổ QRS: trái — phải (%)',0.,100.,(5.,15.),.1,key=key+'_window')
+        left=min(image.width-1,int(percent[0]*image.width/100))
+        right=min(image.width,max(left+1,int(percent[1]*image.width/100)))
+    shown=[sid for sid in ids if hints[sid]['bounds_work_px'][0]<right and hints[sid]['bounds_work_px'][2]>=left]
+    # Use short local lists; whole-image graph may contain thousands of background fragments.
+    filter_label=st.selectbox('Lọc đoạn trong cửa sổ',['Tất cả','Đang giữ','Chưa giữ','Nhánh ngắn cần xem'],key=key+'_filter')
+    local=[sid for sid in shown if filter_label=='Tất cả' or
+           (filter_label=='Đang giữ' and sid in chosen) or
+           (filter_label=='Chưa giữ' and sid not in chosen) or
+           (filter_label=='Nhánh ngắn cần xem' and hints[sid]['short_attached_review_hint'])]
+    st.write(f'{len(shown)} đoạn trong cửa sổ · {len(local)} đoạn theo bộ lọc.')
+    if mode=='Chọn cửa sổ ngang' and local:
+        # Page at 60 items without silently discarding candidates or changing IDs.
+        pages=max(1,(len(local)+59)//60)
+        page=st.selectbox('Trang danh sách đoạn',list(range(1,pages+1)),key=key+f'_page_{left}_{right}_{filter_label}')
+        options=local[(page-1)*60:page*60]
+        focus=st.selectbox('Đoạn trong cửa sổ cần xem',options,format_func=label,key=key+'_local_'+hashlib.sha256(json.dumps(options).encode()).hexdigest()[:12])
+    if focus is not None:
+        st.button('Giữ đoạn đang xem',key=key+'_keep',on_click=edit_selection,args=(focus,True))
+        st.button('Bỏ đoạn đang xem',key=key+'_drop',on_click=edit_selection,args=(focus,False))
+        st.caption(label(focus)+'. Hồng chỉ là đoạn đang xem, kể cả khi chưa được giữ trong CSV.')
+    st.image(review_image(image,graph,selected,focus,(left,right)),caption='Phóng to các nét trong cửa sổ; dấu đỏ là đầu mút gần thành phần rời, không phải mốc ECG.',width='stretch')
     original=image.crop((left,0,right,image.height))
     factor=max(1,min(6,1800//max(1,right-left),1200//image.height))
-    st.image(original.resize((original.width*factor,original.height*factor),Image.Resampling.NEAREST),caption="Ảnh gốc cùng cửa sổ để kiểm tra đỉnh/đáy.",width='stretch')
-    reviewed=select_graph(graph,selected)
-    overview=review_image(image,graph,selected)
-    st.image(overview,caption="Tổng quan lựa chọn hiện tại. Màu xám vẫn hiện để đối chiếu nhưng không nằm trong CSV đã chọn.",width='stretch')
-    notes=st.text_area("Ghi chú đoạn còn sai hoặc chưa rõ",key=key+'_notes')
-    if not selected:st.warning("Chưa chọn đoạn nào: CSV xuất chỉ có tiêu đề; không có đường tín hiệu.")
+    st.image(original.resize((original.width*factor,original.height*factor),Image.Resampling.NEAREST),caption='Ảnh gốc cùng cửa sổ, không vẽ lại hoặc làm mượt sóng.',width='stretch')
+    reviewed=select_graph(graph,selected);overview=review_image(image,graph,selected)
+    st.image(overview,caption='Lựa chọn đang xuất: xanh được giữ; xám chỉ để đối chiếu, không có trong CSV.',width='stretch')
+    notes=st.text_area('Ghi chú đoạn còn sai hoặc chưa rõ',key=key+'_notes')
     review={'selection_type':'user_editable_segments_not_validation',
-            'initial_suggested_segment_ids':defaults,'selected_segment_ids':selected,
-            'excluded_segment_ids':[sid for sid in ids if sid not in selected],
-            'all_segments':[{'segment_id':sid,'component_id':seg['component_id'],
-                'bounds_work_px':segment_bounds(seg),'point_count':len(seg['points']),
-                'initial_suggestion':seg.get('suggested',True)} for sid,seg in enumerate(graph['segments'],1)],
-            'notes':notes,'zoom_window_work_px':[left,right]}
+        'initial_suggested_segment_ids':defaults,'selected_segment_ids':selected,
+        'excluded_segment_ids':[sid for sid in ids if sid not in chosen],
+        'all_segments':[{'segment_id':sid,'component_id':seg['component_id'],
+            **hints[sid],'initial_suggestion':seg.get('suggested',True)} for sid,seg in enumerate(graph['segments'],1)],
+        'notes':notes,'zoom_window_work_px':[left,right],'local_filter':filter_label,
+        'hint_meaning':'Short attached segment is only a review hint; no ECG/noise classification, no automatic removal.'}
     return reviewed,review,overview
 
 
@@ -576,11 +653,10 @@ def main():
     with tabs[2]:st.image(result["mask_png"],caption="Mặt nạ có thể còn chữ/lưới hoặc mất sóng thật.",width="stretch")
     with tabs[3]:st.image(result["old_overlay_png"],caption="Cách 0.1: một điểm mỗi cột; giữ để thấy đoạn dọc bị bỏ hoặc co về giữa.",width="stretch")
     meta=result["metadata"];gs=meta["graph_stats"]
-    quality=meta.get('quality',{})
-    if quality.get('status')=='not_ready':
-        st.error('Trích nét chưa đạt — chỉ xuất file để kiểm tra lỗi. '+ ' '.join(quality.get('reasons',[])))
-    else:
-        st.warning('Cần đối chiếu ảnh gốc; app chưa xác nhận trích nét đúng. '+ ' '.join(quality.get('reasons',[])))
+    background=meta.get('quality',{})
+    if background.get('reasons'):
+        st.info('Nền và toàn bộ nét ứng viên: '+ ' '.join(background['reasons'])+
+                ' Đây là thông tin toàn vùng; đánh giá lựa chọn xuất nằm dưới bước 4.')
     st.write(f"Thời gian: {meta['seconds']:.2f} giây · {gs['segments']} đoạn nét · {gs['junctions']} điểm phân nhánh")
     st.caption("Số đoạn/pixel không phải độ chính xác. Giữ thêm nét dọc có thể đồng thời giữ thêm lưới hoặc chữ.")
     if gs["ambiguous_components"]:
@@ -590,6 +666,18 @@ def main():
     reviewed_graph,review_meta,review_overlay = review_panel(result)
     meta = dict(meta)
     meta["review"] = review_meta
+    quality=selected_quality(result['graph'],review_meta['selected_segment_ids'],tuple(meta['working_size']))
+    meta['background_quality_v04']=meta.pop('quality',{})
+    meta['quality']=quality
+    meta['selection_quality']=quality
+    meta['extraction_baseline']='Digitizer 0.4 masks and graph; unchanged extraction'
+    st.subheader('Đánh giá các đoạn đang giữ')
+    if quality['status']=='not_ready':
+        st.error('Lựa chọn chưa đạt để tiếp tục đo: '+' '.join(quality['reasons']))
+    else:
+        st.warning('Chưa thấy lỗi lớn theo các ngưỡng kỹ thuật đang dùng; vẫn cần đối chiếu từng sóng. Không xác nhận đúng ECG hoặc cho phép đo.')
+    st.write(f"{quality['selected_segments']} đoạn giữ · {quality['connected_components']} thành phần rời · {quality['junctions']} điểm phân nhánh · khoảng thiếu cột dài nhất {quality['longest_internal_missing_x_px']} px")
+    st.caption('Nhiều điểm cùng x có thể là sườn QRS dốc. Các chỉ số này không đánh giá đầy đủ nét sóng hoặc thay thế người kiểm tra.')
     meta["validation_status"] = "not_ready_diagnostic_only" if quality.get("status")=="not_ready" else "manual_selection_unverified"
     meta["export_graph_stats"] = {"segments":len(reviewed_graph["segments"]),
         "unique_points":len({tuple(p) for seg in reviewed_graph["segments"] for p in seg["points"]})}
@@ -603,8 +691,8 @@ def main():
     st.download_button("Tải mặt nạ PNG",result["mask_png"],"digitizer_mask.png","image/png",key="dg_mask_download")
     st.subheader("6. Bước tiếp theo")
     st.write("1. Ảnh sạch: dùng cách 0.3 để đối chiếu. Ảnh chụp lưới đỏ: chọn chế độ tương ứng, thử mặc định với 3–5 nhát của một chuyển đạo.")
-    st.write("2. Nếu có cảnh báo chưa đạt hoặc bám lan vào lưới: dừng chọn thủ công, xuất file kiểm tra. Nếu ít nét rời: kiểm tra riêng từng đỉnh/đáy, chỉ chọn thêm khi nhìn chắc.")
-    st.write("3. Tải ảnh phủ màu, CSV, JSON và mặt nạ; gửi kèm ảnh gốc nếu chưa gửi. Giữ cả lượt chưa đạt để đối chiếu, chưa dùng đo PR/QRS/ST.")
+    st.write("2. Chọn cửa sổ quanh QRS. Dùng bộ lọc Nhánh ngắn cần xem; giữ/bỏ chỉ khi thấy rõ trên ảnh gốc. Đánh giá các đoạn đang giữ cập nhật sau mỗi thao tác.")
+    st.write("3. Thử lại đúng vùng cắt và tham số của 0.4, xuất đủ 4 file trước khi chỉnh nhánh. Nếu chỉnh tay, xuất lượt riêng sau chỉnh. Chưa cần ảnh mới hoặc đo PR/QRS/ST.")
     st.caption("Chọn nhánh chỉ là thao tác đối chiếu của người dùng, không phải xác nhận tín hiệu đúng. Khoảng mất không được nối tự động.")
 
 
