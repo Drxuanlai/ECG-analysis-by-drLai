@@ -19,8 +19,8 @@ try:
 except ImportError:
     pass
 
-VERSION = "Digitizer 0.2"
-METHOD = "ink-components-skeleton-graph-v2"
+VERSION = "Digitizer 0.3"
+METHOD = "ink-graph-review-v3"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SOURCE_PIXELS = 25_000_000
 MAX_WORK_WIDTH = 2000
@@ -183,7 +183,7 @@ def analyze_crop(crop, params):
     work = prepare_working_image(crop)
     mask,gray,removed = ink_mask(work,params["max_gray"],params["local_contrast"],params["suppress_color"],params["remove_grid"])
     trace = trace_candidates(mask,gray,params["continuity"],params["seed_percent"])
-    graph = trace_ink_graph(mask,trace)
+    graph = trace_ink_graph(mask,trace,include_unanchored=True)
     statuses,counts = np.unique(trace["status"],return_counts=True)
     return {"work":work,"mask":mask,"removed":removed,"graph":graph,**trace,
             "counts":dict(zip(statuses.tolist(),counts.tolist()))}
@@ -212,7 +212,7 @@ def thin_ink(mask):
     return a[1:-1,1:-1].astype(bool)
 
 
-def trace_ink_graph(mask, column_trace):
+def trace_ink_graph(mask, column_trace, include_unanchored=False):
     # Select connected ink components supported by the old path; detached text
     # and tiny specks are less likely to survive. Attached grid/text can remain.
     h,w = mask.shape
@@ -223,6 +223,13 @@ def trace_ink_graph(mask, column_trace):
             label = int(labels[int(round(y)),x])
             if label: votes.setdefault(label,set()).add(x)
     keep = [lab for lab,xs in votes.items() if len(xs)>=3 and stats[lab,cv2.CC_STAT_WIDTH]>=5]
+    anchored_labels = set(keep)
+    if include_unanchored:
+        # Expose previously rejected upright strokes for explicit review.
+        # This also exposes text/grid: these components are NOT auto-selected.
+        keep = [lab for lab in range(1,number)
+                if stats[lab,cv2.CC_STAT_AREA]>=3 and
+                (stats[lab,cv2.CC_STAT_WIDTH]>=2 or stats[lab,cv2.CC_STAT_HEIGHT]>=3)]
     selected = np.isin(labels,keep) & mask
     if not np.any(selected):
         raise ValueError('Chưa tìm được thành phần nét đủ dài; chọn vùng sát một chuyển đạo hơn.')
@@ -253,7 +260,8 @@ def trace_ink_graph(mask, column_trace):
         branched=any(len(neighbors[p])>2 for p in points)
         loop=all(len(neighbors[p])==2 for p in points)
         boundary=any(p[0] in (0,w-1) or p[1] in (0,h-1) for p in points)
-        component_info[cid]={'branch':branched,'loop':loop,'edge':boundary,'pixels':len(points)}
+        component_info[cid]={'branch':branched,'loop':loop,'edge':boundary,'pixels':len(points),
+                             'anchored':any(int(labels[y,x]) in anchored_labels for x,y in points)}
     visited=set();segments=[]
     def edge(a,b):return tuple(sorted((a,b)))
     def follow(start,next_point):
@@ -269,7 +277,8 @@ def trace_ink_graph(mask, column_trace):
             if current==start:break
         cid=component[start];info=component_info[cid]
         segments.append({'component_id':cid,'points':points,
-                         'ambiguous':info['branch'] or info['loop'] or info['edge']})
+                         'ambiguous':info['branch'] or info['loop'] or info['edge'],
+                         'suggested':info['anchored']})
     for p in sorted(nodes):
         if len(neighbors[p])!=2:
             for q in neighbors[p]:
@@ -277,6 +286,11 @@ def trace_ink_graph(mask, column_trace):
     for p in sorted(nodes):
         for q in neighbors[p]:
             if edge(p,q) not in visited:follow(p,q)
+    for p in sorted(nodes):
+        if not neighbors[p]:
+            cid=component[p];info=component_info[cid]
+            segments.append({'component_id':cid,'points':[p],
+                             'ambiguous':True,'suggested':info['anchored']})
     return {'selected_mask':selected,'skeleton':skeleton,'segments':segments,
             'component_info':component_info,'junctions':[p for p in sorted(nodes) if len(neighbors[p])>2],
             'stats':{'selected_components':len(keep),'graph_components':len(component_info),
@@ -303,10 +317,105 @@ def graph_csv(graph,crop_box,work_size,crop_size):
     ww,wh=work_size;cw,ch=crop_size
     for sid,seg in enumerate(graph['segments'],1):
         for i,(x,y) in enumerate(seg['points']):
-            writer.writerow([seg['component_id'],sid,i,x,y,
+            writer.writerow([seg['component_id'],seg.get('source_segment_id',sid),i,x,y,
                 round(crop_box[0]+(x+.5)*cw/ww-.5,3),round(crop_box[1]+(y+.5)*ch/wh-.5,3),
                 'nhanh_vong_hoac_cham_bien' if seg['ambiguous'] else 'doan_net_ung_vien'])
     return out.getvalue().encode('utf-8-sig')
+
+
+def segment_bounds(seg):
+    pts=np.asarray(seg['points'])
+    return tuple(int(v) for v in (pts[:,0].min(),pts[:,1].min(),pts[:,0].max(),pts[:,1].max()))
+
+
+def select_graph(graph, selected_ids):
+    selected=set(selected_ids)
+    segments=[dict(seg,source_segment_id=i) for i,seg in enumerate(graph['segments'],1) if i in selected]
+    return dict(graph,segments=segments)
+
+
+def review_image(image, graph, selected_ids, focus_id=None, window=None):
+    out=image.convert('RGB').copy();draw=ImageDraw.Draw(out)
+    selected=set(selected_ids)
+    for sid,seg in enumerate(graph['segments'],1):
+        color='#008c95' if sid in selected else '#999999'
+        if sid==focus_id:color='#e60073'
+        for point in seg['points']:draw.point(tuple(point),fill=color)
+    # Show endpoints at nearby disconnected components. Markers are annotations,
+    # not recovered pixels; there is deliberately no line across the gap.
+    endpoints=[]
+    for sid,seg in enumerate(graph['segments'],1):
+        if sid in selected and len(seg['points'])>1:
+            endpoints.extend([(sid,seg['component_id'],seg['points'][0]),
+                              (sid,seg['component_id'],seg['points'][-1])])
+    tolerance=max(12,int(image.height*.12));buckets={}
+    for _,cid,(x,y) in endpoints:
+        buckets.setdefault((x//9,y//(tolerance+1)),[]).append((cid,x,y))
+    for sid,cid,(x,y) in endpoints:
+        nearby=(q for bx in range(x//9-1,x//9+2)
+                for by in range(y//(tolerance+1)-1,y//(tolerance+1)+2)
+                for q in buckets.get((bx,by),[]))
+        if any(cid!=other and 0<abs(x-qx)<=8 and abs(y-qy)<=tolerance
+               for other,qx,qy in nearby):
+            draw.rectangle((x-2,y-2,x+2,y+2),outline='#d00000')
+    if window:
+        left,right=window
+        out=out.crop((left,0,right,image.height))
+        scale=max(1,min(6,1800//max(1,right-left),1200//max(1,image.height)))
+        out=out.resize((out.width*scale,out.height*scale),Image.Resampling.NEAREST)
+    return out
+
+
+def review_panel(result):
+    graph=result['graph'];image=Image.open(io.BytesIO(result['original_png'])).convert('RGB')
+    key='dg_review_'+result['signature'][:16]
+    ids=list(range(1,len(graph['segments'])+1))
+    defaults=[i for i,seg in enumerate(graph['segments'],1) if seg.get('suggested',True)]
+    def label(sid):
+        seg=graph['segments'][sid-1];a,b,c,d=segment_bounds(seg)
+        return f"#{sid} · x {a}–{c}, y {b}–{d} · {len(seg['points'])} điểm" + (" · nét bổ sung" if not seg.get('suggested',True) else "")
+    st.caption("Xanh: đoạn đang chọn; xám: chưa chọn; hồng: đoạn đang xem. Ô đỏ: đầu mút gần thành phần rời khác, chỉ là vị trí cần kiểm tra. Màu không biểu thị độ chính xác.")
+    # All choices use work-image coordinates, with a signature-specific state.
+    def edit_selection(sid,keep):
+        current=set(st.session_state.get(key+'_ids',defaults))
+        if keep:current.add(sid)
+        else:current.discard(sid)
+        st.session_state[key+'_ids']=sorted(current)
+    if key+'_ids' not in st.session_state:
+        st.session_state[key+'_ids']=defaults
+    selected=st.multiselect("Các đoạn giữ trong bản xuất",ids,format_func=label,key=key+'_ids')
+    mode=st.radio("Vùng phóng to",['Chọn cửa sổ ngang','Theo đoạn nét'],horizontal=True,key=key+'_mode')
+    focus=None
+    if mode=='Theo đoạn nét' and ids:
+        focus=st.selectbox("Đoạn cần xem / thêm / bỏ",ids,format_func=label,key=key+'_focus')
+        a,b,c,d=segment_bounds(graph['segments'][focus-1])
+        left=max(0,a-15);right=min(image.width,max(a+1,c)+16)
+        st.button("Giữ đoạn đang xem",key=key+'_keep',on_click=edit_selection,args=(focus,True))
+        st.button("Bỏ đoạn đang xem",key=key+'_drop',on_click=edit_selection,args=(focus,False))
+        st.caption("Đoạn đang xem được tô hồng dù có hoặc chưa có trong danh sách giữ. Dùng danh sách phía trên để thêm/bỏ đúng số đoạn.")
+    else:
+        percent=st.slider("Cửa sổ QRS: trái — phải (%)",0.,100.,(5.,15.),.1,key=key+'_window')
+        left=int(percent[0]*image.width/100);right=max(left+1,int(percent[1]*image.width/100))
+        right=min(image.width,right);left=min(left,right-1)
+    shown=[i for i,seg in enumerate(graph['segments'],1) if segment_bounds(seg)[0]<right and segment_bounds(seg)[2]>=left]
+    st.write("Đoạn trong cửa sổ: "+(', '.join('#'+str(i) for i in shown) or 'Không có'))
+    st.image(review_image(image,graph,selected,focus,(left,right)),caption="Phóng to pixel gốc; không làm mượt hay vẽ bù sóng.",width='stretch')
+    original=image.crop((left,0,right,image.height))
+    factor=max(1,min(6,1800//max(1,right-left),1200//image.height))
+    st.image(original.resize((original.width*factor,original.height*factor),Image.Resampling.NEAREST),caption="Ảnh gốc cùng cửa sổ để kiểm tra đỉnh/đáy.",width='stretch')
+    reviewed=select_graph(graph,selected)
+    overview=review_image(image,graph,selected)
+    st.image(overview,caption="Tổng quan lựa chọn hiện tại. Màu xám vẫn hiện để đối chiếu nhưng không nằm trong CSV đã chọn.",width='stretch')
+    notes=st.text_area("Ghi chú đoạn còn sai hoặc chưa rõ",key=key+'_notes')
+    if not selected:st.warning("Chưa chọn đoạn nào: CSV xuất chỉ có tiêu đề; không có đường tín hiệu.")
+    review={'selection_type':'user_editable_segments_not_validation',
+            'initial_suggested_segment_ids':defaults,'selected_segment_ids':selected,
+            'excluded_segment_ids':[sid for sid in ids if sid not in selected],
+            'all_segments':[{'segment_id':sid,'component_id':seg['component_id'],
+                'bounds_work_px':segment_bounds(seg),'point_count':len(seg['points']),
+                'initial_suggestion':seg.get('suggested',True)} for sid,seg in enumerate(graph['segments'],1)],
+            'notes':notes,'zoom_window_work_px':[left,right]}
+    return reviewed,review,overview
 
 
 def clear_result():
@@ -384,6 +493,7 @@ def main():
                 "original_png":png_bytes(work),"overlay_png":png_bytes(graph_overlay(work,candidate["graph"])),
                 "old_overlay_png":png_bytes(trace_overlay(work,candidate["y"])),
                 "mask_png":png_bytes(Image.fromarray(candidate["mask"].astype(np.uint8)*255)),
+                "graph":candidate["graph"],
                 "csv":graph_csv(candidate["graph"],box,work.size,crop.size)}
         except (ValueError,cv2.error) as exc:
             st.error(str(exc))
@@ -394,8 +504,8 @@ def main():
         st.info("Ảnh, vùng chọn hoặc thiết lập đã đổi. Kết quả cũ không áp dụng; bấm trích lại.")
         return
     st.subheader("3. Đối chiếu với ảnh gốc")
-    tabs = st.tabs(["Nét 2D mới","Ảnh gốc","Mặt nạ nét tối","Cách cũ để đối chiếu"])
-    with tabs[0]:st.image(result["overlay_png"],caption="Hồng: đoạn ứng viên. Cam: thành phần có nhánh/vòng/chạm biên. Cả hai chưa xác minh. Đường được vẽ từ pixel nét giữ lại, không nối khoảng mất.",width="stretch")
+    tabs = st.tabs(["Tất cả nét 2D","Ảnh gốc","Mặt nạ nét tối","Cách cũ để đối chiếu"])
+    with tabs[0]:st.image(result["overlay_png"],caption="Gồm cả nét bổ sung chưa chọn; hãy chọn ở bước 4. Hồng: đoạn ứng viên. Cam: thành phần có nhánh/vòng/chạm biên. Cả hai chưa xác minh. Đường được vẽ từ pixel nét giữ lại, không nối khoảng mất.",width="stretch")
     with tabs[1]:st.image(result["original_png"],width="stretch")
     with tabs[2]:st.image(result["mask_png"],caption="Mặt nạ có thể còn chữ/lưới hoặc mất sóng thật.",width="stretch")
     with tabs[3]:st.image(result["old_overlay_png"],caption="Cách 0.1: một điểm mỗi cột; giữ để thấy đoạn dọc bị bỏ hoặc co về giữa.",width="stretch")
@@ -405,17 +515,27 @@ def main():
     if gs["ambiguous_components"]:
         st.warning("Có thành phần mơ hồ màu cam. Chưa thể quyết định nhánh nào là ECG; không dùng để đo.")
     st.warning("Chưa có tín hiệu thời gian hay các mốc P/QRS/T. Đường nằm trên mực thật vẫn có thể là lưới/chữ. Kiểm tra riêng đỉnh R và đáy S.")
-    st.subheader("4. Tải kết quả thử nghiệm — từng file riêng")
+    st.subheader("4. Phóng to và chọn nhánh nét")
+    reviewed_graph,review_meta,review_overlay = review_panel(result)
+    meta = dict(meta)
+    meta["review"] = review_meta
+    meta["validation_status"] = "manual_selection_unverified"
+    meta["export_graph_stats"] = {"segments":len(reviewed_graph["segments"]),
+        "unique_points":len({tuple(p) for seg in reviewed_graph["segments"] for p in seg["points"]})}
+    meta["limits"] += " Manual selection does not establish a time signal or clinical validity."
+    review_csv = graph_csv(reviewed_graph,box,tuple(meta["working_size"]),tuple(meta["crop_size"]))
+    st.subheader("5. Tải kết quả thử nghiệm — từng file riêng")
     st.caption("CSV mới chứa các đoạn nét 2D: có thể nhiều điểm cùng x, chưa phải tín hiệu theo thời gian. Các đoạn khác nhau không được tự nối hoặc lấy trung bình để đo. Ảnh có thể chứa thông tin ca bệnh; che định danh trước khi tải lên.")
-    st.download_button("Tải ảnh phủ màu",result["overlay_png"],"digitizer_overlay.png","image/png",key="dg_overlay_download")
-    st.download_button("Tải tọa độ CSV",result["csv"],"digitizer_trace_points.csv","text/csv",key="dg_csv_download")
+    st.download_button("Tải ảnh phủ màu đã chọn",png_bytes(review_overlay),"digitizer_overlay.png","image/png",key="dg_overlay_download")
+    st.download_button("Tải tọa độ CSV đã chọn",review_csv,"digitizer_trace_points.csv","text/csv",key="dg_csv_download")
     st.download_button("Tải cấu hình JSON",json.dumps(meta,ensure_ascii=False,indent=2),"digitizer_record.json","application/json",key="dg_json_download")
     st.download_button("Tải mặt nạ PNG",result["mask_png"],"digitizer_mask.png","image/png",key="dg_mask_download")
-    st.subheader("5. Bước tiếp theo")
-    st.write("1. Chạy lại đúng ảnh và vùng cắt đã dùng ở 0.1. So sánh tab Nét 2D mới với Cách cũ.")
-    st.write("2. Nếu vẫn bỏ đỉnh/đáy hoặc giữ nhánh lưới: tải PNG phủ màu, CSV, JSON và mặt nạ PNG gửi đối chiếu; chưa cần chỉnh nhiều ngưỡng.")
-    st.write("3. Nếu hình dạng rõ hơn: thử một chuyển đạo khác trên cùng ECG, rồi một ảnh mới chưa dùng để sửa code. Giữ cả lượt không đạt.")
-    st.caption("Ai làm gì: em xuất bộ thử; người phát triển đối chiếu và sửa. Chưa chuyển sang đo PR/QRS/ST khi đường nét còn sai.")
+    st.subheader("6. Bước tiếp theo")
+    st.write("1. Dùng lại ảnh III và vùng cắt cũ. Mở từng QRS, đối chiếu ảnh gốc với tất cả nét ứng viên.")
+    st.write("2. Chọn thêm đoạn bị bỏ và bỏ nhánh chữ/lưới nếu nhìn chắc. Chưa rõ thì giữ nguyên và ghi chú; không đo PR/QRS/ST.")
+    st.write("3. Tải ảnh phủ màu đã chọn, CSV đã chọn, JSON và mặt nạ. Gửi đủ 4 file để người phát triển kiểm tra; chưa cần ECG mới.")
+    st.caption("Chọn nhánh chỉ là thao tác đối chiếu của người dùng, không phải xác nhận tín hiệu đúng. Khoảng mất không được nối tự động.")
+
 
 
 if __name__ == "__main__":
