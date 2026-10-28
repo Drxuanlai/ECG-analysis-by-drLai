@@ -296,8 +296,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v10.3"
-PROMPT_VERSION = "ecg-bidirectional-autocrop-v10.3"
+APP_VERSION = "v10.4"
+PROMPT_VERSION = "ecg-adaptive-autocrop-v10.4"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -1259,81 +1259,99 @@ def _evaluate_crop(image,xp,yp,fast=True):
             "fail":int(q.get("lead_fail",12)),"grid":cal.get("status"),
             "grid_confidence":float(cal.get("confidence") or 0),"result":result}
 
-def qc_guided_auto_crop(image):
-    """v10.3: bidirectional coarse-to-fine crop optimization.
+def _crop_accept(q, strict=False):
+    return (q["pass"] >= 11 and q["fail"] == 0) if strict else (q["pass"] >= 10 and q["fail"] <= 1)
 
-    Stage 1 searches both inward trims and outward expansion around the detected grid.
-    Stage 2 refines around the best fast candidates.
-    Stage 3 reranks the shortlist at full resolution with production deskew.
-    """
+def _crop_meta(best, stage, fast_count, coarse_count=0, fine_count=0, fullres_count=0, detector_conf=0.0):
+    return {"method":"adaptive_early_stop","stage":stage,"fast_count":fast_count,
+            "coarse_count":coarse_count,"fine_count":fine_count,"fullres_count":fullres_count,
+            "score":best["score"],"pass":best["pass"],"review":best["review"],"fail":best["fail"],
+            "grid":best["grid"],"grid_confidence":best["grid_confidence"],
+            "acceptable":_crop_accept(best),"detector_grid_confidence":float(detector_conf)}
+
+def qc_guided_auto_crop(image):
+    """Adaptive early-stop crop search. Full-resolution QC is the final authority."""
     if not DIGITIZER_AVAILABLE or digitizer_detect_grid_bbox is None:
         return (0,100),(0,100),None
     try:
         paper=digitizer_detect_paper_bbox(image); grid,gconf=digitizer_detect_grid_bbox(image,paper)
         w,h=image.size; gx0,gy0,gx1,gy1=grid
         base=(100*gx0/w,100*gx1/w,100*gy0/h,100*gy1/h)
+        seen=set(); fast_count=0; fullres_count=0
+        def key_for(xp,yp): return tuple(round(v,1) for v in (*xp,*yp))
+        def ev(xp,yp,fast):
+            nonlocal fast_count,fullres_count
+            if fast: fast_count+=1
+            else: fullres_count+=1
+            return _evaluate_crop(image,xp,yp,fast=fast)
 
-        # Directed patterns: positive values trim inward, negative values expand outward.
-        # Includes asymmetric trims because photographed sheets often contain desk/background
-        # predominantly on one or two sides.
+        # A. Fast path: clean scans should stop here.
+        obvious=[((0.,100.),(0.,100.)),
+                 _clip_pct_box(base[0],base[1],base[2],base[3]),
+                 _clip_pct_box(base[0]+4,base[1]-3,base[2]+5,base[3]-3)]
+        for xp,yp in obvious:
+            k=key_for(xp,yp)
+            if k in seen: continue
+            seen.add(k)
+            try:
+                q=ev(xp,yp,True)
+                if q["pass"]>=11 and q["fail"]==0:
+                    full=ev(xp,yp,False)
+                    if _crop_accept(full,True):
+                        meta=_crop_meta(full,"fast_path",fast_count,fullres_count=fullres_count,detector_conf=gconf)
+                        return tuple(round(v) for v in full["x"]),tuple(round(v) for v in full["y"]),meta
+            except Exception: pass
+
+        # B. Directed coarse search.
         patterns=[
-            (0,0,0,0),
-            (5,3,5,3),(8,4,8,4),(10,5,10,5),(12,5,12,4),(15,5,15,5),
-            (10,8,12,6),(12,8,15,6),(15,8,15,8),
-            (5,10,10,5),(8,12,12,6),
-            (12,3,15,3),(15,3,18,4),(8,3,15,4),
-            (3,8,15,4),(5,5,18,5),(10,5,18,5),
+            (0,0,0,0),(5,3,5,3),(8,4,8,4),(10,5,10,5),(12,5,12,4),(15,5,15,5),
+            (10,8,12,6),(12,8,15,6),(15,8,15,8),(5,10,10,5),(8,12,12,6),
+            (12,3,15,3),(15,3,18,4),(8,3,15,4),(3,8,15,4),(5,5,18,5),(10,5,18,5),
             (-3,-3,-3,-3),(-5,-3,-5,-3),(-3,-5,-3,-5),
-            (5,0,10,0),(10,0,15,0),(15,0,15,0),
-            (0,5,10,5),(0,8,15,5),(8,0,0,0),(0,8,0,0),
-        ]
-        coarse=[]; seen=set()
+            (5,0,10,0),(10,0,15,0),(15,0,15,0),(0,5,10,5),(0,8,15,5),(8,0,0,0),(0,8,0,0)]
+        coarse=[]
         for lt,rt,tt,bt in patterns:
             xp,yp=_clip_pct_box(base[0]+lt,base[1]-rt,base[2]+tt,base[3]-bt)
-            key=tuple(round(v,1) for v in (*xp,*yp))
-            if key in seen: continue
-            seen.add(key)
-            try: coarse.append(_evaluate_crop(image,xp,yp,fast=True))
+            k=key_for(xp,yp)
+            if k in seen: continue
+            seen.add(k)
+            try: coarse.append(ev(xp,yp,True))
             except Exception: pass
-        if not coarse:
-            return (0,100),(0,100),None
+        if not coarse: return (0,100),(0,100),None
         coarse.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
 
-        # Fine search around top 3 coarse crops, moving individual edges ±2/4%.
-        fine=list(coarse[:5])
-        deltas=[-4,-2,0,2,4]
-        for seed in coarse[:3]:
+        verified=[]
+        for cand in coarse[:3]:
+            try:
+                full=ev(cand["x"],cand["y"],False); verified.append(full)
+                if _crop_accept(full):
+                    meta=_crop_meta(full,"coarse_early_stop",fast_count,len(coarse),0,fullres_count,gconf)
+                    return tuple(round(v) for v in full["x"]),tuple(round(v) for v in full["y"]),meta
+            except Exception: pass
+
+        # C. Fine search only if coarse full-res verification is insufficient.
+        fine=[]; deltas=[-4,-2,2,4]
+        for seed in coarse[:2]:
             x0,x1=seed["x"]; y0,y1=seed["y"]
-            moves=[
-                (d,0,0,0) for d in deltas if d]+[(0,d,0,0) for d in deltas if d]+\
-                [(0,0,d,0) for d in deltas if d]+[(0,0,0,d) for d in deltas if d]+\
-                [(d,-d,0,0) for d in (-3,3)]+[(0,0,d,-d) for d in (-3,3)]
+            moves=([(d,0,0,0) for d in deltas]+[(0,d,0,0) for d in deltas]+
+                   [(0,0,d,0) for d in deltas]+[(0,0,0,d) for d in deltas]+
+                   [(d,-d,0,0) for d in (-3,3)]+[(0,0,d,-d) for d in (-3,3)])
             for dl,dr,dt,db in moves:
                 xp,yp=_clip_pct_box(x0+dl,x1+dr,y0+dt,y1+db)
-                key=tuple(round(v,1) for v in (*xp,*yp))
-                if key in seen: continue
-                seen.add(key)
-                try: fine.append(_evaluate_crop(image,xp,yp,fast=True))
+                k=key_for(xp,yp)
+                if k in seen: continue
+                seen.add(k)
+                try: fine.append(ev(xp,yp,True))
                 except Exception: pass
-
         fine.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
-
-        # Full-resolution rerank. This removes the v10.2 mismatch between thumbnail search
-        # and production Digitizer behavior.
-        full=[]
-        for cand in fine[:4]:
-            try: full.append(_evaluate_crop(image,cand["x"],cand["y"],fast=False))
+        final=list(verified)
+        for cand in fine[:3]:
+            try: final.append(ev(cand["x"],cand["y"],False))
             except Exception: pass
-        if not full:
-            full=fine[:1]
-        full.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
-        best=full[0]
-        acceptable=(best["pass"]>=10 and best["fail"]<=1)
-        meta={"method":"bidirectional_coarse_to_fine_fullres",
-              "coarse_count":len(coarse),"fine_count":len(fine),"fullres_count":len(full),
-              "score":best["score"],"pass":best["pass"],"review":best["review"],"fail":best["fail"],
-              "grid":best["grid"],"grid_confidence":best["grid_confidence"],
-              "acceptable":acceptable,"detector_grid_confidence":float(gconf)}
+        if not final: final=[coarse[0]]
+        final.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
+        best=final[0]
+        meta=_crop_meta(best,"fine_final",fast_count,len(coarse),len(fine),fullres_count,gconf)
         return tuple(round(v) for v in best["x"]),tuple(round(v) for v in best["y"]),meta
     except Exception:
         return (0,100),(0,100),None
@@ -1358,8 +1376,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · bidirectional auto-crop + full-res rerank")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v10.3 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · adaptive auto-crop + early-stop")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v10.4 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1444,7 +1462,7 @@ else:
         whole_x, whole_y = ((auto_crop_x,auto_crop_y) if crop_whole else ((0,100),(0,100)))
         if crop_whole:
             if auto_crop_meta:
-                st.caption(f"Auto-crop v10.3: coarse {auto_crop_meta['coarse_count']} · fine {auto_crop_meta['fine_count']} · full-res rerank {auto_crop_meta['fullres_count']} · best PASS {auto_crop_meta['pass']} / REVIEW {auto_crop_meta['review']} / FAIL {auto_crop_meta['fail']} · grid {auto_crop_meta['grid']}.")
+                st.caption(f"Auto-crop v10.4 [{auto_crop_meta['stage']}]: fast {auto_crop_meta['fast_count']} · coarse {auto_crop_meta['coarse_count']} · fine {auto_crop_meta['fine_count']} · full-res {auto_crop_meta['fullres_count']} · best PASS {auto_crop_meta['pass']} / REVIEW {auto_crop_meta['review']} / FAIL {auto_crop_meta['fail']} · grid {auto_crop_meta['grid']}.")
                 if not auto_crop_meta["acceptable"]:
                     st.warning("Auto-crop chưa đạt ngưỡng tin cậy (mục tiêu ≥10 PASS và ≤1 FAIL). Hãy kiểm tra preview; slider là fallback.")
             whole_x = st.slider("Toàn bộ ECG: trái — phải (%)", 0,100,whole_x, key="image_x_"+image_id)
