@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-VERSION = "ECG Digitizer Engine 1.2-cross-axis-calibration"
+VERSION = "ECG Digitizer Engine 1.3-failsafe"
 STANDARD_12_LAYOUT = [
     ["I", "aVR", "V1", "V4"],
     ["II", "aVL", "V2", "V5"],
@@ -299,7 +299,12 @@ def _direct_cross_axis_period(px, py):
     return max(strong or matches,key=lambda z:z[0])
 
 def estimate_grid_calibration(image: Image.Image, grid_box):
-    """Robust 1-mm grid estimate with X/Y consensus before harmonic assignment."""
+    """Fail-safe grid calibration.
+
+    PASS requires a directly observed periodic peak on X and Y with close periods.
+    Harmonic division is retained only as diagnostic metadata and can never create
+    px_per_mm. If direct X/Y agreement is absent, physical-unit conversion stays off.
+    """
     rgb=np.asarray(image.convert("RGB")); x0,y0,x1,y1=grid_box
     roi=rgb[y0:y1,x0:x1]
     r=roi[:,:,0].astype(float); g=roi[:,:,1].astype(float); b=roi[:,:,2].astype(float)
@@ -309,42 +314,39 @@ def estimate_grid_calibration(image: Image.Image, grid_box):
     px=_autocorr_peaks(xp,3,maxx); py=_autocorr_peaks(yp,3,maxy)
     fx,cx,mx=_fundamental_from_peaks(px); fy,cy,my=_fundamental_from_peaks(py)
 
-    status="FAIL"; pxmm=None; conf=0.; ratio=None; method=None
+    # Direct observed-period matches only. Do not divide either axis by a guessed harmonic.
+    matches=[]
+    # Use raw observed autocorrelation peaks, not the diagnostic harmonic labels.
+    # _autocorr_peaks returns (strength, lag_px).
+    for sx,lx in px:
+        for sy,ly in py:
+            ratio=max(lx,ly)/max(1e-6,min(lx,ly))
+            strength=min(float(sx),float(sy))
+            if ratio<=1.08 and strength>=.20:
+                # Prefer strong agreement; mild preference for smaller observed period.
+                score=2.5*strength + 1.5*(1-(ratio-1)/.08) - .001*min(lx,ly)
+                matches.append((score,float(lx),float(ly),strength,ratio))
+    status="REVIEW"; pxmm=None; conf=0.; ratio=None; method="unresolved_direct_xy"
     observed_x=fx; observed_y=fy
-    direct=_direct_cross_axis_period(px,py)
-    if direct is not None:
-        _,period,dx,dy,dconf,dratio=direct
+    if matches:
+        # A 5-mm/bold-grid multiple can have stronger autocorrelation than the 1-mm
+        # grid. Among credible direct X/Y matches, choose the smallest period that
+        # is itself strong; larger 2x/3x/4x peaks then act as harmonic support.
+        credible=[m for m in matches if m[3]>=.35]
+        pool=credible or matches
+        _,dx,dy,dconf,dratio=min(pool,key=lambda z:(z[1]+z[2])/2.0)
+        period=(dx+dy)/2.0
         if 3<=period<=80:
-            pxmm=period; observed_x=dx; observed_y=dy
-            ratio=dratio; conf=dconf; method="direct_cross_axis"
-            status="PASS" if dratio<=1.08 and dconf>=.20 else "REVIEW"
-
-    # Only if no credible shared observed period exists, fall back to harmonic families.
-    if pxmm is None and fx and fy:
-        pairs=[]
-        for ax in (1,2,3,4,5,6):
-            for ay in (1,2,3,4,5,6):
-                aa=fx/ax; bb=fy/ay
-                if aa<3 or bb<3: continue
-                rr=max(aa,bb)/max(1e-6,min(aa,bb))
-                complexity=(ax-1)+(ay-1)
-                score=rr + .025*complexity
-                pairs.append((score,rr,aa,bb,ax,ay))
-        if pairs:
-            _,rr,aa,bb,ax,ay=min(pairs,key=lambda z:z[0])
-            conf=float(min(cx,cy))
-            if rr<=1.18 and 3<=np.mean([aa,bb])<=80:
-                pxmm=float(np.mean([aa,bb])); ratio=rr; method="harmonic_cross_axis"
-                status="PASS" if rr<=1.10 and conf>=.22 else "REVIEW"
-            else:
-                status="REVIEW"
+            observed_x,observed_y=dx,dy; pxmm=period
+            conf=dconf; ratio=dratio; method="direct_cross_axis_fundamental"
+            status="PASS"
 
     return {"status":status,"small_grid_px_x":observed_x,"small_grid_px_y":observed_y,
             "px_per_mm":pxmm,"axis_ratio":ratio,"confidence":conf,
             "consensus_method":method,"x_harmonics":mx,"y_harmonics":my,
             "speed_mm_s":None,"gain_mm_mV":None,"gain_by_lead":{},
             "time_ms_per_px":None,"mV_per_px_by_lead":{},
-            "note":"1-mm grid geometry with X/Y consensus; speed/gain require OCR, calibration pulse, or user confirmation."}
+            "note":"FAIL-SAFE: px/mm is emitted only from directly agreeing X/Y observed periods; harmonic-only agreement never enables physical units."}
 
 def _normalize_recording_hints(recording_hints=None, speed_mm_s=None, gain_mm_mV=None):
     h=dict(recording_hints or {})
@@ -400,22 +402,36 @@ def detect_calibration_pulse_gain(image, boxes, px_per_mm):
     return proposals,confs
 
 def apply_recording_standard(calibration, recording_hints=None, pulse_gains=None, pulse_confidence=None):
+    """Apply only OCR/user-confirmed recording standards.
+
+    Calibration-pulse detection is diagnostic cross-check evidence and NEVER fills
+    missing gain values. This prevents QRS/transition strokes from silently becoming
+    a physical amplitude calibration.
+    """
     c=dict(calibration); hints=dict(recording_hints or {})
     speed=hints.get("speed_mm_s")
     if speed not in (None,25,50): raise ValueError("speed must be 25, 50, or None")
     gains,sources=_gain_map_from_hints(hints)
-    for lead,g in (pulse_gains or {}).items():
-        # OCR/user wins; pulse fills only missing leads.
-        if lead not in gains:
-            gains[lead]=float(g); sources[lead]="calibration_pulse"
-    pxmm=c.get("px_per_mm"); c["speed_mm_s"]=speed
+    pxmm=c.get("px_per_mm")
+    c["speed_mm_s"]=speed
     c["speed_source"]=hints.get("speed_source","ocr_or_user" if speed else None)
-    c["gain_by_lead"]=gains; c["gain_source_by_lead"]=sources
-    c["gain_confidence_by_lead"]={lead:float((pulse_confidence or {}).get(lead,1.0 if sources.get(lead," ").startswith("ocr_or_user") else 0.0)) for lead in gains}
-    c["time_ms_per_px"]=(1000/(pxmm*speed)) if pxmm and speed else None
-    c["mV_per_px_by_lead"]={lead:1/(pxmm*g) for lead,g in gains.items()} if pxmm else {}
-    c["recording_standard_status"]=("PASS" if pxmm and speed and len(gains)>=12 else
-                                    "REVIEW" if pxmm and (speed or gains) else "UNRESOLVED")
+    c["gain_by_lead"]=gains
+    c["gain_source_by_lead"]=sources
+    c["gain_confidence_by_lead"]={lead:1.0 for lead in gains}
+    c["pulse_crosscheck"]={
+        "proposed_gain_by_lead":dict(pulse_gains or {}),
+        "confidence_by_lead":dict(pulse_confidence or {}),
+        "used_for_conversion":False,
+        "meaning":"Diagnostic cross-check only; never populates gain_by_lead."
+    }
+    # Only direct grid PASS can enable physical conversion.
+    grid_ok=(c.get("status")=="PASS" and pxmm)
+    c["time_ms_per_px"]=(1000/(pxmm*speed)) if grid_ok and speed else None
+    c["mV_per_px_by_lead"]={lead:1/(pxmm*g) for lead,g in gains.items()} if grid_ok else {}
+    c["recording_standard_status"]=(
+        "PASS" if grid_ok and speed and len([k for k in gains if k in LEADS_12])>=12 else
+        "REVIEW" if grid_ok and (speed or gains) else "UNRESOLVED"
+    )
     return c
 
 def lead_qc(centerline, box, grid_box):
