@@ -296,8 +296,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.0"
-PROMPT_VERSION = "ecg-ocr-roi-v11.0"
+APP_VERSION = "v11.0.1"
+PROMPT_VERSION = "ecg-ocr-roi-rhythm-v11.0.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -1452,15 +1452,27 @@ def ocr_anchored_group_proposals(ocr, image_size, digitizer_result=None):
         x0=max(0,bounds[c]-0.012*w); x1=min(w,bounds[c+1]+0.012*w)
         groups.append((label,(100*x0/w,100*x1/w),(100*top/h,100*bottom/h)))
 
-    # Rhythm: prefer Digitizer rhythm box; otherwise lower strip under diagnostic rows.
+    # Rhythm II: Digitizer box is the core waveform detector, not the final crop.
+    # Expand vertically to retain the printed Rhythm [II] label, grid context,
+    # P waves and baseline; keep almost the full horizontal recording.
     rhythm=None
     if digitizer_result:
         rb=digitizer_result.get("leads",{}).get("II-rhythm",{}).get("box")
         if rb:
-            rhythm=((max(0.,100*rb[0]/w),min(100.,100*rb[2]/w)),
-                    (max(0.,100*rb[1]/h),min(100.,100*rb[3]/h)))
+            rx0=max(0.,min(2.0,100*rb[0]/w))
+            rx1=min(100.,max(98.0,100*rb[2]/w))
+            ry0=max(0.,100*rb[1]/h - 7.0)
+            ry1=min(100.,100*rb[3]/h + 3.5)
+            # Ensure a useful vertical context even when the detected box is very thin.
+            if ry1-ry0 < 20.0:
+                center=(ry0+ry1)/2.0
+                ry0=max(0.,center-11.0)
+                ry1=min(100.,center+11.0)
+            rhythm=((rx0,rx1),(ry0,ry1))
     if rhythm is None:
-        rhythm=((1.,99.),(max(0.,100*bottom/h),99.))
+        # Geometry fallback: start slightly above the end of the 12-lead rows so
+        # the rhythm label and first complexes are not clipped.
+        rhythm=((1.,99.),(max(0.,100*bottom/h-5.0),99.))
 
     return groups,rhythm,{"method":"ocr_anchors","anchors":sorted(valid),"anchor_count":len(valid),
                           "columns_px":[round(v,1) for v in cx],"rows_px":[round(row_y[r],1) for r in range(3)]}
@@ -1484,8 +1496,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · manual crop + OCR-anchored lead ROI")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.0 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · manual crop + OCR lead ROI + expanded rhythm II")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.0.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1649,8 +1661,9 @@ else:
             st.image(region["png"],caption=f"{rid} · {region['sent_size'][0]} × {region['sent_size'][1]} px",width="stretch")
             regions.append(region)
     if rhythm_enabled:
-        with st.expander("Dải nhịp dài — giữ toàn bộ chiều dài",expanded=True):
-            rhythm_x,rhythm_y=auto_rhythm_box if auto_rhythm_box else ((0,100),(80,100))
+        with st.expander("Dải nhịp dài — Rhythm II",expanded=True):
+            st.caption("ROI được mở rộng quanh DII kéo dài để giữ nhãn Rhythm [II], lưới nền và đủ chu kỳ cho đo RR/PR/QRS/QT. Chỉ chỉnh nếu preview còn cắt sóng.")
+            rhythm_x,rhythm_y=auto_rhythm_box if auto_rhythm_box else ((1,99),(75,100))
             rx = st.slider("Dải nhịp: trái — phải (%)",0.0,100.0,tuple(float(round(v,1)) for v in rhythm_x),.1,key="region_rx_"+frame_id)
             ry = st.slider("Dải nhịp: trên — dưới (%)",0.0,100.0,tuple(float(round(v,1)) for v in rhythm_y),.1,key="region_ry_"+frame_id)
             try:
