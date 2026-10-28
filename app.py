@@ -22,12 +22,15 @@ from threading import RLock
 
 # Digitizer v1.3 fail-safe: local image-processing evidence, never a replacement for the original ECG.
 try:
-    from ecg_digitizer import digitize_ecg, result_summary as digitizer_result_summary
+    from ecg_digitizer import (digitize_ecg, result_summary as digitizer_result_summary,
+        detect_paper_bbox as digitizer_detect_paper_bbox, detect_grid_bbox as digitizer_detect_grid_bbox)
     DIGITIZER_AVAILABLE = True
     DIGITIZER_IMPORT_ERROR = ""
 except Exception as _digitizer_exc:
     digitize_ecg = None
     digitizer_result_summary = None
+    digitizer_detect_paper_bbox = None
+    digitizer_detect_grid_bbox = None
     DIGITIZER_AVAILABLE = False
     DIGITIZER_IMPORT_ERROR = type(_digitizer_exc).__name__
 
@@ -263,8 +266,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v10.0"
-PROMPT_VERSION = "ecg-digitizer-v10.0"
+APP_VERSION = "v10.1"
+PROMPT_VERSION = "ecg-digitizer-autocrop-v10.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -664,8 +667,8 @@ def arithmetic_checks(data, known, age_years=None):
     for f in data["lead_features"]:
         ref, boxes = f["st_measurement_id"], f["st_small_boxes"]
         if not ref:
-            if boxes is not None:
-                add("warning", f"{f['lead']}: số ST chưa liên kết tới ID số đo và mốc ảnh.")
+            if boxes is not None and abs(float(boxes)) > 1e-9:
+                add("warning", f"{f['lead']}: số ST khác 0 chưa liên kết tới ID số đo và mốc ảnh.")
             continue
         m = by_id.get(ref)
         if not m or m["parameter"] != "st_mm" or m["lead"] != f["lead"] or m["region_id"] != f["detail_region_id"]:
@@ -747,9 +750,13 @@ def arithmetic_checks(data, known, age_years=None):
         add("info", "Chưa có phép tính đủ dữ kiện hoặc khớp để đối chiếu; không được hiểu là số đo đã đúng.")
     arithmetic = [c for c in checks if c.get("category") == "arithmetic"]
     arithmetic_status = "Có mâu thuẫn số học" if any(c["status"]=="warning" for c in arithmetic) else "Khớp trong dung sai làm tròn" if arithmetic else "Chưa đủ dữ kiện kiểm tra"
+    blocking = any(c["status"]=="warning" and
+                   (c.get("category")=="arithmetic" or bool(c.get("measurement_ids")))
+                   for c in checks)
     return {"checks": checks, "arithmetic_status":arithmetic_status,
             "image_measurement_status":"CHƯA ĐƯỢC BÁC SĨ XÁC MINH", "review_measurement_ids": sorted(bad_ids),
             "has_warning": any(c["status"] == "warning" for c in checks),
+             "has_blocking_warning":blocking,
             "rounding_tolerance": {"relative": .05, "ms_minimum": 10, "bpm_minimum": 5,
                                    "mv_minimum": .05, "st_mm_minimum": .2}}
 
@@ -1091,14 +1098,13 @@ def markdown_report(result):
     lines += ["", "## Kiểm tra số học", "Nhất quán số học: " + result["arithmetic"]["arithmetic_status"],
         "Phép đo ảnh: " + result["arithmetic"]["image_measurement_status"], "Chỉ kiểm tra nhất quán; không xác minh phép đo ảnh."]
     lines += [f"- {c['status']}: {c['message']}" for c in result["arithmetic"]["checks"]]
-    if result["arithmetic"]["has_warning"]:
-        lines += ["", "CẦN ĐO LẠI: Tạm ẩn phần diễn giải/kết luận AI vì dữ liệu có mâu thuẫn hoặc thiếu căn cứ quy đổi."]
-    else:
-        lines += ["", "## Diễn giải AI chưa xác minh", "Nhịp: " + data["rhythm"],
-            "Dẫn truyền: " + data["conduction"], "Tái cực: " + data["repolarization"]]
-        lines += ["- " + x for x in data["impression"]]
-        for h in data["hypotheses"]:
-            lines += [f"- Khả năng: {h['possibility']} | Ủng hộ: {h['supporting_evidence']} | Chưa phù hợp/thiếu: {h['opposing_or_missing']} | Xác minh: {h['verification']}"]
+    if result["arithmetic"].get("has_blocking_warning",False):
+        lines += ["", "CẢNH BÁO: Có số đo bị gắn cờ; không dùng các số đo đó làm căn cứ định lượng."]
+    lines += ["", "## Diễn giải AI chưa xác minh", "Nhịp: " + data["rhythm"],
+        "Dẫn truyền: " + data["conduction"], "Tái cực: " + data["repolarization"]]
+    lines += ["- " + x for x in data["impression"]]
+    for h in data["hypotheses"]:
+        lines += [f"- Khả năng: {h['possibility']} | Ủng hộ: {h['supporting_evidence']} | Chưa phù hợp/thiếu: {h['opposing_or_missing']} | Xác minh: {h['verification']}"]
     lines += ["", "## Điểm cần bác sĩ kiểm tra", *["- " + x for x in data["verification_needed"]],
               "", "## Lưu ý lâm sàng từ AI — cần đánh giá trực tiếp", data["urgency"]]
     return "\n".join(lines)
@@ -1161,20 +1167,19 @@ def render_result(result):
                 st.warning(c["message"])
             else:
                 st.caption(c["message"])
-        if result["arithmetic"]["has_warning"]:
-            st.error("Cần kiểm tra lại. Tạm ẩn diễn giải và kết luận AI vì quan sát chưa đủ rõ, mâu thuẫn hoặc thiếu căn cứ quy đổi. Gói đối chiếu giữ nguyên đầu ra AI; không tự sửa số hoặc chẩn đoán.")
-        else:
-            st.subheader("Diễn giải AI — cần bác sĩ xác minh")
-            for label, field in [("Nhịp", "rhythm"), ("Dẫn truyền", "conduction"), ("Tái cực", "repolarization")]:
-                st.write(label + ": " + data[field])
-            for item in data["impression"]:
-                st.write("• " + item)
-            st.subheader("Khả năng cần phân biệt")
-            for h in data["hypotheses"]:
-                with st.expander(h["possibility"]):
-                    st.write("Ủng hộ: " + h["supporting_evidence"])
-                    st.write("Chưa phù hợp / còn thiếu: " + h["opposing_or_missing"])
-                    st.write("Cần xác minh: " + h["verification"])
+        if result["arithmetic"].get("has_blocking_warning",False):
+            st.warning("Có số đo/mốc bị gắn cờ. Không dùng các số đo đó làm căn cứ định lượng; diễn giải định tính vẫn hiển thị để bác sĩ đối chiếu ECG gốc.")
+        st.subheader("Diễn giải AI — cần bác sĩ xác minh")
+        for label, field in [("Nhịp", "rhythm"), ("Dẫn truyền", "conduction"), ("Tái cực", "repolarization")]:
+            st.write(label + ": " + data[field])
+        for item in data["impression"]:
+            st.write("• " + item)
+        st.subheader("Khả năng cần phân biệt")
+        for h in data["hypotheses"]:
+            with st.expander(h["possibility"]):
+                st.write("Ủng hộ: " + h["supporting_evidence"])
+                st.write("Chưa phù hợp / còn thiếu: " + h["opposing_or_missing"])
+                st.write("Cần xác minh: " + h["verification"])
         st.subheader("Điểm cần bác sĩ kiểm tra")
         for item in data["verification_needed"]:
             st.write("• " + item)
@@ -1185,10 +1190,43 @@ def render_result(result):
         st.download_button("Tải gói đối chiếu ZIP", audit_zip(result), "ecg_review_v9.zip", "application/zip", key="audit_download_v9")
 
 
+def auto_ecg_crop_percent(image):
+    if not DIGITIZER_AVAILABLE or digitizer_detect_grid_bbox is None:
+        return (0,100),(0,100),None
+    try:
+        paper=digitizer_detect_paper_bbox(image)
+        grid,conf=digitizer_detect_grid_bbox(image,paper)
+        w,h=image.size; x0,y0,x1,y1=grid
+        gw=max(1,x1-x0); gh=max(1,y1-y0)
+        x0=max(0,x0-int(.035*gw)); x1=min(w,x1+int(.035*gw))
+        y0=max(0,y0-int(.10*gh)); y1=min(h,y1+int(.08*gh))
+        xp=(round(100*x0/w),round(100*x1/w)); yp=(round(100*y0/h),round(100*y1/h))
+        if xp[1]-xp[0]<45 or yp[1]-yp[0]<35: return (0,100),(0,100),None
+        return xp,yp,{"grid_confidence":float(conf)}
+    except Exception:
+        return (0,100),(0,100),None
+
+def digitizer_group_proposals(result, image_size, padding_pct=1.5):
+    if not result: return None,None
+    leads=result.get("leads",{}); w,h=image_size
+    groups=[("Nhóm chi I–III",["I","II","III"]),("Nhóm chi aVR–aVF",["aVR","aVL","aVF"]),
+            ("Nhóm ngực V1–V3",["V1","V2","V3"]),("Nhóm ngực V4–V6",["V4","V5","V6"])]
+    out=[]
+    for label,names in groups:
+        boxes=[leads[n].get("box") for n in names if n in leads and leads[n].get("box")]
+        if len(boxes)!=3: return None,None
+        x0=min(b[0] for b in boxes); y0=min(b[1] for b in boxes); x1=max(b[2] for b in boxes); y1=max(b[3] for b in boxes)
+        px=padding_pct*w/100; py=padding_pct*h/100
+        out.append((label,(max(0.,100*(x0-px)/w),min(100.,100*(x1+px)/w)),
+                     (max(0.,100*(y0-py)/h),min(100.,100*(y1+py)/h))))
+    rb=leads.get("II-rhythm",{}).get("box"); rhythm=None
+    if rb: rhythm=((100*rb[0]/w,100*rb[2]/w),(100*rb[1]/h,100*rb[3]/h))
+    return out,rhythm
+
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · AI vision + Digitizer v1.3 fail-safe + dự phòng API")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v10.0 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · auto-crop + AI vision + Digitizer v1.3 fail-safe")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v10.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1268,11 +1306,14 @@ else:
         manual = st.selectbox("Xoay thêm ngược chiều kim đồng hồ", [0,90,180,270], key="image_rot_"+image_id)
         oriented = rotate_quarter_turn(original, (auto_angle+manual)%360)
         st.image(oriented, caption="Toàn cảnh sau chỉnh chiều", width="stretch")
-        crop_whole = st.checkbox("Cắt bỏ nền ngoài tờ ECG", key="image_crop_"+image_id)
-        whole_x, whole_y = (0,100), (0,100)
+        auto_crop_x,auto_crop_y,auto_crop_meta=auto_ecg_crop_percent(oriented)
+        crop_whole = st.checkbox("Tự cắt tương đối vùng ECG", value=auto_crop_meta is not None, key="image_crop_"+image_id)
+        whole_x, whole_y = ((auto_crop_x,auto_crop_y) if crop_whole else ((0,100),(0,100)))
         if crop_whole:
-            whole_x = st.slider("Toàn bộ ECG: trái — phải (%)", 0,100,(0,100), key="image_x_"+image_id)
-            whole_y = st.slider("Toàn bộ ECG: trên — dưới (%)", 0,100,(0,100), key="image_y_"+image_id)
+            if auto_crop_meta:
+                st.caption(f"Đã gợi ý vùng ECG từ lưới (confidence {auto_crop_meta['grid_confidence']:.2f}). Chỉ chỉnh nếu preview cắt mất sóng/nhãn chuẩn.")
+            whole_x = st.slider("Toàn bộ ECG: trái — phải (%)", 0,100,whole_x, key="image_x_"+image_id)
+            whole_y = st.slider("Toàn bộ ECG: trên — dưới (%)", 0,100,whole_y, key="image_y_"+image_id)
         enhance = st.checkbox("Tăng tương phản ảnh", value=False, key="image_enhance_"+image_id)
         if enhance:
             st.caption("Tăng tương phản có thể làm mất/thay đổi chi tiết. Các ảnh gửi đều dùng cùng thiết lập; hãy đối chiếu bản gốc.")
@@ -1309,6 +1350,7 @@ else:
                 digitizer_result=None; digitizer_evidence=None
                 st.warning("Digitizer không hoàn tất ("+type(exc).__name__+"). Không chặn phân tích ảnh gốc.")
 
+    auto_group_proposals,auto_rhythm_box=digitizer_group_proposals(digitizer_result,ecg.size) if digitizer_result else (None,None)
     regions = [make_region(ecg, "overview", "Toàn bộ ECG", (0,100),(0,100), enhance)]
     st.image(regions[0]["png"], caption="Ảnh toàn bộ ECG sẽ gửi AI", width="stretch")
     st.subheader("2. Chọn bố cục và kiểm tra vùng chi tiết")
@@ -1321,7 +1363,11 @@ else:
     padding_y = st.slider("Đệm trên/dưới vùng gợi ý (% ảnh)",0.0,8.0,3.0,0.5,key="image_padding_"+frame_id+layout)
     st.caption("Khoảng đệm giảm nguy cơ mất đỉnh R/đáy S; chưa phát hiện được mọi chỗ cắt sóng. Kiểm tra từng ảnh, nhất là sóng cao hoặc sâu.")
     try:
-        proposals = pad_regions(suggested_regions(layout,group_x,group_y),0.5,padding_y)
+        if layout=="3 hàng × 4 cột" and auto_group_proposals:
+            proposals=auto_group_proposals
+            st.caption("4 vùng chi tiết lấy tự động từ ROI từng lead của Digitizer; sliders bên dưới chỉ là fallback.")
+        else:
+            proposals = pad_regions(suggested_regions(layout,group_x,group_y),0.5,padding_y)
     except ValueError as exc:
         st.error(str(exc));st.stop()
     region_scope = frame_id+hashlib.sha256(json.dumps([layout,group_x,group_y,padding_y]).encode()).hexdigest()[:8]
@@ -1343,8 +1389,9 @@ else:
             regions.append(region)
     if rhythm_enabled:
         with st.expander("Dải nhịp dài — giữ toàn bộ chiều dài",expanded=True):
-            rx = st.slider("Dải nhịp: trái — phải (%)",0,100,(0,100),key="region_rx_"+frame_id)
-            ry = st.slider("Dải nhịp: trên — dưới (%)",0,100,(80,100),key="region_ry_"+frame_id)
+            rhythm_x,rhythm_y=auto_rhythm_box if auto_rhythm_box else ((0,100),(80,100))
+            rx = st.slider("Dải nhịp: trái — phải (%)",0.0,100.0,tuple(float(round(v,1)) for v in rhythm_x),.1,key="region_rx_"+frame_id)
+            ry = st.slider("Dải nhịp: trên — dưới (%)",0.0,100.0,tuple(float(round(v,1)) for v in rhythm_y),.1,key="region_ry_"+frame_id)
             try:
                 region = make_region(ecg,"rhythm","Dải nhịp dài",rx,ry,enhance)
             except ValueError as exc:
