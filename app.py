@@ -141,6 +141,36 @@ def _tesseract_tsv(image, psm=11, timeout=8):
     return rows
 
 
+def _ocr_recording_text(rows):
+    """Reconstruct approximate spatial lines and extract literal 25/50 mm/s and 2.5/5/10/20 mm/mV."""
+    if not rows: return []
+    heights=[r["height"] for r in rows if r["height"]>0]
+    tol=max(8.,float(np.median(heights))*0.8 if heights else 12.)
+    lines=[]
+    for r in sorted(rows,key=lambda z:z["cy"]):
+        target=None
+        for line in lines:
+            if abs(line["cy"]-r["cy"])<=tol:
+                target=line; break
+        if target is None:
+            target={"cy":r["cy"],"rows":[]}; lines.append(target)
+        target["rows"].append(r)
+        target["cy"]=float(np.mean([x["cy"] for x in target["rows"]]))
+    found=[]
+    patterns=[(r"(?<!\d)(25|50)\s*mm\s*/\s*s(?:ec)?","mm/s"),
+              (r"(?<!\d)(2[.,]5|5|10|20)\s*mm\s*/\s*m[vV]","mm/mV")]
+    for line in lines:
+        rr=sorted(line["rows"],key=lambda z:z["left"])
+        text=" ".join(x["text"] for x in rr)
+        compact=re.sub(r"\s+"," ",text)
+        for pat,unit in patterns:
+            for m in re.finditer(pat,compact,re.I):
+                val=float(m.group(1).replace(",","."))
+                found.append({"value":val,"unit":unit,"evidence":m.group(0),
+                              "x":float(np.mean([x["cx"] for x in rr])),
+                              "y":line["cy"],"confidence":float(np.mean([x["conf"] for x in rr]))})
+    return found
+
 def extract_ecg_ocr_evidence(image):
     """Extract conservative lead anchors and literal recording-standard text.
     OCR is evidence only. User-confirmed values always win.
@@ -155,23 +185,9 @@ def extract_ecg_ocr_evidence(image):
         if lead and r["conf"]>=35 and r["conf"]>anchor_conf.get(lead,-1):
             anchors[lead]=(r["cx"],r["cy"]); anchor_conf[lead]=r["conf"]
 
-    # Reconstruct OCR lines using block/par/line IDs from a second TSV-like pass is expensive;
-    # instead inspect nearby token windows in reading order for literal number + mm/unit pairs.
-    ordered=sorted(rows,key=lambda z:(round(z["cy"]/max(8,z["height"])),z["left"]))
-    literal=[]
-    for i,r in enumerate(ordered):
-        window=" ".join(x["text"] for x in ordered[max(0,i-2):min(len(ordered),i+4)])
-        for m in re.finditer(r"(?<!\d)(2\.5|5|10|20|25|50)\s*mm\s*/\s*(m[vV]|s(?:ec)?)",window,re.I):
-            value=float(m.group(1)); unit=m.group(2).lower()
-            literal.append({"value":value,"unit":"mm/mV" if unit.startswith("m") else "mm/s",
-                            "evidence":m.group(0),"x":r["cx"],"y":r["cy"],"confidence":r["conf"]})
-    # Deduplicate evidence text/value roughly.
-    seen=set(); unique=[]
-    for x in literal:
-        k=(x["value"],x["unit"],round(x["x"]/80),round(x["y"]/60))
-        if k not in seen: seen.add(k); unique.append(x)
+    unique=_ocr_recording_text(rows)
     return {"label_anchors":anchors,"label_confidence":anchor_conf,"recording_text":unique,
-            "ocr_available":bool(rows)}
+            "image_width":image.width,"image_height":image.height,"ocr_available":bool(rows)}
 
 
 def recording_hints_from_user_and_ocr(known, ocr):
@@ -194,11 +210,25 @@ def recording_hints_from_user_and_ocr(known, ocr):
         for lead in LEADS[6:]: gains[lead]=float(known["chest_mm_mv"])
         sources["chest"]="user"
 
-    # OCR gain is intentionally not assigned globally without spatial/label certainty.
-    # Keep literal evidence for AI and later review; engine pulse remains cross-check only.
+    # OCR-derived gain may fill only when literal image text is unambiguous.
+    if not gains:
+        ge=[x for x in ocr.get("recording_text",[]) if x["unit"]=="mm/mV" and x["value"] in (2.5,5,10,20)]
+        vals=sorted(set(x["value"] for x in ge))
+        if len(vals)==1:
+            for lead in LEADS: gains[lead]=vals[0]
+            sources["all"]="ocr_image_text"
+        elif ge and ocr.get("image_width"):
+            # Mixed gain: associate printed gain text with nearest lead-column anchors only when
+            # anchors are available; do not guess limb/chest from pulse morphology.
+            anchors=ocr.get("label_anchors",{}); width=float(ocr["image_width"])
+            for lead,(ax,ay) in anchors.items():
+                near=sorted(ge,key=lambda e:abs(e["x"]-ax)+0.35*abs(e["y"]-ay))
+                if near and abs(near[0]["x"]-ax)<0.28*width:
+                    gains[lead]=near[0]["value"]
+            if gains: sources["partial"]="ocr_image_text_spatial"
     if gains:
         hints["gain_by_lead"]=gains
-        hints["gain_source"]="user_confirmed_by_lead"
+        hints["gain_source"]="user_confirmed_by_lead" if any(v=="user" for v in sources.values()) else "ocr_image_text"
     return hints, sources
 
 
@@ -266,8 +296,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v10.1"
-PROMPT_VERSION = "ecg-digitizer-autocrop-v10.1"
+APP_VERSION = "v10.2"
+PROMPT_VERSION = "ecg-qc-autocrop-v10.2"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -335,6 +365,7 @@ SYSTEM_PROMPT += "\nBẢNG 12 CHUYỂN ĐẠO VÀ ĐỐI CHIẾU\n- lead_feature
 SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐOẠN TRÊN)\n- Mọi source=image_text là CHỮ CHUẨN GHI ĐỀ XUẤT do AI đọc, chưa được xác minh. evidence\n  phải chép đúng cụm chữ chứa giá trị và đơn vị (ví dụ '25 mm/s', '10 mm/mV'). Không dùng\n  chiều cao xung hoặc hình dạng sóng làm image_text. Không thấy chữ: giá trị null,\n  source=unknown, evidence=''. Không tự suy ra gain hỗn hợp hoặc gain giảm một nửa.\n- Chỉ quy đổi ms/bpm/mV khi có chuẩn tương ứng trong user_confirmed_calibration.\n  Chưa có chuẩn: value=null, nhưng có thể ghi số ô và mốc nhìn được. ST theo ô nhỏ\n  vẫn được mô tả nếu đường nền/J rõ; chưa rõ kích thước lưới thì để value=null.\n- Mỗi measurement có start_point/end_point/baseline_point: tọa độ x_pct,y_pct 0–100\n  tính trên ẢNH region_id ĐÃ GỬI (không phải ảnh toàn cảnh nếu đo ở crop).\n  Không đoán tọa độ khi mốc mờ: để null và nêu giới hạn.\n  RR/PR/QRS/QT: A=start_point là mốc bắt đầu, B=end_point là mốc kết thúc; B nằm sau A.\n  ST: A là điểm J, N=baseline_point nằm trên TP/PR dùng đối chiếu. Voltage: A/B hai mốc\n  biên độ, N đường nền. HR/QTc tính từ số đo liên quan, không phải tọa độ mới.\n- Chỉ đưa tối đa 8 số đo có ích, ưu tiên RR, PR, QRS và ST bất thường nếu thấy rõ.\n  Không trả 12 số ST chỉ để điền đủ bảng. lead_features.st_measurement_id tham chiếu\n  số đo ST cùng vùng/chuyển đạo; st_small_boxes sao chép từ chính số đo đó.\n  Chưa đo ST: st_measurement_id='', st_small_boxes=null, vẫn mô tả hướng ST nếu rõ.\n- summary_measurement_ids chỉ liệt kê ID số đo dùng trong diễn giải. Số định lượng phải\n  nằm trong measurements; không lặp số có đơn vị ms/bpm/mm/mV trong rhythm, conduction,\n  repolarization, impression/hypotheses. Diễn giải dùng mô tả định tính và ID tham chiếu.\n- conduction_assessment gồm av_status=normal/abnormal/uncertain,\n  qrs_status=narrow/wide/uncertain và pr_measurement_id/qrs_measurement_id.\n  Chưa có PR được quy đổi hợp lệ: av_status=uncertain, không kết luận PR bình thường.\n  Chưa có QRS được quy đổi hợp lệ: qrs_status=uncertain. Không suy ra block từ số ô\n  chưa biết tốc độ. Chẩn đoán dẫn truyền phải phù hợp tuổi và hình thái, không chỉ độ rộng.\n- Trước kết luận: đánh giá đầu QRS/Q bệnh lý, quan hệ biên độ/hình dạng T với QRS,\n  dẫn truyền AV, điện thế và biến đổi tái cực, các chuyển đạo đối diện/liên quan.\n  Dấu thiếu máu cơ tim có thể kín đáo; không bắt buộc đủ ngưỡng ST chênh lên mới cảnh báo.\n  Không gọi mọi V2 đẳng điện là bệnh lý; cần ngữ cảnh và đối chiếu các chuyển đạo.\n  Chỉ từ ECG hiện tại không được suy diễn diễn biến, kết quả chụp mạch hoặc chẩn đoán\n  của ECG về sau. Không gọi T 'khổng lồ' nếu không có số đo biên độ có căn cứ.\n- Các vùng ảnh có khoảng đệm và có thể chồng lặp/hiện một phần chuyển đạo bên cạnh.\n  Dùng nhãn thật để chọn sóng, không tính phần chồng lặp thành nhát mới.\n"
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
+SYSTEM_PROMPT += "\nV10.2: Nếu st_small_boxes khác 0 thì st_measurement_id bắt buộc phải trỏ tới một measurement st_mm có landmarks; nếu không đủ mốc, đặt st_small_boxes=null và detail_st=uncertain thay vì đoán số. Nếu tuổi/triệu chứng/bệnh sử/sinh hiệu chưa được cung cấp, không được kết luận urgency=non_urgent chỉ từ ECG; dùng indeterminate/needs_clinical_context theo giá trị schema phù hợp. Chuẩn ghi đọc trực tiếp từ chữ in trên ảnh có thể dùng source=image_text khi evidence chứa đúng số và đơn vị; không gọi đó là user-confirmed.\n"
 
 
 def object_schema(properties):
@@ -668,7 +699,7 @@ def arithmetic_checks(data, known, age_years=None):
         ref, boxes = f["st_measurement_id"], f["st_small_boxes"]
         if not ref:
             if boxes is not None and abs(float(boxes)) > 1e-9:
-                add("warning", f"{f['lead']}: số ST khác 0 chưa liên kết tới ID số đo và mốc ảnh.")
+                add("warning", f"{f['lead']}: ST khác 0 bắt buộc có measurement ID và landmarks.", category="arithmetic")
             continue
         m = by_id.get(ref)
         if not m or m["parameter"] != "st_mm" or m["lead"] != f["lead"] or m["region_id"] != f["detail_region_id"]:
@@ -750,6 +781,10 @@ def arithmetic_checks(data, known, age_years=None):
         add("info", "Chưa có phép tính đủ dữ kiện hoặc khớp để đối chiếu; không được hiểu là số đo đã đúng.")
     arithmetic = [c for c in checks if c.get("category") == "arithmetic"]
     arithmetic_status = "Có mâu thuẫn số học" if any(c["status"]=="warning" for c in arithmetic) else "Khớp trong dung sai làm tròn" if arithmetic else "Chưa đủ dữ kiện kiểm tra"
+    # Urgency is checked again in the UI against the actual case context.
+    if data.get("urgency") == "non_urgent" and age_years is None:
+        add("warning", "Không nên coi non_urgent là đã xác minh khi dữ kiện lâm sàng chưa đầy đủ; cần đối chiếu triệu chứng/sinh hiệu.", category="clinical_context")
+
     blocking = any(c["status"]=="warning" and
                    (c.get("category")=="arithmetic" or bool(c.get("measurement_ids")))
                    for c in checks)
@@ -1190,21 +1225,77 @@ def render_result(result):
         st.download_button("Tải gói đối chiếu ZIP", audit_zip(result), "ecg_review_v9.zip", "application/zip", key="audit_download_v9")
 
 
-def auto_ecg_crop_percent(image):
+def _pct_box_to_pixels(size, xp, yp):
+    w,h=size
+    return (max(0,min(w-1,round(w*xp[0]/100))),max(0,min(h-1,round(h*yp[0]/100))),
+            max(1,min(w,round(w*xp[1]/100))),max(1,min(h,round(h*yp[1]/100))))
+
+def _candidate_score(result, crop_area_fraction):
+    q=result.get("overall_qc",{}); cal=result.get("calibration",{})
+    p=int(q.get("lead_pass",0)); r=int(q.get("lead_review",0)); f=int(q.get("lead_fail",12))
+    grid=cal.get("status")
+    # FAIL dominates; PASS is the primary target. Compactness is only a tie-breaker.
+    score=12*p-11*f-2*r+(8 if grid=="PASS" else 2 if grid=="REVIEW" else -5)
+    score+=float(cal.get("confidence") or 0)*2
+    score-=max(0.,crop_area_fraction-.55)*2
+    return float(score)
+
+def qc_guided_auto_crop(image, max_candidates=18):
+    """Search around the grid bbox and choose the crop that maximizes Digitizer QC.
+    No OCR is run inside this search.
+    """
     if not DIGITIZER_AVAILABLE or digitizer_detect_grid_bbox is None:
         return (0,100),(0,100),None
     try:
-        paper=digitizer_detect_paper_bbox(image)
-        grid,conf=digitizer_detect_grid_bbox(image,paper)
-        w,h=image.size; x0,y0,x1,y1=grid
-        gw=max(1,x1-x0); gh=max(1,y1-y0)
-        x0=max(0,x0-int(.035*gw)); x1=min(w,x1+int(.035*gw))
-        y0=max(0,y0-int(.10*gh)); y1=min(h,y1+int(.08*gh))
-        xp=(round(100*x0/w),round(100*x1/w)); yp=(round(100*y0/h),round(100*y1/h))
-        if xp[1]-xp[0]<45 or yp[1]-yp[0]<35: return (0,100),(0,100),None
-        return xp,yp,{"grid_confidence":float(conf)}
+        paper=digitizer_detect_paper_bbox(image); grid,gconf=digitizer_detect_grid_bbox(image,paper)
+        w,h=image.size; gx0,gy0,gx1,gy1=grid
+        base=(100*gx0/w,100*gx1/w,100*gy0/h,100*gy1/h)
+        # Candidate margins around the detected grid. These include the manual benchmark pattern
+        # (tighter top/bottom than v10.1) without overfitting to one image.
+        margins=[
+            (1,1,2,2),(2,2,4,3),(3,3,6,4),(4,2,8,4),(2,4,8,4),
+            (4,4,10,5),(6,3,10,5),(3,6,10,5),(5,5,12,6),
+            (7,4,12,6),(4,7,12,6),(6,6,14,7),
+            (8,5,14,7),(5,8,14,7),(8,8,16,8),
+            (10,6,16,8),(6,10,16,8),(10,10,18,9)
+        ][:max_candidates]
+        candidates=[]; seen=set()
+        for ml,mr,mt,mb in margins:
+            xp=(max(0.,base[0]-ml),min(100.,base[1]+mr))
+            yp=(max(0.,base[2]-mt),min(100.,base[3]+mb))
+            key=tuple(round(v,1) for v in (*xp,*yp))
+            if key in seen: continue
+            seen.add(key)
+            box=_pct_box_to_pixels(image.size,xp,yp)
+            if box[2]<=box[0] or box[3]<=box[1]: continue
+            crop=image.crop(box)
+            # Keep search bounded on phone/server CPU.
+            probe=crop.copy(); probe.thumbnail((1800,1000),Image.Resampling.LANCZOS)
+            try:
+                res=digitize_ecg(probe,include_rhythm=True,deskew=False)
+                area=((box[2]-box[0])*(box[3]-box[1]))/(w*h)
+                score=_candidate_score(res,area)
+                q=res.get("overall_qc",{}); cal=res.get("calibration",{})
+                candidates.append({"score":score,"x":xp,"y":yp,"box":box,
+                    "pass":int(q.get("lead_pass",0)),"review":int(q.get("lead_review",0)),
+                    "fail":int(q.get("lead_fail",12)),"grid":cal.get("status"),
+                    "grid_confidence":float(cal.get("confidence") or 0)})
+            except Exception:
+                continue
+        if not candidates:
+            return (0,100),(0,100),None
+        candidates.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
+        best=candidates[0]
+        # Confidence describes crop search quality, not grid detection confidence.
+        good=(best["pass"]>=10 and best["fail"]<=1)
+        meta={"method":"qc_guided_search","candidate_count":len(candidates),
+              "score":best["score"],"pass":best["pass"],"review":best["review"],"fail":best["fail"],
+              "grid":best["grid"],"acceptable":good,
+              "runner_up_score":candidates[1]["score"] if len(candidates)>1 else None}
+        return tuple(round(v) for v in best["x"]),tuple(round(v) for v in best["y"]),meta
     except Exception:
         return (0,100),(0,100),None
+
 
 def digitizer_group_proposals(result, image_size, padding_pct=1.5):
     if not result: return None,None
@@ -1225,8 +1316,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · auto-crop + AI vision + Digitizer v1.3 fail-safe")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v10.1 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · QC-guided auto-crop + AI vision + Digitizer")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v10.2 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1306,12 +1397,14 @@ else:
         manual = st.selectbox("Xoay thêm ngược chiều kim đồng hồ", [0,90,180,270], key="image_rot_"+image_id)
         oriented = rotate_quarter_turn(original, (auto_angle+manual)%360)
         st.image(oriented, caption="Toàn cảnh sau chỉnh chiều", width="stretch")
-        auto_crop_x,auto_crop_y,auto_crop_meta=auto_ecg_crop_percent(oriented)
+        auto_crop_x,auto_crop_y,auto_crop_meta=qc_guided_auto_crop(oriented)
         crop_whole = st.checkbox("Tự cắt tương đối vùng ECG", value=auto_crop_meta is not None, key="image_crop_"+image_id)
         whole_x, whole_y = ((auto_crop_x,auto_crop_y) if crop_whole else ((0,100),(0,100)))
         if crop_whole:
             if auto_crop_meta:
-                st.caption(f"Đã gợi ý vùng ECG từ lưới (confidence {auto_crop_meta['grid_confidence']:.2f}). Chỉ chỉnh nếu preview cắt mất sóng/nhãn chuẩn.")
+                st.caption(f"Auto-crop QC: thử {auto_crop_meta['candidate_count']} vùng · best PASS {auto_crop_meta['pass']} / REVIEW {auto_crop_meta['review']} / FAIL {auto_crop_meta['fail']} · grid {auto_crop_meta['grid']}.")
+                if not auto_crop_meta["acceptable"]:
+                    st.warning("Auto-crop chưa đạt ngưỡng tin cậy (mục tiêu ≥10 PASS và ≤1 FAIL). Hãy kiểm tra preview; slider là fallback.")
             whole_x = st.slider("Toàn bộ ECG: trái — phải (%)", 0,100,whole_x, key="image_x_"+image_id)
             whole_y = st.slider("Toàn bộ ECG: trên — dưới (%)", 0,100,whole_y, key="image_y_"+image_id)
         enhance = st.checkbox("Tăng tương phản ảnh", value=False, key="image_enhance_"+image_id)
