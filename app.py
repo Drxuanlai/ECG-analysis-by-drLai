@@ -434,6 +434,146 @@ def template_qrs_overlay(ecg,item,lm):
         if x0 is not None:
             xx=max(0,min(crop.width-1,int(x0*sx)));arr[:,max(0,xx-1):min(crop.width,xx+2)]=0
     return Image.fromarray(arr)
+# ----------------- LOCAL GRID + J/ST ENGINE v11.2a -----------------
+def _autocorr_period_1d(v,minlag=3,maxlag=80):
+    v=np.asarray(v,dtype=float); v=v-np.nanmean(v)
+    if len(v)<maxlag*2 or np.nanstd(v)<1e-6:return None,None
+    ac=[]
+    for lag in range(minlag,min(maxlag,len(v)//2)+1):
+        a=v[:-lag]; b=v[lag:]
+        den=np.std(a)*np.std(b)
+        ac.append((lag,float(np.mean(a*b)/den) if den>1e-9 else 0.))
+    if not ac:return None,None
+    # prefer first strong local peak; grid 1-mm should be the shortest stable period.
+    vals=dict(ac); peaks=[]
+    for lag,val in ac[1:-1]:
+        if val>=vals.get(lag-1,-9) and val>=vals.get(lag+1,-9):peaks.append((lag,val))
+    strong=[p for p in peaks if p[1]>=.18]
+    best=min(strong,key=lambda z:z[0]) if strong else max(ac,key=lambda z:z[1])
+    return best
+
+def _profile_line_positions(profile):
+    """Find repeated grid-line peaks in a 1-D grid emphasis profile."""
+    v=np.asarray(profile,dtype=float)
+    if len(v)<20:return []
+    # remove slow illumination/background trend
+    k=max(7,int(len(v)*.035)); k+=(k%2==0)
+    trend=np.convolve(v,np.ones(k)/k,mode="same")
+    z=v-trend
+    thr=float(np.percentile(z,78))
+    cand=[]
+    for i in range(2,len(z)-2):
+        if z[i]>=thr and z[i]>=z[i-1] and z[i]>=z[i+1]:
+            if not cand or i-cand[-1]>=2:cand.append(i)
+            elif z[i]>z[cand[-1]]:cand[-1]=i
+    return cand
+
+def _fundamental_spacing(positions):
+    if len(positions)<5:return None,None
+    d=np.diff(positions).astype(float)
+    d=d[(d>=3)&(d<=40)]
+    if len(d)<4:return None,None
+    # Small grid is the lower repeated spacing; thick 5-mm lines may create missing small lines,
+    # so normalize larger gaps by integer multiples of candidate fundamentals.
+    candidates=np.arange(3,16,dtype=float)
+    best=None
+    for c in candidates:
+        residual=np.minimum.reduce([np.abs(d-k*c) for k in range(1,6)])
+        support=float(np.mean(residual<=max(1.0,.18*c)))
+        err=float(np.median(residual))
+        score=support-.04*err
+        if best is None or score>best[0]:best=(score,c,support,err)
+    if best is None:return None,None
+    _,c,support,err=best
+    return float(c),float(support)
+
+def detect_local_small_grid(item,ecg_image):
+    """Conservative local 1-mm grid detector. PASS requires axis agreement."""
+    box=item.get("box")
+    if not box:return {"status":"UNRESOLVED","reason":"no_box"}
+    crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("RGB"))
+    if crop.size==0:return {"status":"UNRESOLVED","reason":"empty_crop"}
+    f=crop.astype(float); red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2]); gray=f.mean(axis=2)
+    vx=np.mean(red,axis=0)+.25*(255-np.mean(gray,axis=0))
+    hy=np.mean(red,axis=1)+.25*(255-np.mean(gray,axis=1))
+    xs=_profile_line_positions(vx); ys=_profile_line_positions(hy)
+    px,cx=_fundamental_spacing(xs); py,cy=_fundamental_spacing(ys)
+    if px is None or py is None:
+        return {"status":"UNRESOLVED","reason":"both_axes_required","x_period_px":px,"y_period_px":py}
+    agree=abs(px-py)/max(px,py)<=.22
+    period=float(np.median([px,py])); conf=float(np.mean([cx,cy]))
+    # Guard against choosing 5-mm heavy-line spacing as 1-mm spacing: a lead ROI should
+    # contain many small boxes horizontally. This is image geometry, not a physiologic rule.
+    roi_w=crop.shape[1]; enough_boxes=(roi_w/period)>=18
+    status="PASS" if agree and conf>=.68 and enough_boxes else "REVIEW" if agree and conf>=.55 and enough_boxes else "UNRESOLVED"
+    return {"status":status,"small_grid_px":round(period,2) if status!="UNRESOLVED" else None,
+            "x_period_px":round(px,2),"y_period_px":round(py,2),
+            "x_support":round(cx,3),"y_support":round(cy,3),"confidence":round(conf,3),
+            "axis_agreement":bool(agree),"estimated_horizontal_boxes":round(roi_w/period,1)}
+
+
+def measure_j_st_lead(item,lm,clqc,grid,recording_speed=None):
+    """Measure baseline/J/ST from cleaned centerline. No diagnostic ST label is produced."""
+    if not lm or lm.get("status")=="UNRESOLVED":return {"status":"UNRESOLVED","reason":"no_qrs_landmark"}
+    if not clqc or clqc.get("status")=="FAIL":return {"status":"UNRESOLVED","reason":"centerline_fail"}
+    if not grid or grid.get("status")!="PASS" or not grid.get("small_grid_px"):
+        return {"status":"UNRESOLVED","reason":"local_grid_not_pass","local_grid":grid}
+    sig=item.get("signal_px"); cleaned,_=clean_centerline_signal(sig)
+    y=_tb_interp(cleaned)
+    if y is None:return {"status":"UNRESOLVED","reason":"no_centerline"}
+    rep=lm.get("representative") or {}; o=rep.get("onset_x"); j=rep.get("offset_x")
+    if o is None or j is None:return {"status":"UNRESOLVED","reason":"no_OJ"}
+    pxbox=float(grid["small_grid_px"])
+    # baseline: PR-like segment before QRS onset, avoiding immediate QRS foot.
+    b1=max(0,int(round(o-4.5*pxbox))); b2=max(0,int(round(o-.7*pxbox)))
+    if b2-b1<max(4,int(.8*pxbox)):return {"status":"UNRESOLVED","reason":"baseline_window_short"}
+    base_seg=y[b1:b2]; base_seg=base_seg[np.isfinite(base_seg)]
+    if len(base_seg)<4:return {"status":"UNRESOLVED","reason":"baseline_support"}
+    baseline=float(np.median(base_seg)); noise=float(np.median(np.abs(base_seg-baseline)))
+    # image y down: positive ECG/ST elevation means baseline_y - signal_y > 0.
+    def dev_at(x):
+        x=int(round(x)); rad=max(1,int(round(.12*pxbox)))
+        a=max(0,x-rad); b=min(len(y),x+rad+1)
+        z=y[a:b]; z=z[np.isfinite(z)]
+        return None if len(z)==0 else (baseline-float(np.median(z)))/pxbox
+    st_j=dev_at(j)
+    # ST after J: retain small-box horizontal offsets; at 25 mm/s 1 and 2 boxes = 40/80 ms.
+    st_j1=dev_at(j+pxbox); st_j2=dev_at(j+2*pxbox)
+    if any(v is None for v in (st_j,st_j1,st_j2)):return {"status":"UNRESOLVED","reason":"st_support"}
+    # baseline stability in vertical small boxes
+    noise_boxes=noise/pxbox
+    status="PASS" if noise_boxes<=.18 and lm.get("status")=="PASS" else "REVIEW"
+    out={"status":status,"baseline_y_px":round(baseline,2),"baseline_noise_small_boxes":round(noise_boxes,3),
+         "j_x":int(j),"st_at_j_small_boxes":round(st_j,2),
+         "st_j_plus_1box_small_boxes":round(st_j1,2),"st_j_plus_2box_small_boxes":round(st_j2,2),
+         "local_grid":grid}
+    if recording_speed in (25,50):
+        box_ms=1000.0/(recording_speed*5.0)
+        out["horizontal_box_ms"]=round(box_ms,1)
+        out["j_plus_1box_ms"]=round(box_ms,1); out["j_plus_2box_ms"]=round(2*box_ms,1)
+    return out
+
+def build_j_st_evidence(result,ecg_image,qrs_ev,centerline_ev,recording_speed=None):
+    out={"engine":"local-grid-j-st-v11.2a","status":"UNRESOLVED","leads":{},
+         "rules":["No ST elevation/depression diagnostic label is produced.",
+                  "ST values are vertical small-box deviations from a local pre-QRS baseline.",
+                  "Positive value means upward ECG deflection relative to baseline.",
+                  "UNRESOLVED/REVIEW must not be promoted to verified ST abnormality by AI."]}
+    if not result:return out
+    for lead,item in result.get("leads",{}).items():
+        if lead=="II-rhythm":continue
+        grid=detect_local_small_grid(item,ecg_image)
+        lm=(qrs_ev or {}).get("leads",{}).get(lead,{})
+        cl=(centerline_ev or {}).get("leads",{}).get(lead,{})
+        ev=measure_j_st_lead(item,lm,cl,grid,recording_speed)
+        ev["grid_qc"]=grid
+        out["leads"][lead]=ev
+    n=sum(v.get("status")=="PASS" for v in out["leads"].values())
+    r=sum(v.get("status")=="REVIEW" for v in out["leads"].values())
+    out["pass_leads"]=n;out["review_leads"]=r
+    out["status"]="PASS" if n>=8 else "REVIEW" if n+r>=6 else "UNRESOLVED"
+    return out
+
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
     img = np.array(pil_img)
@@ -472,8 +612,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.1c"
-PROMPT_VERSION = "ecg-centerline-qc-v11.1c"
+APP_VERSION = "v11.2a"
+PROMPT_VERSION = "ecg-jpoint-st-v11.2a"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -541,6 +681,7 @@ SYSTEM_PROMPT += "\nBẢNG 12 CHUYỂN ĐẠO VÀ ĐỐI CHIẾU\n- lead_feature
 SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐOẠN TRÊN)\n- Mọi source=image_text là CHỮ CHUẨN GHI ĐỀ XUẤT do AI đọc, chưa được xác minh. evidence\n  phải chép đúng cụm chữ chứa giá trị và đơn vị (ví dụ '25 mm/s', '10 mm/mV'). Không dùng\n  chiều cao xung hoặc hình dạng sóng làm image_text. Không thấy chữ: giá trị null,\n  source=unknown, evidence=''. Không tự suy ra gain hỗn hợp hoặc gain giảm một nửa.\n- Chỉ quy đổi ms/bpm/mV khi có chuẩn tương ứng trong user_confirmed_calibration.\n  Chưa có chuẩn: value=null, nhưng có thể ghi số ô và mốc nhìn được. ST theo ô nhỏ\n  vẫn được mô tả nếu đường nền/J rõ; chưa rõ kích thước lưới thì để value=null.\n- Mỗi measurement có start_point/end_point/baseline_point: tọa độ x_pct,y_pct 0–100\n  tính trên ẢNH region_id ĐÃ GỬI (không phải ảnh toàn cảnh nếu đo ở crop).\n  Không đoán tọa độ khi mốc mờ: để null và nêu giới hạn.\n  RR/PR/QRS/QT: A=start_point là mốc bắt đầu, B=end_point là mốc kết thúc; B nằm sau A.\n  ST: A là điểm J, N=baseline_point nằm trên TP/PR dùng đối chiếu. Voltage: A/B hai mốc\n  biên độ, N đường nền. HR/QTc tính từ số đo liên quan, không phải tọa độ mới.\n- Chỉ đưa tối đa 8 số đo có ích, ưu tiên RR, PR, QRS và ST bất thường nếu thấy rõ.\n  Không trả 12 số ST chỉ để điền đủ bảng. lead_features.st_measurement_id tham chiếu\n  số đo ST cùng vùng/chuyển đạo; st_small_boxes sao chép từ chính số đo đó.\n  Chưa đo ST: st_measurement_id='', st_small_boxes=null, vẫn mô tả hướng ST nếu rõ.\n- summary_measurement_ids chỉ liệt kê ID số đo dùng trong diễn giải. Số định lượng phải\n  nằm trong measurements; không lặp số có đơn vị ms/bpm/mm/mV trong rhythm, conduction,\n  repolarization, impression/hypotheses. Diễn giải dùng mô tả định tính và ID tham chiếu.\n- conduction_assessment gồm av_status=normal/abnormal/uncertain,\n  qrs_status=narrow/wide/uncertain và pr_measurement_id/qrs_measurement_id.\n  Chưa có PR được quy đổi hợp lệ: av_status=uncertain, không kết luận PR bình thường.\n  Chưa có QRS được quy đổi hợp lệ: qrs_status=uncertain. Không suy ra block từ số ô\n  chưa biết tốc độ. Chẩn đoán dẫn truyền phải phù hợp tuổi và hình thái, không chỉ độ rộng.\n- Trước kết luận: đánh giá đầu QRS/Q bệnh lý, quan hệ biên độ/hình dạng T với QRS,\n  dẫn truyền AV, điện thế và biến đổi tái cực, các chuyển đạo đối diện/liên quan.\n  Dấu thiếu máu cơ tim có thể kín đáo; không bắt buộc đủ ngưỡng ST chênh lên mới cảnh báo.\n  Không gọi mọi V2 đẳng điện là bệnh lý; cần ngữ cảnh và đối chiếu các chuyển đạo.\n  Chỉ từ ECG hiện tại không được suy diễn diễn biến, kết quả chụp mạch hoặc chẩn đoán\n  của ECG về sau. Không gọi T 'khổng lồ' nếu không có số đo biên độ có căn cứ.\n- Các vùng ảnh có khoảng đệm và có thể chồng lặp/hiện một phần chuyển đạo bên cạnh.\n  Dùng nhãn thật để chọn sóng, không tính phần chồng lặp thành nhát mới.\n"
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
+SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2a: j_st_engine là bằng chứng đo candidate. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.1c: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
 SYSTEM_PROMPT += "\nV10.2: Nếu st_small_boxes khác 0 thì st_measurement_id bắt buộc phải trỏ tới một measurement st_mm có landmarks; nếu không đủ mốc, đặt st_small_boxes=null và detail_st=uncertain thay vì đoán số. Nếu tuổi/triệu chứng/bệnh sử/sinh hiệu chưa được cung cấp, không được kết luận urgency=non_urgent chỉ từ ECG; dùng indeterminate/needs_clinical_context theo giá trị schema phù hợp. Chuẩn ghi đọc trực tiếp từ chữ in trên ảnh có thể dùng source=image_text khi evidence chứa đúng số và đơn vị; không gọi đó là user-confirmed.\n"
 
@@ -1673,8 +1814,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · centerline cleanup/QC + median-beat QRS")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.1c thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · local grid + J-point/ST measurement")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.2a thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1773,7 +1914,7 @@ else:
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
-    digitizer_result=None; digitizer_evidence=None; qrs_template_evidence=None; centerline_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
+    digitizer_result=None; digitizer_evidence=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
         if not DIGITIZER_AVAILABLE:
             st.warning("Chưa nạp được ecg_digitizer.py ("+DIGITIZER_IMPORT_ERROR+"). AI vẫn có thể đọc ảnh gốc; hãy kiểm tra file engine trên GitHub.")
@@ -1789,6 +1930,9 @@ else:
                     qrs_template_evidence=build_template_qrs_evidence(digitizer_result)
                     digitizer_evidence["centerline_qc"]=centerline_evidence
                     digitizer_evidence["qrs_template_landmarks"]=qrs_template_evidence
+                    _speed_for_st = speed if speed in (25,50) else None
+                    j_st_evidence=build_j_st_evidence(digitizer_result,ecg,qrs_template_evidence,centerline_evidence,_speed_for_st)
+                    digitizer_evidence["j_st_engine"]=j_st_evidence
                 dq=digitizer_result.get("overall_qc",{})
                 st.write(f"QC Digitizer: **{dq.get('status','?')}** · PASS {dq.get('lead_pass',0)} · REVIEW {dq.get('lead_review',0)} · FAIL {dq.get('lead_fail',0)}")
                 cal=digitizer_result.get("calibration",{})
@@ -1815,6 +1959,22 @@ else:
                             _lm=qrs_template_evidence.get("leads",{}).get(_lead,{})
                             _ov=template_qrs_overlay(ecg,digitizer_result.get("leads",{}).get(_lead,{}),_lm)
                             if _ov is not None: st.image(_ov,caption=f"{_lead} · {_lm.get('status')} · QRS {_lm.get('qrs_width_px')} px · ô nhỏ chưa xác minh",width="stretch")
+                    if j_st_evidence:
+                        st.markdown("**v11.2a — Local grid + J/ST measurement candidates**")
+                        _strows=[]
+                        for _lead in LEADS:
+                            _e=j_st_evidence.get("leads",{}).get(_lead,{})
+                            _g=_e.get("grid_qc",{})
+                            _strows.append({"Lead":_lead,"Grid":_g.get("status","UNRESOLVED"),
+                                            "1 mm px":_g.get("small_grid_px"),"Grid conf":_g.get("confidence"),
+                                            "ST QC":_e.get("status","UNRESOLVED"),
+                                            "ST@J (ô)":_e.get("st_at_j_small_boxes"),
+                                            "ST J+1 ô":_e.get("st_j_plus_1box_small_boxes"),
+                                            "ST J+2 ô":_e.get("st_j_plus_2box_small_boxes"),
+                                            "baseline noise":_e.get("baseline_noise_small_boxes"),
+                                            "reason":_e.get("reason","") or ""})
+                        st.dataframe(_strows,use_container_width=True,hide_index=True)
+                        st.caption("Đây là phép đo candidate, chưa phải chẩn đoán ST chênh. Grid/J/baseline không PASS thì không dùng định lượng.")
             except Exception as exc:
                 digitizer_result=None; digitizer_evidence=None
                 st.warning("Digitizer không hoàn tất ("+type(exc).__name__+"). Không chặn phân tích ảnh gốc.")
