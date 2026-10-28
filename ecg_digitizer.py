@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-VERSION = "ECG Digitizer Engine 1.1-final-calibration"
+VERSION = "ECG Digitizer Engine 1.2-cross-axis-calibration"
 STANDARD_12_LAYOUT = [
     ["I", "aVR", "V1", "V4"],
     ["II", "aVL", "V2", "V5"],
@@ -283,10 +283,23 @@ def _fundamental_from_peaks(peaks):
         score,lag=max(peaks); return lag,score,[(lag,1,score)]
     return float(best[1]),float(min(1,best[0]/2)),best[2]
 
+def _direct_cross_axis_period(px, py):
+    """Prefer a strong observed period shared by X and Y before harmonic division."""
+    matches=[]
+    for lx,sx in px:
+        for ly,sy in py:
+            ratio=max(lx,ly)/max(1e-6,min(lx,ly))
+            if ratio<=1.12:
+                strength=min(float(sx),float(sy))
+                period=(float(lx)+float(ly))/2.0
+                score=2.5*strength + 1.2*(1-(ratio-1)/.12)
+                matches.append((score,period,float(lx),float(ly),strength,ratio))
+    if not matches:return None
+    strong=[m for m in matches if m[4]>=.18]
+    return max(strong or matches,key=lambda z:z[0])
+
 def estimate_grid_calibration(image: Image.Image, grid_box):
-    """Robust 1-mm grid estimate using X/Y harmonic families.
-    Bold 5-mm lines are allowed to dominate one axis. No speed/gain is inferred here.
-    """
+    """Robust 1-mm grid estimate with X/Y consensus before harmonic assignment."""
     rgb=np.asarray(image.convert("RGB")); x0,y0,x1,y1=grid_box
     roi=rgb[y0:y1,x0:x1]
     r=roi[:,:,0].astype(float); g=roi[:,:,1].astype(float); b=roi[:,:,2].astype(float)
@@ -295,26 +308,43 @@ def estimate_grid_calibration(image: Image.Image, grid_box):
     maxx=min(160,max(10,len(xp)//10)); maxy=min(160,max(10,len(yp)//6))
     px=_autocorr_peaks(xp,3,maxx); py=_autocorr_peaks(yp,3,maxy)
     fx,cx,mx=_fundamental_from_peaks(px); fy,cy,my=_fundamental_from_peaks(py)
-    status="FAIL"; pxmm=None; conf=0.; ratio=None
-    if fx and fy:
-        ratio=max(fx,fy)/max(1e-6,min(fx,fy))
-        # If one axis locked onto a harmonic, explicitly test /5 and *5 reconciliation.
-        pairs=[(fx,fy)]
-        for ax in (1,5):
-            for ay in (1,5): pairs.append((fx/ax,fy/ay))
-        a,b=min(pairs,key=lambda z:abs(np.log(max(z)/max(1e-6,min(z)))))
-        rr=max(a,b)/max(1e-6,min(a,b))
-        conf=float(min(cx,cy))
-        if rr<=1.28 and 3<=np.mean([a,b])<=80:
-            pxmm=float(np.mean([a,b])); ratio=rr
-            status="PASS" if rr<=1.15 and conf>=.22 else "REVIEW"
-        else: status="REVIEW"
-    return {"status":status,"small_grid_px_x":fx,"small_grid_px_y":fy,
+
+    status="FAIL"; pxmm=None; conf=0.; ratio=None; method=None
+    observed_x=fx; observed_y=fy
+    direct=_direct_cross_axis_period(px,py)
+    if direct is not None:
+        _,period,dx,dy,dconf,dratio=direct
+        if 3<=period<=80:
+            pxmm=period; observed_x=dx; observed_y=dy
+            ratio=dratio; conf=dconf; method="direct_cross_axis"
+            status="PASS" if dratio<=1.08 and dconf>=.20 else "REVIEW"
+
+    # Only if no credible shared observed period exists, fall back to harmonic families.
+    if pxmm is None and fx and fy:
+        pairs=[]
+        for ax in (1,2,3,4,5,6):
+            for ay in (1,2,3,4,5,6):
+                aa=fx/ax; bb=fy/ay
+                if aa<3 or bb<3: continue
+                rr=max(aa,bb)/max(1e-6,min(aa,bb))
+                complexity=(ax-1)+(ay-1)
+                score=rr + .025*complexity
+                pairs.append((score,rr,aa,bb,ax,ay))
+        if pairs:
+            _,rr,aa,bb,ax,ay=min(pairs,key=lambda z:z[0])
+            conf=float(min(cx,cy))
+            if rr<=1.18 and 3<=np.mean([aa,bb])<=80:
+                pxmm=float(np.mean([aa,bb])); ratio=rr; method="harmonic_cross_axis"
+                status="PASS" if rr<=1.10 and conf>=.22 else "REVIEW"
+            else:
+                status="REVIEW"
+
+    return {"status":status,"small_grid_px_x":observed_x,"small_grid_px_y":observed_y,
             "px_per_mm":pxmm,"axis_ratio":ratio,"confidence":conf,
-            "x_harmonics":mx,"y_harmonics":my,
+            "consensus_method":method,"x_harmonics":mx,"y_harmonics":my,
             "speed_mm_s":None,"gain_mm_mV":None,"gain_by_lead":{},
             "time_ms_per_px":None,"mV_per_px_by_lead":{},
-            "note":"1-mm grid geometry only; speed/gain require OCR, calibration pulse, or user confirmation."}
+            "note":"1-mm grid geometry with X/Y consensus; speed/gain require OCR, calibration pulse, or user confirmation."}
 
 def _normalize_recording_hints(recording_hints=None, speed_mm_s=None, gain_mm_mV=None):
     h=dict(recording_hints or {})
