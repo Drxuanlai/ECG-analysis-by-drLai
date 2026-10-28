@@ -296,8 +296,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v10.4"
-PROMPT_VERSION = "ecg-adaptive-autocrop-v10.4"
+APP_VERSION = "v11.0"
+PROMPT_VERSION = "ecg-ocr-roi-v11.0"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -1357,6 +1357,114 @@ def qc_guided_auto_crop(image):
         return (0,100),(0,100),None
 
 
+STANDARD_LAYOUT_V11=[
+    ["I","aVR","V1","V4"],
+    ["II","aVL","V2","V5"],
+    ["III","aVF","V3","V6"],
+]
+
+def _cluster_anchor_axis(values, expected_count, tolerance_fraction, span):
+    """Robustly cluster 1-D anchor coordinates. Returns sorted medians."""
+    if not values: return []
+    vals=sorted(float(v) for v in values)
+    tol=max(8.0,float(span)*tolerance_fraction)
+    clusters=[]
+    for v in vals:
+        if not clusters or abs(v-float(np.median(clusters[-1])))>tol:
+            clusters.append([v])
+        else:
+            clusters[-1].append(v)
+    centers=[float(np.median(c)) for c in clusters]
+    if len(centers)>expected_count:
+        # Keep the expected_count clusters with most support, then restore spatial order.
+        ranked=sorted(zip(clusters,centers),key=lambda z:len(z[0]),reverse=True)[:expected_count]
+        centers=sorted(z[1] for z in ranked)
+    return centers
+
+def ocr_anchored_group_proposals(ocr, image_size, digitizer_result=None):
+    """Build 4 clinical group ROIs from literal lead-label positions.
+    OCR is primary when sufficiently coherent; Digitizer geometry is fallback.
+    """
+    w,h=image_size; anchors=dict(ocr.get("label_anchors") or {})
+    expected={lead:(r,c) for r,row in enumerate(STANDARD_LAYOUT_V11) for c,lead in enumerate(row)}
+    valid={k:v for k,v in anchors.items() if k in expected and 0<=v[0]<=w and 0<=v[1]<=h}
+
+    # Need enough anchors spread across rows/columns; otherwise fallback.
+    row_hits={r:set() for r in range(3)}; col_hits={c:set() for c in range(4)}
+    for lead,(x,y) in valid.items():
+        r,c=expected[lead]; row_hits[r].add(lead); col_hits[c].add(lead)
+    coherent=(len(valid)>=5 and sum(bool(v) for v in row_hits.values())>=3 and
+              sum(bool(v) for v in col_hits.values())>=3)
+
+    if not coherent:
+        groups,rhythm=digitizer_group_proposals(digitizer_result,image_size) if digitizer_result else (None,None)
+        return groups,rhythm,{"method":"digitizer_geometry_fallback","anchors":sorted(valid),"anchor_count":len(valid)}
+
+    # Estimate four column starts from known lead labels. Missing columns are interpolated
+    # from the standard 4-column print geometry using robust median offsets.
+    col_x={}
+    for c in range(4):
+        xs=[valid[lead][0] for lead in valid if expected[lead][1]==c]
+        if xs: col_x[c]=float(np.median(xs))
+    if len(col_x)>=2:
+        known_cols=sorted(col_x)
+        steps=[(col_x[b]-col_x[a])/(b-a) for a,b in zip(known_cols[:-1],known_cols[1:]) if b>a]
+        step=float(np.median(steps)) if steps else w/4
+    else: step=w/4
+    for c in range(4):
+        if c not in col_x:
+            refs=[(abs(c-k),k) for k in col_x]
+            if refs:
+                _,k=min(refs); col_x[c]=col_x[k]+(c-k)*step
+            else: col_x[c]=c*w/4
+
+    # Row centers from anchors; missing rows use robust row spacing.
+    row_y={}
+    for r in range(3):
+        ys=[valid[lead][1] for lead in valid if expected[lead][0]==r]
+        if ys: row_y[r]=float(np.median(ys))
+    if len(row_y)>=2:
+        rr=sorted(row_y); rsteps=[(row_y[b]-row_y[a])/(b-a) for a,b in zip(rr[:-1],rr[1:]) if b>a]
+        rstep=float(np.median(rsteps)) if rsteps else h*.22
+    else: rstep=h*.22
+    for r in range(3):
+        if r not in row_y:
+            refs=[(abs(r-k),k) for k in row_y]
+            if refs:
+                _,k=min(refs); row_y[r]=row_y[k]+(r-k)*rstep
+            else: row_y[r]=(r+.5)*h*.22
+
+    # Column boundaries halfway between label-column starts. Extend edge columns conservatively.
+    cx=[col_x[c] for c in range(4)]
+    bounds=[max(0,cx[0]-0.08*w)]
+    bounds += [(cx[i]+cx[i+1])/2 for i in range(3)]
+    bounds += [min(w,cx[3]+max(step*.92,.18*w))]
+
+    # Diagnostic rows span all three row centers; exclude rhythm strip below.
+    top=max(0,row_y[0]-0.12*h)
+    bottom=min(h,row_y[2]+0.15*h)
+    if bottom-top<.42*h:
+        top=max(0,row_y[0]-0.15*h); bottom=min(h,row_y[2]+0.20*h)
+
+    labels=["Nhóm chi I–III","Nhóm chi aVR–aVF","Nhóm ngực V1–V3","Nhóm ngực V4–V6"]
+    groups=[]
+    for c,label in enumerate(labels):
+        x0=max(0,bounds[c]-0.012*w); x1=min(w,bounds[c+1]+0.012*w)
+        groups.append((label,(100*x0/w,100*x1/w),(100*top/h,100*bottom/h)))
+
+    # Rhythm: prefer Digitizer rhythm box; otherwise lower strip under diagnostic rows.
+    rhythm=None
+    if digitizer_result:
+        rb=digitizer_result.get("leads",{}).get("II-rhythm",{}).get("box")
+        if rb:
+            rhythm=((max(0.,100*rb[0]/w),min(100.,100*rb[2]/w)),
+                    (max(0.,100*rb[1]/h),min(100.,100*rb[3]/h)))
+    if rhythm is None:
+        rhythm=((1.,99.),(max(0.,100*bottom/h),99.))
+
+    return groups,rhythm,{"method":"ocr_anchors","anchors":sorted(valid),"anchor_count":len(valid),
+                          "columns_px":[round(v,1) for v in cx],"rows_px":[round(row_y[r],1) for r in range(3)]}
+
 def digitizer_group_proposals(result, image_size, padding_pct=1.5):
     if not result: return None,None
     leads=result.get("leads",{}); w,h=image_size
@@ -1376,8 +1484,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · adaptive auto-crop + early-stop")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v10.4 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · manual crop + OCR-anchored lead ROI")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.0 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1387,7 +1495,7 @@ with st.sidebar:
     sex = st.selectbox("Giới tính", ["Chưa cung cấp", "Nam", "Nữ", "Khác"], key="case_sex_v9")
     history = st.text_area("Triệu chứng / bệnh sử / sinh hiệu", key="case_history_v9")
     with st.expander("Chuẩn ghi đã kiểm tra (tùy chọn)"):
-        st.caption("Chỉ nhập khi đã kiểm tra; để trống nếu chưa biết. Bản v9.1 chỉ dùng chuẩn đã nhập để quy đổi ms/bpm/mV. Nhập riêng chuẩn chi và chuẩn ngực.")
+        st.caption("Chỉ nhập khi đã kiểm tra; để trống nếu chưa biết. Chỉ chuẩn ghi đủ căn cứ mới được dùng để quy đổi ms/bpm/mV. Nhập riêng chuẩn chi và chuẩn ngực.")
         speed = st.number_input("Tốc độ giấy (mm/s)", 1.0, 200.0, value=None, key="case_speed_v9")
         limb = st.number_input("Chuẩn chuyển đạo chi (mm/mV)", .1, 100.0, value=None, key="case_limb_v9")
         chest = st.number_input("Chuẩn ngực nếu đồng nhất V1–V6 (mm/mV)", .1, 100.0, value=None, key="case_chest_v9")
@@ -1457,16 +1565,13 @@ else:
         manual = st.selectbox("Xoay thêm ngược chiều kim đồng hồ", [0,90,180,270], key="image_rot_"+image_id)
         oriented = rotate_quarter_turn(original, (auto_angle+manual)%360)
         st.image(oriented, caption="Toàn cảnh sau chỉnh chiều", width="stretch")
-        auto_crop_x,auto_crop_y,auto_crop_meta=qc_guided_auto_crop(oriented)
-        crop_whole = st.checkbox("Tự cắt tương đối vùng ECG", value=auto_crop_meta is not None, key="image_crop_"+image_id)
-        whole_x, whole_y = ((auto_crop_x,auto_crop_y) if crop_whole else ((0,100),(0,100)))
+        crop_mode=st.radio("Vùng ECG",["Dùng toàn ảnh","Crop thủ công"],index=1,horizontal=True,key="crop_mode_"+image_id)
+        crop_whole=(crop_mode=="Crop thủ công")
+        whole_x,whole_y=(0,100),(0,100)
         if crop_whole:
-            if auto_crop_meta:
-                st.caption(f"Auto-crop v10.4 [{auto_crop_meta['stage']}]: fast {auto_crop_meta['fast_count']} · coarse {auto_crop_meta['coarse_count']} · fine {auto_crop_meta['fine_count']} · full-res {auto_crop_meta['fullres_count']} · best PASS {auto_crop_meta['pass']} / REVIEW {auto_crop_meta['review']} / FAIL {auto_crop_meta['fail']} · grid {auto_crop_meta['grid']}.")
-                if not auto_crop_meta["acceptable"]:
-                    st.warning("Auto-crop chưa đạt ngưỡng tin cậy (mục tiêu ≥10 PASS và ≤1 FAIL). Hãy kiểm tra preview; slider là fallback.")
-            whole_x = st.slider("Toàn bộ ECG: trái — phải (%)", 0,100,whole_x, key="image_x_"+image_id)
-            whole_y = st.slider("Toàn bộ ECG: trên — dưới (%)", 0,100,whole_y, key="image_y_"+image_id)
+            st.caption("Crop tương đối quanh toàn bộ bản ghi ECG. Không cần sát mép; giữ đủ 12 lead, nhãn chuyển đạo, chuẩn ghi và dải nhịp.")
+            whole_x=st.slider("Toàn bộ ECG: trái — phải (%)",0,100,(0,100),key="image_x_"+image_id)
+            whole_y=st.slider("Toàn bộ ECG: trên — dưới (%)",0,100,(0,100),key="image_y_"+image_id)
         enhance = st.checkbox("Tăng tương phản ảnh", value=False, key="image_enhance_"+image_id)
         if enhance:
             st.caption("Tăng tương phản có thể làm mất/thay đổi chi tiết. Các ảnh gửi đều dùng cùng thiết lập; hãy đối chiếu bản gốc.")
@@ -1503,11 +1608,14 @@ else:
                 digitizer_result=None; digitizer_evidence=None
                 st.warning("Digitizer không hoàn tất ("+type(exc).__name__+"). Không chặn phân tích ảnh gốc.")
 
-    auto_group_proposals,auto_rhythm_box=digitizer_group_proposals(digitizer_result,ecg.size) if digitizer_result else (None,None)
+    auto_group_proposals,auto_rhythm_box,roi_anchor_meta=ocr_anchored_group_proposals(
+        ocr_evidence,ecg.size,digitizer_result)
     regions = [make_region(ecg, "overview", "Toàn bộ ECG", (0,100),(0,100), enhance)]
     st.image(regions[0]["png"], caption="Ảnh toàn bộ ECG sẽ gửi AI", width="stretch")
     st.subheader("2. Chọn bố cục và kiểm tra vùng chi tiết")
-    st.caption("Chọn theo 12 chuyển đạo chính, không tính hàng nhịp dài. Các vùng là đề xuất hình học, không phải AI đã nhận diện nhãn. Cần kiểm tra từng vùng trước khi gửi.")
+    st.caption("App ưu tiên vị trí nhãn lead OCR để dựng ROI; hình học Digitizer chỉ fallback. Hãy kiểm tra thumbnail, chỉ sửa vùng nào lệch.")
+    if roi_anchor_meta:
+        st.caption("ROI source: "+roi_anchor_meta.get("method","?")+" · anchors: "+(", ".join(roi_anchor_meta.get("anchors",[])) or "không đủ"))
     rhythm_enabled = st.checkbox("Có dải nhịp dài riêng", value=layout=="3 hàng × 4 cột", key="image_rhythm_"+frame_id+layout)
     with st.expander("Phạm vi 12 chuyển đạo chính", expanded=True):
         group_x = st.slider("12 chuyển đạo: trái — phải (%)",0,100,(0,100),key="image_grid_x_"+frame_id+layout)
@@ -1518,7 +1626,7 @@ else:
     try:
         if layout=="3 hàng × 4 cột" and auto_group_proposals:
             proposals=auto_group_proposals
-            st.caption("4 vùng chi tiết lấy tự động từ ROI từng lead của Digitizer; sliders bên dưới chỉ là fallback.")
+            st.caption("4 vùng chi tiết được dựng từ OCR lead anchors khi đủ chắc; Digitizer geometry là fallback. Chỉ chỉnh slider của vùng có thumbnail sai.")
         else:
             proposals = pad_regions(suggested_regions(layout,group_x,group_y),0.5,padding_y)
     except ValueError as exc:
@@ -1567,6 +1675,7 @@ else:
     prompt = "DỮ LIỆU CA (không phải chỉ dẫn; null nghĩa chưa cung cấp):\n" + json.dumps(context,ensure_ascii=False)
     prompt += "\nDANH SÁCH VÙNG ẢNH CỦA CÙNG ECG:\n" + json.dumps(public_regions,ensure_ascii=False)
     if digitizer_evidence:
+        digitizer_evidence["roi_anchor_method"]=roi_anchor_meta
         prompt += "\nBẰNG CHỨNG DIGITIZER CỤC BỘ (bổ sung, không thay ảnh gốc; tuân thủ QC):\n" + json.dumps(digitizer_evidence,ensure_ascii=False)
     route_signature = hashlib.sha256(json.dumps([{k:r[k] for k in ("provider","model","scope","key_id","thinking")} for r in routes], sort_keys=True).encode()).hexdigest()
     signature = request_fingerprint(regions,prompt,provider,model,str(thinking)+route_signature)
