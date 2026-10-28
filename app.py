@@ -453,15 +453,11 @@ def _autocorr_period_1d(v,minlag=3,maxlag=80):
     return best
 
 def _profile_line_positions(profile):
-    """Find repeated grid-line peaks in a 1-D grid emphasis profile."""
     v=np.asarray(profile,dtype=float)
     if len(v)<20:return []
-    # remove slow illumination/background trend
     k=max(7,int(len(v)*.035)); k+=(k%2==0)
     trend=np.convolve(v,np.ones(k)/k,mode="same")
-    z=v-trend
-    thr=float(np.percentile(z,78))
-    cand=[]
+    z=v-trend; thr=float(np.percentile(z,78)); cand=[]
     for i in range(2,len(z)-2):
         if z[i]>=thr and z[i]>=z[i-1] and z[i]>=z[i+1]:
             if not cand or i-cand[-1]>=2:cand.append(i)
@@ -470,25 +466,65 @@ def _profile_line_positions(profile):
 
 def _fundamental_spacing(positions):
     if len(positions)<5:return None,None
-    d=np.diff(positions).astype(float)
-    d=d[(d>=3)&(d<=40)]
+    d=np.diff(positions).astype(float); d=d[(d>=3)&(d<=60)]
     if len(d)<4:return None,None
-    # Small grid is the lower repeated spacing; thick 5-mm lines may create missing small lines,
-    # so normalize larger gaps by integer multiples of candidate fundamentals.
-    candidates=np.arange(3,16,dtype=float)
     best=None
-    for c in candidates:
-        residual=np.minimum.reduce([np.abs(d-k*c) for k in range(1,6)])
+    for c in np.arange(3,18,dtype=float):
+        residual=np.minimum.reduce([np.abs(d-k*c) for k in range(1,7)])
         support=float(np.mean(residual<=max(1.0,.18*c)))
-        err=float(np.median(residual))
-        score=support-.04*err
+        err=float(np.median(residual)); score=support-.04*err
         if best is None or score>best[0]:best=(score,c,support,err)
     if best is None:return None,None
     _,c,support,err=best
     return float(c),float(support)
 
+def _major_grid_spacing(profile,small):
+    """Look for stronger periodic grid lines near 5x the small-grid candidate."""
+    if small is None:return None,None
+    v=np.asarray(profile,dtype=float)
+    lo=max(8,int(round(3.7*small))); hi=min(int(round(6.3*small)),max(9,len(v)//3))
+    if hi<=lo:return None,None
+    v=v-np.mean(v)
+    vals=[]
+    for lag in range(lo,hi+1):
+        a=v[:-lag];b=v[lag:];den=np.std(a)*np.std(b)
+        vals.append((lag,float(np.mean(a*b)/den) if den>1e-9 else 0.))
+    if not vals:return None,None
+    lag,conf=max(vals,key=lambda z:z[1])
+    return float(lag),float(conf)
+
+def _detect_calibration_pulse(item,ecg_image,small_px):
+    """Detect a rectangular 1-mV calibration pulse in the lead ROI.
+    Returns height in image pixels only; validation against 10 mm happens elsewhere.
+    """
+    box=item.get("box")
+    if not box or not small_px:return {"status":"UNRESOLVED","reason":"no_box_or_scale"}
+    crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("L"))
+    if crop.size==0:return {"status":"UNRESOLVED","reason":"empty_crop"}
+    # Dark-pixel mask; inspect mainly outer 30% because calibration pulses are commonly near lead edges.
+    thr=float(np.percentile(crop,28)); dark=crop<=thr
+    h,w=dark.shape
+    candidates=[]
+    for xa,xb in [(0,int(.32*w)),(int(.68*w),w)]:
+        sub=dark[:,xa:xb]
+        # vertical stroke strength
+        col=np.sum(sub,axis=0)
+        strong=np.where(col>=max(6,.08*h))[0]
+        for x in strong:
+            ys=np.where(sub[:,x])[0]
+            if len(ys)<4:continue
+            height=float(ys.max()-ys.min())
+            # pulse expected around 10 small boxes, allow wide tolerance before validation
+            ratio=height/max(1.,small_px)
+            if 6.0<=ratio<=14.5:
+                candidates.append((abs(ratio-10.),height,xa+x))
+    if not candidates:return {"status":"UNRESOLVED","reason":"pulse_not_found"}
+    _,height,x=min(candidates,key=lambda z:z[0])
+    return {"status":"CANDIDATE","height_px":round(height,2),"x_px":int(x),
+            "height_in_small_candidate":round(height/small_px,2)}
+
 def detect_local_small_grid(item,ecg_image):
-    """Conservative local 1-mm grid detector. PASS requires axis agreement."""
+    """v11.2b: small grid must cross-check against 5-mm major grid and/or 1-mV pulse."""
     box=item.get("box")
     if not box:return {"status":"UNRESOLVED","reason":"no_box"}
     crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("RGB"))
@@ -496,20 +532,53 @@ def detect_local_small_grid(item,ecg_image):
     f=crop.astype(float); red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2]); gray=f.mean(axis=2)
     vx=np.mean(red,axis=0)+.25*(255-np.mean(gray,axis=0))
     hy=np.mean(red,axis=1)+.25*(255-np.mean(gray,axis=1))
-    xs=_profile_line_positions(vx); ys=_profile_line_positions(hy)
-    px,cx=_fundamental_spacing(xs); py,cy=_fundamental_spacing(ys)
+    xs=_profile_line_positions(vx);ys=_profile_line_positions(hy)
+    px,cx=_fundamental_spacing(xs);py,cy=_fundamental_spacing(ys)
     if px is None or py is None:
         return {"status":"UNRESOLVED","reason":"both_axes_required","x_period_px":px,"y_period_px":py}
-    agree=abs(px-py)/max(px,py)<=.22
-    period=float(np.median([px,py])); conf=float(np.mean([cx,cy]))
-    # Guard against choosing 5-mm heavy-line spacing as 1-mm spacing: a lead ROI should
-    # contain many small boxes horizontally. This is image geometry, not a physiologic rule.
-    roi_w=crop.shape[1]; enough_boxes=(roi_w/period)>=18
-    status="PASS" if agree and conf>=.68 and enough_boxes else "REVIEW" if agree and conf>=.55 and enough_boxes else "UNRESOLVED"
-    return {"status":status,"small_grid_px":round(period,2) if status!="UNRESOLVED" else None,
+
+    axis_agree=abs(px-py)/max(px,py)<=.22
+    small=float(np.median([px,py])); fine_conf=float(np.mean([cx,cy]))
+    roi_w=crop.shape[1]; enough=(roi_w/small)>=18
+
+    mx,mxc=_major_grid_spacing(vx,small); my,myc=_major_grid_spacing(hy,small)
+    majors=[m for m in (mx,my) if m is not None]
+    major=float(np.median(majors)) if majors else None
+    major_ratio=major/small if major else None
+    major_ok=bool(major_ratio is not None and 4.45<=major_ratio<=5.55)
+    major_conf=float(np.mean([c for c in (mxc,myc) if c is not None])) if majors else 0.
+
+    pulse=_detect_calibration_pulse(item,ecg_image,small)
+    pulse_ratio=pulse.get("height_in_small_candidate")
+    pulse_ok=bool(pulse_ratio is not None and 8.5<=pulse_ratio<=11.5)
+
+    # Cross-validation policy:
+    # PASS = fine-grid axes agree + enough boxes + strong fine periodicity +
+    #        at least one independent scale validator (major grid or calibration pulse).
+    validators=int(major_ok)+int(pulse_ok)
+    if axis_agree and enough and fine_conf>=.68 and validators>=1:
+        status="PASS"
+    elif axis_agree and enough and fine_conf>=.55 and (validators>=1 or major_conf>=.25):
+        status="REVIEW"
+    else:
+        status="UNRESOLVED"
+
+    reason=None
+    if status=="UNRESOLVED":
+        if not axis_agree:reason="fine_grid_axes_disagree"
+        elif not enough:reason="too_few_estimated_small_boxes"
+        elif validators==0:reason="scale_not_cross_validated"
+        else:reason="low_grid_confidence"
+
+    return {"status":status,"small_grid_px":round(small,2) if status!="UNRESOLVED" else None,
             "x_period_px":round(px,2),"y_period_px":round(py,2),
-            "x_support":round(cx,3),"y_support":round(cy,3),"confidence":round(conf,3),
-            "axis_agreement":bool(agree),"estimated_horizontal_boxes":round(roi_w/period,1)}
+            "x_support":round(cx,3),"y_support":round(cy,3),"fine_confidence":round(fine_conf,3),
+            "axis_agreement":bool(axis_agree),"estimated_horizontal_boxes":round(roi_w/small,1),
+            "major_grid_px":round(major,2) if major else None,
+            "major_to_small_ratio":round(major_ratio,2) if major_ratio else None,
+            "major_confidence":round(major_conf,3),"major_validator":major_ok,
+            "calibration_pulse":pulse,"pulse_validator":pulse_ok,
+            "validators_passed":validators,"reason":reason}
 
 
 def measure_j_st_lead(item,lm,clqc,grid,recording_speed=None):
@@ -540,13 +609,20 @@ def measure_j_st_lead(item,lm,clqc,grid,recording_speed=None):
     # ST after J: retain small-box horizontal offsets; at 25 mm/s 1 and 2 boxes = 40/80 ms.
     st_j1=dev_at(j+pxbox); st_j2=dev_at(j+2*pxbox)
     if any(v is None for v in (st_j,st_j1,st_j2)):return {"status":"UNRESOLVED","reason":"st_support"}
-    # baseline stability in vertical small boxes
+    # baseline stability + engineering plausibility guard.
     noise_boxes=noise/pxbox
-    status="PASS" if noise_boxes<=.18 and lm.get("status")=="PASS" else "REVIEW"
+    # Large apparent J shifts usually mean wrong O/J or baseline on photographed ECG.
+    # Do not interpret them diagnostically; block them from quantitative evidence.
+    extreme=max(abs(st_j),abs(st_j1),abs(st_j2))>3.0
+    if extreme:
+        status="UNRESOLVED"; guard_reason="j_or_baseline_implausible"
+    else:
+        status="PASS" if noise_boxes<=.18 and lm.get("status")=="PASS" else "REVIEW"
+        guard_reason=None
     out={"status":status,"baseline_y_px":round(baseline,2),"baseline_noise_small_boxes":round(noise_boxes,3),
          "j_x":int(j),"st_at_j_small_boxes":round(st_j,2),
          "st_j_plus_1box_small_boxes":round(st_j1,2),"st_j_plus_2box_small_boxes":round(st_j2,2),
-         "local_grid":grid}
+         "local_grid":grid,"reason":guard_reason}
     if recording_speed in (25,50):
         box_ms=1000.0/(recording_speed*5.0)
         out["horizontal_box_ms"]=round(box_ms,1)
@@ -554,8 +630,8 @@ def measure_j_st_lead(item,lm,clqc,grid,recording_speed=None):
     return out
 
 def build_j_st_evidence(result,ecg_image,qrs_ev,centerline_ev,recording_speed=None):
-    out={"engine":"local-grid-j-st-v11.2a","status":"UNRESOLVED","leads":{},
-         "rules":["No ST elevation/depression diagnostic label is produced.",
+    out={"engine":"calibration-validated-grid-j-st-v11.2b","status":"UNRESOLVED","leads":{},
+         "rules":["No ST elevation/depression diagnostic label is produced.","Local 1-mm scale requires independent validation by major grid and/or calibration pulse.",
                   "ST values are vertical small-box deviations from a local pre-QRS baseline.",
                   "Positive value means upward ECG deflection relative to baseline.",
                   "UNRESOLVED/REVIEW must not be promoted to verified ST abnormality by AI."]}
@@ -612,8 +688,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.2a"
-PROMPT_VERSION = "ecg-jpoint-st-v11.2a"
+APP_VERSION = "v11.2b"
+PROMPT_VERSION = "ecg-calibrated-grid-jst-v11.2b"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -681,7 +757,7 @@ SYSTEM_PROMPT += "\nBẢNG 12 CHUYỂN ĐẠO VÀ ĐỐI CHIẾU\n- lead_feature
 SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐOẠN TRÊN)\n- Mọi source=image_text là CHỮ CHUẨN GHI ĐỀ XUẤT do AI đọc, chưa được xác minh. evidence\n  phải chép đúng cụm chữ chứa giá trị và đơn vị (ví dụ '25 mm/s', '10 mm/mV'). Không dùng\n  chiều cao xung hoặc hình dạng sóng làm image_text. Không thấy chữ: giá trị null,\n  source=unknown, evidence=''. Không tự suy ra gain hỗn hợp hoặc gain giảm một nửa.\n- Chỉ quy đổi ms/bpm/mV khi có chuẩn tương ứng trong user_confirmed_calibration.\n  Chưa có chuẩn: value=null, nhưng có thể ghi số ô và mốc nhìn được. ST theo ô nhỏ\n  vẫn được mô tả nếu đường nền/J rõ; chưa rõ kích thước lưới thì để value=null.\n- Mỗi measurement có start_point/end_point/baseline_point: tọa độ x_pct,y_pct 0–100\n  tính trên ẢNH region_id ĐÃ GỬI (không phải ảnh toàn cảnh nếu đo ở crop).\n  Không đoán tọa độ khi mốc mờ: để null và nêu giới hạn.\n  RR/PR/QRS/QT: A=start_point là mốc bắt đầu, B=end_point là mốc kết thúc; B nằm sau A.\n  ST: A là điểm J, N=baseline_point nằm trên TP/PR dùng đối chiếu. Voltage: A/B hai mốc\n  biên độ, N đường nền. HR/QTc tính từ số đo liên quan, không phải tọa độ mới.\n- Chỉ đưa tối đa 8 số đo có ích, ưu tiên RR, PR, QRS và ST bất thường nếu thấy rõ.\n  Không trả 12 số ST chỉ để điền đủ bảng. lead_features.st_measurement_id tham chiếu\n  số đo ST cùng vùng/chuyển đạo; st_small_boxes sao chép từ chính số đo đó.\n  Chưa đo ST: st_measurement_id='', st_small_boxes=null, vẫn mô tả hướng ST nếu rõ.\n- summary_measurement_ids chỉ liệt kê ID số đo dùng trong diễn giải. Số định lượng phải\n  nằm trong measurements; không lặp số có đơn vị ms/bpm/mm/mV trong rhythm, conduction,\n  repolarization, impression/hypotheses. Diễn giải dùng mô tả định tính và ID tham chiếu.\n- conduction_assessment gồm av_status=normal/abnormal/uncertain,\n  qrs_status=narrow/wide/uncertain và pr_measurement_id/qrs_measurement_id.\n  Chưa có PR được quy đổi hợp lệ: av_status=uncertain, không kết luận PR bình thường.\n  Chưa có QRS được quy đổi hợp lệ: qrs_status=uncertain. Không suy ra block từ số ô\n  chưa biết tốc độ. Chẩn đoán dẫn truyền phải phù hợp tuổi và hình thái, không chỉ độ rộng.\n- Trước kết luận: đánh giá đầu QRS/Q bệnh lý, quan hệ biên độ/hình dạng T với QRS,\n  dẫn truyền AV, điện thế và biến đổi tái cực, các chuyển đạo đối diện/liên quan.\n  Dấu thiếu máu cơ tim có thể kín đáo; không bắt buộc đủ ngưỡng ST chênh lên mới cảnh báo.\n  Không gọi mọi V2 đẳng điện là bệnh lý; cần ngữ cảnh và đối chiếu các chuyển đạo.\n  Chỉ từ ECG hiện tại không được suy diễn diễn biến, kết quả chụp mạch hoặc chẩn đoán\n  của ECG về sau. Không gọi T 'khổng lồ' nếu không có số đo biên độ có căn cứ.\n- Các vùng ảnh có khoảng đệm và có thể chồng lặp/hiện một phần chuyển đạo bên cạnh.\n  Dùng nhãn thật để chọn sóng, không tính phần chồng lặp thành nhát mới.\n"
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
-SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2a: j_st_engine là bằng chứng đo candidate. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
+SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.1c: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
 SYSTEM_PROMPT += "\nV10.2: Nếu st_small_boxes khác 0 thì st_measurement_id bắt buộc phải trỏ tới một measurement st_mm có landmarks; nếu không đủ mốc, đặt st_small_boxes=null và detail_st=uncertain thay vì đoán số. Nếu tuổi/triệu chứng/bệnh sử/sinh hiệu chưa được cung cấp, không được kết luận urgency=non_urgent chỉ từ ECG; dùng indeterminate/needs_clinical_context theo giá trị schema phù hợp. Chuẩn ghi đọc trực tiếp từ chữ in trên ảnh có thể dùng source=image_text khi evidence chứa đúng số và đơn vị; không gọi đó là user-confirmed.\n"
 
@@ -1814,8 +1890,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · local grid + J-point/ST measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.2a thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · calibration-validated grid + J/ST")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.2b thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1960,21 +2036,28 @@ else:
                             _ov=template_qrs_overlay(ecg,digitizer_result.get("leads",{}).get(_lead,{}),_lm)
                             if _ov is not None: st.image(_ov,caption=f"{_lead} · {_lm.get('status')} · QRS {_lm.get('qrs_width_px')} px · ô nhỏ chưa xác minh",width="stretch")
                     if j_st_evidence:
-                        st.markdown("**v11.2a — Local grid + J/ST measurement candidates**")
+                        st.markdown("**v11.2b — Calibration-validated local grid + J/ST candidates**")
                         _strows=[]
                         for _lead in LEADS:
                             _e=j_st_evidence.get("leads",{}).get(_lead,{})
                             _g=_e.get("grid_qc",{})
+                            _pulse=_g.get("calibration_pulse",{})
                             _strows.append({"Lead":_lead,"Grid":_g.get("status","UNRESOLVED"),
-                                            "1 mm px":_g.get("small_grid_px"),"Grid conf":_g.get("confidence"),
+                                            "1 mm px":_g.get("small_grid_px"),
+                                            "fine conf":_g.get("fine_confidence"),
+                                            "5mm/1mm":_g.get("major_to_small_ratio"),
+                                            "major ✓":_g.get("major_validator"),
+                                            "pulse/1mm":_pulse.get("height_in_small_candidate"),
+                                            "pulse ✓":_g.get("pulse_validator"),
+                                            "validators":_g.get("validators_passed",0),
                                             "ST QC":_e.get("status","UNRESOLVED"),
                                             "ST@J (ô)":_e.get("st_at_j_small_boxes"),
                                             "ST J+1 ô":_e.get("st_j_plus_1box_small_boxes"),
                                             "ST J+2 ô":_e.get("st_j_plus_2box_small_boxes"),
                                             "baseline noise":_e.get("baseline_noise_small_boxes"),
-                                            "reason":_e.get("reason","") or ""})
+                                            "reason":_e.get("reason","") or _g.get("reason","") or ""})
                         st.dataframe(_strows,use_container_width=True,hide_index=True)
-                        st.caption("Đây là phép đo candidate, chưa phải chẩn đoán ST chênh. Grid/J/baseline không PASS thì không dùng định lượng.")
+                        st.caption("Đây là phép đo candidate. Scale 1 mm chỉ PASS khi được kiểm tra chéo bằng major-grid và/hoặc xung calibration; Grid/J/baseline không PASS thì không dùng định lượng.")
             except Exception as exc:
                 digitizer_result=None; digitizer_evidence=None
                 st.warning("Digitizer không hoàn tất ("+type(exc).__name__+"). Không chặn phân tích ảnh gốc.")
