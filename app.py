@@ -258,7 +258,58 @@ def compact_digitizer_evidence(result, ocr):
                      "Do not use FAIL leads quantitatively. REVIEW leads require visual confirmation.",
                      "Do not infer gain from calibration-pulse proposals; only gain_by_lead is conversion-authorized."]}
 
-# ----------------- TEMPLATE QRS LANDMARK ENGINE v11.1b -----------------
+# ----------------- CENTERLINE CLEANUP / QC v11.1c -----------------
+def _cl_runs(mask):
+    out=[]; a=None
+    for i,v in enumerate(np.asarray(mask,dtype=bool)):
+        if v and a is None: a=i
+        elif not v and a is not None: out.append((a,i-1)); a=None
+    if a is not None: out.append((a,len(mask)-1))
+    return out
+
+def clean_centerline_signal(signal):
+    y=np.asarray(signal,dtype=float).copy(); n=len(y)
+    if n<40: return y,{"status":"FAIL","reason":"too_short","support":0.0}
+    finite=np.isfinite(y); raw_support=float(finite.mean())
+    if finite.sum()<20: return y,{"status":"FAIL","reason":"too_few_points","support":raw_support}
+    idx=np.where(finite)[0]; vals=y[idx]; dy=np.abs(np.diff(vals))
+    typical=float(np.median(dy)) if len(dy) else 0.; mad=float(np.median(np.abs(dy-typical))) if len(dy) else 0.
+    jump_thr=max(5.,typical+6.*max(1.,mad)); bad=np.zeros(n,dtype=bool)
+    for k,d in enumerate(dy):
+        if idx[k+1]-idx[k]<=2 and d>jump_thr: bad[idx[k]]=True; bad[idx[k+1]]=True
+    for a,b in _cl_runs(finite):
+        if b-a+1<=2 and a>0 and b<n-1: bad[a:b+1]=True
+    y[bad]=np.nan; finite=np.isfinite(y); max_gap=max(2,min(6,int(round(n*.015))))
+    for a,b in _cl_runs(~finite):
+        gap=b-a+1
+        if gap<=max_gap and a>0 and b<n-1 and np.isfinite(y[a-1]) and np.isfinite(y[b+1]):
+            y[a:b+1]=np.linspace(y[a-1],y[b+1],gap+2)[1:-1]
+    finite=np.isfinite(y); support=float(finite.mean()); runs=_cl_runs(finite)
+    longest=max([b-a+1 for a,b in runs],default=0)/n; pairs=finite[:-1]&finite[1:]
+    if pairs.any():
+        jumps=np.abs(np.diff(y))[pairs]; medj=float(np.median(jumps)); q90=float(np.percentile(jumps,90))
+        jump_score=float(np.mean(jumps<=max(4.,medj*5.+2.)))
+    else: medj=q90=999.; jump_score=0.
+    fragments=len(runs); score=.45*support+.30*longest+.25*jump_score
+    if support<.55 or longest<.30 or fragments>18: status="FAIL"
+    elif support<.78 or longest<.55 or jump_score<.82 or fragments>10: status="REVIEW"
+    else: status="PASS"
+    return y,{"status":status,"score":round(score,3),"raw_support":round(raw_support,3),"support":round(support,3),
+              "longest_run_fraction":round(longest,3),"fragment_count":fragments,
+              "median_adjacent_jump_px":round(medj,2),"p90_adjacent_jump_px":round(q90,2),
+              "jump_continuity":round(jump_score,3),"removed_points":int(bad.sum()),"short_gap_max_px":max_gap}
+
+def build_centerline_qc(result):
+    out={"engine":"centerline-qc-v11.1c","leads":{}}
+    if not result:return out
+    for lead,item in result.get("leads",{}).items():
+        if lead=="II-rhythm":continue
+        sig=item.get("signal_px")
+        if sig is None: out["leads"][lead]={"status":"FAIL","reason":"no_signal"}; continue
+        _,qc=clean_centerline_signal(sig); out["leads"][lead]=qc
+    return out
+
+# ----------------- TEMPLATE QRS LANDMARK ENGINE v11.1c -----------------
 def _tb_interp(signal):
     y=np.asarray(signal,dtype=float); good=np.isfinite(y)
     if len(y)<40 or good.mean()<.65: return None
@@ -316,8 +367,10 @@ def _tb_activity_landmarks(template,pxmm):
 def analyze_template_qrs(item,pxmm=None):
     lqc=item.get("qc",{}).get("status","FAIL"); sig=item.get("signal_px")
     if sig is None or lqc=="FAIL":return {"status":"UNRESOLVED","reason":"lead_qc_or_signal"}
-    y=_tb_interp(sig)
-    if y is None:return {"status":"UNRESOLVED","reason":"centerline_support"}
+    cleaned,clqc=clean_centerline_signal(sig)
+    if clqc.get("status")=="FAIL": return {"status":"UNRESOLVED","reason":"centerline_qc_fail","centerline_qc":clqc}
+    y=_tb_interp(cleaned)
+    if y is None:return {"status":"UNRESOLVED","reason":"centerline_support","centerline_qc":clqc}
     # Landmark geometry must not depend on possibly misclassified 1-mm vs 5-mm grid.
     # First estimate dominant beat spacing in pixels, then use a conservative working scale
     # (~20 small boxes per RR at common rates) only for window sizes, never as a measurement.
@@ -342,7 +395,8 @@ def analyze_template_qrs(item,pxmm=None):
         if 0<=ox<jx<len(y):proj.append({"onset_x":int(ox),"offset_x":int(jx),"dominant_x":int(bt["center_x"]),"width_px":float(jx-ox)})
     if len(proj)<2:return {"status":"UNRESOLVED","reason":"projection_failure"}
     widths=np.array([p["width_px"] for p in proj]); med=float(np.median(widths)); mad=float(np.median(np.abs(widths-med)))
-    cons=float(np.mean(np.abs(widths-med)<=max(3.0,2.5*mad))); conf=cons*min(1.,len(proj)/3)*(1. if lqc=="PASS" else .75)
+    cons=float(np.mean(np.abs(widths-med)<=max(3.0,2.5*mad)))
+    conf=cons*min(1.,len(proj)/3)*(1. if lqc=="PASS" else .75)*(1. if clqc.get("status")=="PASS" else .65)
     # Pixel-width plausibility relative to RR; no physical-grid assumption here.
     ratio=med/max(1.0,rrpx)
     ok=.025<=ratio<=.22 and conf>=.5; rep=min(proj,key=lambda p:abs(p["width_px"]-med))
@@ -351,10 +405,10 @@ def analyze_template_qrs(item,pxmm=None):
             "qrs_width_px":round(med,1) if ok else None,"qrs_to_rr_ratio":round(ratio,3) if ok else None,
             "qrs_width_small_boxes":None,"representative":rep if ok else None,
             "template_landmarks":{k:v for k,v in lm.items() if k!="template"},"template_wave":lm["template"],
-            "reason":None if ok else "low_consistency_or_width"}
+            "centerline_qc":clqc,"reason":None if ok else "low_consistency_or_width"}
 def build_template_qrs_evidence(result):
     cal=result.get("calibration",{}) if result else {}; px=cal.get("px_per_mm")
-    out={"engine":"aligned-median-qrs-v11.1b","status":"UNRESOLVED","px_per_small_box":px,"grid_status":cal.get("status"),"leads":{},
+    out={"engine":"aligned-median-qrs-v11.1c","status":"UNRESOLVED","px_per_small_box":px,"grid_status":cal.get("status"),"leads":{},
          "rules":["No morphology naming.","O=onset candidate; J=QRS offset/J candidate.","Small-box width is withheld until local 1-mm grid is verified.","UNRESOLVED must not be completed by AI."]}
     if not result or cal.get("status")!="PASS" or not px:return out
     for lead,item in result.get("leads",{}).items():
@@ -369,7 +423,7 @@ def build_template_qrs_evidence(result):
     out["status"]="PASS" if n>=10 else "REVIEW" if n>=6 else "UNRESOLVED";return out
 def template_qrs_overlay(ecg,item,lm):
     if not lm or lm.get("status")=="UNRESOLVED" or not item.get("box"):return None
-    crop=ecg.crop(tuple(map(int,item["box"]))).convert("RGB");arr=np.asarray(crop).copy();sig=np.asarray(item.get("signal_px",[]),float)
+    crop=ecg.crop(tuple(map(int,item["box"]))).convert("RGB");arr=np.asarray(crop).copy();sig,_clqc=clean_centerline_signal(item.get("signal_px",[]))
     ww,wh=item.get("work_size",[len(sig),crop.height]);sx=crop.width/max(1,float(ww));sy=crop.height/max(1,float(wh))
     for x0,y0 in enumerate(sig):
         if np.isfinite(y0):
@@ -418,8 +472,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.1b"
-PROMPT_VERSION = "ecg-template-qrs-landmarks-v11.1b"
+APP_VERSION = "v11.1c"
+PROMPT_VERSION = "ecg-centerline-qc-v11.1c"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -487,7 +541,7 @@ SYSTEM_PROMPT += "\nBẢNG 12 CHUYỂN ĐẠO VÀ ĐỐI CHIẾU\n- lead_feature
 SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐOẠN TRÊN)\n- Mọi source=image_text là CHỮ CHUẨN GHI ĐỀ XUẤT do AI đọc, chưa được xác minh. evidence\n  phải chép đúng cụm chữ chứa giá trị và đơn vị (ví dụ '25 mm/s', '10 mm/mV'). Không dùng\n  chiều cao xung hoặc hình dạng sóng làm image_text. Không thấy chữ: giá trị null,\n  source=unknown, evidence=''. Không tự suy ra gain hỗn hợp hoặc gain giảm một nửa.\n- Chỉ quy đổi ms/bpm/mV khi có chuẩn tương ứng trong user_confirmed_calibration.\n  Chưa có chuẩn: value=null, nhưng có thể ghi số ô và mốc nhìn được. ST theo ô nhỏ\n  vẫn được mô tả nếu đường nền/J rõ; chưa rõ kích thước lưới thì để value=null.\n- Mỗi measurement có start_point/end_point/baseline_point: tọa độ x_pct,y_pct 0–100\n  tính trên ẢNH region_id ĐÃ GỬI (không phải ảnh toàn cảnh nếu đo ở crop).\n  Không đoán tọa độ khi mốc mờ: để null và nêu giới hạn.\n  RR/PR/QRS/QT: A=start_point là mốc bắt đầu, B=end_point là mốc kết thúc; B nằm sau A.\n  ST: A là điểm J, N=baseline_point nằm trên TP/PR dùng đối chiếu. Voltage: A/B hai mốc\n  biên độ, N đường nền. HR/QTc tính từ số đo liên quan, không phải tọa độ mới.\n- Chỉ đưa tối đa 8 số đo có ích, ưu tiên RR, PR, QRS và ST bất thường nếu thấy rõ.\n  Không trả 12 số ST chỉ để điền đủ bảng. lead_features.st_measurement_id tham chiếu\n  số đo ST cùng vùng/chuyển đạo; st_small_boxes sao chép từ chính số đo đó.\n  Chưa đo ST: st_measurement_id='', st_small_boxes=null, vẫn mô tả hướng ST nếu rõ.\n- summary_measurement_ids chỉ liệt kê ID số đo dùng trong diễn giải. Số định lượng phải\n  nằm trong measurements; không lặp số có đơn vị ms/bpm/mm/mV trong rhythm, conduction,\n  repolarization, impression/hypotheses. Diễn giải dùng mô tả định tính và ID tham chiếu.\n- conduction_assessment gồm av_status=normal/abnormal/uncertain,\n  qrs_status=narrow/wide/uncertain và pr_measurement_id/qrs_measurement_id.\n  Chưa có PR được quy đổi hợp lệ: av_status=uncertain, không kết luận PR bình thường.\n  Chưa có QRS được quy đổi hợp lệ: qrs_status=uncertain. Không suy ra block từ số ô\n  chưa biết tốc độ. Chẩn đoán dẫn truyền phải phù hợp tuổi và hình thái, không chỉ độ rộng.\n- Trước kết luận: đánh giá đầu QRS/Q bệnh lý, quan hệ biên độ/hình dạng T với QRS,\n  dẫn truyền AV, điện thế và biến đổi tái cực, các chuyển đạo đối diện/liên quan.\n  Dấu thiếu máu cơ tim có thể kín đáo; không bắt buộc đủ ngưỡng ST chênh lên mới cảnh báo.\n  Không gọi mọi V2 đẳng điện là bệnh lý; cần ngữ cảnh và đối chiếu các chuyển đạo.\n  Chỉ từ ECG hiện tại không được suy diễn diễn biến, kết quả chụp mạch hoặc chẩn đoán\n  của ECG về sau. Không gọi T 'khổng lồ' nếu không có số đo biên độ có căn cứ.\n- Các vùng ảnh có khoảng đệm và có thể chồng lặp/hiện một phần chuyển đạo bên cạnh.\n  Dùng nhãn thật để chọn sóng, không tính phần chồng lặp thành nhát mới.\n"
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
-SYSTEM_PROMPT += "\nQRS TEMPLATE v11.1b: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
+SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.1c: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
 SYSTEM_PROMPT += "\nV10.2: Nếu st_small_boxes khác 0 thì st_measurement_id bắt buộc phải trỏ tới một measurement st_mm có landmarks; nếu không đủ mốc, đặt st_small_boxes=null và detail_st=uncertain thay vì đoán số. Nếu tuổi/triệu chứng/bệnh sử/sinh hiệu chưa được cung cấp, không được kết luận urgency=non_urgent chỉ từ ECG; dùng indeterminate/needs_clinical_context theo giá trị schema phù hợp. Chuẩn ghi đọc trực tiếp từ chữ in trên ảnh có thể dùng source=image_text khi evidence chứa đúng số và đơn vị; không gọi đó là user-confirmed.\n"
 
 
@@ -1619,8 +1673,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · aligned median-beat QRS landmarks")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.1b thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · centerline cleanup/QC + median-beat QRS")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.1c thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1719,7 +1773,7 @@ else:
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
-    digitizer_result=None; digitizer_evidence=None; qrs_template_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
+    digitizer_result=None; digitizer_evidence=None; qrs_template_evidence=None; centerline_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
         if not DIGITIZER_AVAILABLE:
             st.warning("Chưa nạp được ecg_digitizer.py ("+DIGITIZER_IMPORT_ERROR+"). AI vẫn có thể đọc ảnh gốc; hãy kiểm tra file engine trên GitHub.")
@@ -1731,7 +1785,9 @@ else:
                     digitizer_result=digitize_ecg(ecg,label_anchors=ocr_evidence.get("label_anchors") or None,
                         recording_hints=recording_hints,include_rhythm=rhythm_enabled if 'rhythm_enabled' in locals() else True)
                     digitizer_evidence=compact_digitizer_evidence(digitizer_result,ocr_evidence)
+                    centerline_evidence=build_centerline_qc(digitizer_result)
                     qrs_template_evidence=build_template_qrs_evidence(digitizer_result)
+                    digitizer_evidence["centerline_qc"]=centerline_evidence
                     digitizer_evidence["qrs_template_landmarks"]=qrs_template_evidence
                 dq=digitizer_result.get("overall_qc",{})
                 st.write(f"QC Digitizer: **{dq.get('status','?')}** · PASS {dq.get('lead_pass',0)} · REVIEW {dq.get('lead_review',0)} · FAIL {dq.get('lead_fail',0)}")
@@ -1742,15 +1798,18 @@ else:
                 if dq.get("status")!="PASS":
                     st.info("Digitizer chưa PASS toàn bộ. AI vẫn nhận ảnh gốc; lead REVIEW/FAIL không được coi là số đo đã xác minh.")
                 if qrs_template_evidence:
-                    st.markdown("**v11.1b — aligned median-beat QRS landmarks (chưa gọi morphology)**")
+                    st.markdown("**v11.1c — centerline QC + aligned median-beat QRS (chưa gọi morphology)**")
                     _rows=[]
                     for _lead in LEADS:
                         _lm=qrs_template_evidence.get("leads",{}).get(_lead,{})
-                        _rows.append({"Lead":_lead,"QC":_lm.get("status","UNRESOLVED"),"QRS px":_lm.get("qrs_width_px"),"QRS/RR":_lm.get("qrs_to_rr_ratio"),
-                                      "Ô nhỏ":_lm.get("qrs_width_small_boxes"),
+                        _cl=(centerline_evidence or {}).get("leads",{}).get(_lead,{})
+                        _rows.append({"Lead":_lead,"Centerline":_cl.get("status","FAIL"),"CL score":_cl.get("score"),
+                                      "support":_cl.get("support"),"fragments":_cl.get("fragment_count"),
+                                      "Landmark":_lm.get("status","UNRESOLVED"),"QRS px":_lm.get("qrs_width_px"),
+                                      "QRS/RR":_lm.get("qrs_to_rr_ratio"),"Ô nhỏ":_lm.get("qrs_width_small_boxes"),
                                       "beats":_lm.get("beats_projected",0),"confidence":_lm.get("confidence"),"reason":_lm.get("reason","") or ""})
                     st.dataframe(_rows,use_container_width=True,hide_index=True)
-                    with st.expander("Overlay centerline + O/J — kiểm tra bằng mắt",expanded=False):
+                    with st.expander("Overlay centerline cleanup + O/J — kiểm tra bằng mắt",expanded=False):
                         st.caption("Hai vạch là O=onset và J=QRS offset candidate. Đường centerline số hóa được chồng lên ảnh; chưa gán Q/R/S/R′.")
                         for _lead in LEADS:
                             _lm=qrs_template_evidence.get("leads",{}).get(_lead,{})
