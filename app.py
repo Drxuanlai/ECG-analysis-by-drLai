@@ -296,8 +296,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v10.2"
-PROMPT_VERSION = "ecg-qc-autocrop-v10.2"
+APP_VERSION = "v10.3"
+PROMPT_VERSION = "ecg-bidirectional-autocrop-v10.3"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -1234,15 +1234,37 @@ def _candidate_score(result, crop_area_fraction):
     q=result.get("overall_qc",{}); cal=result.get("calibration",{})
     p=int(q.get("lead_pass",0)); r=int(q.get("lead_review",0)); f=int(q.get("lead_fail",12))
     grid=cal.get("status")
-    # FAIL dominates; PASS is the primary target. Compactness is only a tie-breaker.
-    score=12*p-11*f-2*r+(8 if grid=="PASS" else 2 if grid=="REVIEW" else -5)
+    score=14*p-13*f-2*r+(9 if grid=="PASS" else 2 if grid=="REVIEW" else -6)
     score+=float(cal.get("confidence") or 0)*2
-    score-=max(0.,crop_area_fraction-.55)*2
+    # Only a weak compactness tie-breaker; QC must dominate.
+    score-=max(0.,crop_area_fraction-.60)
     return float(score)
 
-def qc_guided_auto_crop(image, max_candidates=18):
-    """Search around the grid bbox and choose the crop that maximizes Digitizer QC.
-    No OCR is run inside this search.
+def _clip_pct_box(x0,x1,y0,y1):
+    x0=max(0.,min(98.,x0)); x1=max(x0+2.,min(100.,x1))
+    y0=max(0.,min(98.,y0)); y1=max(y0+2.,min(100.,y1))
+    return (x0,x1),(y0,y1)
+
+def _evaluate_crop(image,xp,yp,fast=True):
+    box=_pct_box_to_pixels(image.size,xp,yp)
+    crop=image.crop(box)
+    work=crop.copy()
+    if fast:
+        work.thumbnail((1500,850),Image.Resampling.LANCZOS)
+    result=digitize_ecg(work,include_rhythm=True,deskew=not fast)
+    area=((box[2]-box[0])*(box[3]-box[1]))/(image.width*image.height)
+    q=result.get("overall_qc",{}); cal=result.get("calibration",{})
+    return {"score":_candidate_score(result,area),"x":xp,"y":yp,"box":box,
+            "pass":int(q.get("lead_pass",0)),"review":int(q.get("lead_review",0)),
+            "fail":int(q.get("lead_fail",12)),"grid":cal.get("status"),
+            "grid_confidence":float(cal.get("confidence") or 0),"result":result}
+
+def qc_guided_auto_crop(image):
+    """v10.3: bidirectional coarse-to-fine crop optimization.
+
+    Stage 1 searches both inward trims and outward expansion around the detected grid.
+    Stage 2 refines around the best fast candidates.
+    Stage 3 reranks the shortlist at full resolution with production deskew.
     """
     if not DIGITIZER_AVAILABLE or digitizer_detect_grid_bbox is None:
         return (0,100),(0,100),None
@@ -1250,48 +1272,68 @@ def qc_guided_auto_crop(image, max_candidates=18):
         paper=digitizer_detect_paper_bbox(image); grid,gconf=digitizer_detect_grid_bbox(image,paper)
         w,h=image.size; gx0,gy0,gx1,gy1=grid
         base=(100*gx0/w,100*gx1/w,100*gy0/h,100*gy1/h)
-        # Candidate margins around the detected grid. These include the manual benchmark pattern
-        # (tighter top/bottom than v10.1) without overfitting to one image.
-        margins=[
-            (1,1,2,2),(2,2,4,3),(3,3,6,4),(4,2,8,4),(2,4,8,4),
-            (4,4,10,5),(6,3,10,5),(3,6,10,5),(5,5,12,6),
-            (7,4,12,6),(4,7,12,6),(6,6,14,7),
-            (8,5,14,7),(5,8,14,7),(8,8,16,8),
-            (10,6,16,8),(6,10,16,8),(10,10,18,9)
-        ][:max_candidates]
-        candidates=[]; seen=set()
-        for ml,mr,mt,mb in margins:
-            xp=(max(0.,base[0]-ml),min(100.,base[1]+mr))
-            yp=(max(0.,base[2]-mt),min(100.,base[3]+mb))
+
+        # Directed patterns: positive values trim inward, negative values expand outward.
+        # Includes asymmetric trims because photographed sheets often contain desk/background
+        # predominantly on one or two sides.
+        patterns=[
+            (0,0,0,0),
+            (5,3,5,3),(8,4,8,4),(10,5,10,5),(12,5,12,4),(15,5,15,5),
+            (10,8,12,6),(12,8,15,6),(15,8,15,8),
+            (5,10,10,5),(8,12,12,6),
+            (12,3,15,3),(15,3,18,4),(8,3,15,4),
+            (3,8,15,4),(5,5,18,5),(10,5,18,5),
+            (-3,-3,-3,-3),(-5,-3,-5,-3),(-3,-5,-3,-5),
+            (5,0,10,0),(10,0,15,0),(15,0,15,0),
+            (0,5,10,5),(0,8,15,5),(8,0,0,0),(0,8,0,0),
+        ]
+        coarse=[]; seen=set()
+        for lt,rt,tt,bt in patterns:
+            xp,yp=_clip_pct_box(base[0]+lt,base[1]-rt,base[2]+tt,base[3]-bt)
             key=tuple(round(v,1) for v in (*xp,*yp))
             if key in seen: continue
             seen.add(key)
-            box=_pct_box_to_pixels(image.size,xp,yp)
-            if box[2]<=box[0] or box[3]<=box[1]: continue
-            crop=image.crop(box)
-            # Keep search bounded on phone/server CPU.
-            probe=crop.copy(); probe.thumbnail((1800,1000),Image.Resampling.LANCZOS)
-            try:
-                res=digitize_ecg(probe,include_rhythm=True,deskew=False)
-                area=((box[2]-box[0])*(box[3]-box[1]))/(w*h)
-                score=_candidate_score(res,area)
-                q=res.get("overall_qc",{}); cal=res.get("calibration",{})
-                candidates.append({"score":score,"x":xp,"y":yp,"box":box,
-                    "pass":int(q.get("lead_pass",0)),"review":int(q.get("lead_review",0)),
-                    "fail":int(q.get("lead_fail",12)),"grid":cal.get("status"),
-                    "grid_confidence":float(cal.get("confidence") or 0)})
-            except Exception:
-                continue
-        if not candidates:
+            try: coarse.append(_evaluate_crop(image,xp,yp,fast=True))
+            except Exception: pass
+        if not coarse:
             return (0,100),(0,100),None
-        candidates.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
-        best=candidates[0]
-        # Confidence describes crop search quality, not grid detection confidence.
-        good=(best["pass"]>=10 and best["fail"]<=1)
-        meta={"method":"qc_guided_search","candidate_count":len(candidates),
+        coarse.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
+
+        # Fine search around top 3 coarse crops, moving individual edges ±2/4%.
+        fine=list(coarse[:5])
+        deltas=[-4,-2,0,2,4]
+        for seed in coarse[:3]:
+            x0,x1=seed["x"]; y0,y1=seed["y"]
+            moves=[
+                (d,0,0,0) for d in deltas if d]+[(0,d,0,0) for d in deltas if d]+\
+                [(0,0,d,0) for d in deltas if d]+[(0,0,0,d) for d in deltas if d]+\
+                [(d,-d,0,0) for d in (-3,3)]+[(0,0,d,-d) for d in (-3,3)]
+            for dl,dr,dt,db in moves:
+                xp,yp=_clip_pct_box(x0+dl,x1+dr,y0+dt,y1+db)
+                key=tuple(round(v,1) for v in (*xp,*yp))
+                if key in seen: continue
+                seen.add(key)
+                try: fine.append(_evaluate_crop(image,xp,yp,fast=True))
+                except Exception: pass
+
+        fine.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
+
+        # Full-resolution rerank. This removes the v10.2 mismatch between thumbnail search
+        # and production Digitizer behavior.
+        full=[]
+        for cand in fine[:4]:
+            try: full.append(_evaluate_crop(image,cand["x"],cand["y"],fast=False))
+            except Exception: pass
+        if not full:
+            full=fine[:1]
+        full.sort(key=lambda c:(c["score"],c["pass"],-c["fail"],-c["review"]),reverse=True)
+        best=full[0]
+        acceptable=(best["pass"]>=10 and best["fail"]<=1)
+        meta={"method":"bidirectional_coarse_to_fine_fullres",
+              "coarse_count":len(coarse),"fine_count":len(fine),"fullres_count":len(full),
               "score":best["score"],"pass":best["pass"],"review":best["review"],"fail":best["fail"],
-              "grid":best["grid"],"acceptable":good,
-              "runner_up_score":candidates[1]["score"] if len(candidates)>1 else None}
+              "grid":best["grid"],"grid_confidence":best["grid_confidence"],
+              "acceptable":acceptable,"detector_grid_confidence":float(gconf)}
         return tuple(round(v) for v in best["x"]),tuple(round(v) for v in best["y"]),meta
     except Exception:
         return (0,100),(0,100),None
@@ -1316,8 +1358,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · QC-guided auto-crop + AI vision + Digitizer")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v10.2 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · bidirectional auto-crop + full-res rerank")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v10.3 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -1402,7 +1444,7 @@ else:
         whole_x, whole_y = ((auto_crop_x,auto_crop_y) if crop_whole else ((0,100),(0,100)))
         if crop_whole:
             if auto_crop_meta:
-                st.caption(f"Auto-crop QC: thử {auto_crop_meta['candidate_count']} vùng · best PASS {auto_crop_meta['pass']} / REVIEW {auto_crop_meta['review']} / FAIL {auto_crop_meta['fail']} · grid {auto_crop_meta['grid']}.")
+                st.caption(f"Auto-crop v10.3: coarse {auto_crop_meta['coarse_count']} · fine {auto_crop_meta['fine_count']} · full-res rerank {auto_crop_meta['fullres_count']} · best PASS {auto_crop_meta['pass']} / REVIEW {auto_crop_meta['review']} / FAIL {auto_crop_meta['fail']} · grid {auto_crop_meta['grid']}.")
                 if not auto_crop_meta["acceptable"]:
                     st.warning("Auto-crop chưa đạt ngưỡng tin cậy (mục tiêu ≥10 PASS và ≤1 FAIL). Hãy kiểm tra preview; slider là fallback.")
             whole_x = st.slider("Toàn bộ ECG: trái — phải (%)", 0,100,whole_x, key="image_x_"+image_id)
