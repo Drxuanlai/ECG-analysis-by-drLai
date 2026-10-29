@@ -1409,6 +1409,7 @@ def _rr_from_rhythm_region(ecg_image,rhythm_region,speed_mm_s=None):
     if out['status']=='UNRESOLVED':
         out['reason']=qc.get('reason');out['fiducials_x']=out['predicted_x'];return out
 
+    out['detection_status']=out['status']
     snapped,snapqc=_snap_phase_fiducials_to_qrs(crop,y,matched,float(qc['rr_guess_px']))
     out['snap_qc']=snapqc;out['fiducials_x']=snapped
     if snapqc.get('status')=='REVIEW' and out['status']=='PASS':
@@ -1432,9 +1433,15 @@ def _rr_from_rhythm_region(ecg_image,rhythm_region,speed_mm_s=None):
     out['median_rr_px']=round(float(np.median(rrvals)),2);out['consecutive']=True
 
     grid=_rhythm_horizontal_grid(crop);out['rhythm_grid']=grid
+    # Conversion authority is independent of snap PASS/REVIEW once a valid consecutive RR pair exists.
+    # REVIEW preserves the numeric measurement but prevents it from being promoted to verified evidence.
     conv=_convert_rr_to_time(out['median_rr_px'],grid,speed_mm_s);out['conversion']=conv
     out['conversion_status']=conv.get('status','UNRESOLVED')
     out['small_boxes']=conv.get('rr_small_boxes');out['rr_ms']=conv.get('rr_ms');out['heart_rate_bpm']=conv.get('heart_rate_bpm')
+    if conv.get('status')=='PASS':
+        out['measurement_status']='PASS' if out.get('status')=='PASS' and snapqc.get('status')=='PASS' else 'REVIEW'
+    else:
+        out['measurement_status']='UNRESOLVED'
     return out
 
 
@@ -1472,9 +1479,8 @@ def rr_authority_overlay_from_digitizer(ecg_image,result,rr):
     return Image.fromarray(arr)
 
 def measurement_authority_conflicts(data,rr_authority,j_st_evidence):
-    _rr_status=(rr_authority or {}).get("status","UNRESOLVED")
-    _conv_status=(rr_authority or {}).get("conversion_status","UNRESOLVED")
-    authority={"rr_ms":{"status":"PASS" if _rr_status=="PASS" and _conv_status=="PASS" else "UNRESOLVED",
+    _rr_measurement_status=(rr_authority or {}).get("measurement_status","UNRESOLVED")
+    authority={"rr_ms":{"status":_rr_measurement_status,
                         "value":(rr_authority or {}).get("rr_ms"),"source":"engine"}}
     for lead,e in (j_st_evidence or {}).get("leads",{}).items():
         authority[f"st_mm:{lead}"]={"status":e.get("status","UNRESOLVED"),
@@ -1529,8 +1535,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.8"
-PROMPT_VERSION = "ecg-harmonic-grid-resolver-v11.3.8"
+APP_VERSION = "v11.3.9"
+PROMPT_VERSION = "ecg-rr-conversion-gating-v11.3.9"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2732,8 +2738,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · harmonic-aware Rhythm-II grid + RR/HR")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.8 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · RR conversion gating hotfix")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.9 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2985,24 +2991,27 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.8 — Measurement Authority: harmonic-aware grid → RR/HR**")
+    st.markdown("**v11.3.9 — RR/HR: detection QC ≠ measurement QC**")
     if rr_authority:
-        _c=st.columns(9)
-        _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
-        _c[1].metric("R accepted",rr_authority.get("r_accepted",0))
-        _c[2].metric("Snap QC",(rr_authority.get("snap_qc") or {}).get("status","—"))
-        _c[3].metric("RR px",rr_authority.get("rr_px","—"))
-        _c[4].metric("RR boxes",rr_authority.get("small_boxes","—"))
-        _c[5].metric("RR ms",rr_authority.get("rr_ms","—"))
-        _c[6].metric("HR bpm",rr_authority.get("heart_rate_bpm","—"))
-        _c[7].metric("Grid",(rr_authority.get("rhythm_grid") or {}).get("status","—"))
-        _c[8].metric("RR CV",rr_authority.get("snapped_rr_cv",rr_authority.get("rr_cv","—")))
+        _c=st.columns(10)
+        _c[0].metric("Detection QC",rr_authority.get("status","UNRESOLVED"))
+        _c[1].metric("Measurement QC",rr_authority.get("measurement_status","UNRESOLVED"))
+        _c[2].metric("R accepted",rr_authority.get("r_accepted",0))
+        _c[3].metric("Snap QC",(rr_authority.get("snap_qc") or {}).get("status","—"))
+        _c[4].metric("RR px",rr_authority.get("rr_px","—"))
+        _c[5].metric("RR boxes",rr_authority.get("small_boxes","—"))
+        _c[6].metric("RR ms",rr_authority.get("rr_ms","—"))
+        _c[7].metric("HR bpm",rr_authority.get("heart_rate_bpm","—"))
+        _c[8].metric("Grid",(rr_authority.get("rhythm_grid") or {}).get("status","—"))
+        _c[9].metric("RR CV",rr_authority.get("snapped_rr_cv",rr_authority.get("rr_cv","—")))
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.8 — R detector giữ nguyên. Grid resolver hiểu autocorrelation 5× có thể là major-grid harmonic của fundamental 1 mm; không còn lấy median hai period bất đồng.",width="stretch")
-        if rr_authority.get("status")!="PASS":
-            st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
+            st.image(_ov,caption="RR ENGINE v11.3.9 — detector/grid giữ nguyên v11.3.8. Snap REVIEW không xóa RR boxes/ms/HR; nó chỉ hạ Measurement QC xuống REVIEW.",width="stretch")
+        if rr_authority.get("measurement_status")=="REVIEW":
+            st.info("RR/HR đã đo được nhưng Measurement QC = REVIEW: hiển thị số để bác sĩ kiểm tra, chưa coi là verified evidence.")
+        elif rr_authority.get("measurement_status")!="PASS":
+            st.info("RR chưa có Measurement PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
         _rg=rr_authority.get("rhythm_grid") or {}
         with st.expander("Rhythm-II grid evidence",expanded=False):
             st.json(_rg)
