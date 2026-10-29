@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.1.2"
-PROMPT_VERSION = "ecg-ai-landmark-api-fallback-v14.1.2"
+APP_VERSION = "v14.1.3"
+PROMPT_VERSION = "ecg-ai-landmark-api-fallback-v14.1.3"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3204,9 +3204,13 @@ def _clean_api_error(exc):
 def analyze_gemini(api_key, model, regions, prompt, thinking):
     client = genai.Client(api_key=api_key)
     parts = [types.Part.from_text(text=prompt)]
-    for image in images:
-        buf=io.BytesIO(); image.convert("RGB").save(buf,format="JPEG",quality=92)
-        parts.append(types.Part.from_bytes(data=buf.getvalue(),mime_type="image/jpeg"))
+    for region in regions:
+        image = region.get("image") if isinstance(region, dict) else None
+        if image is None:
+            continue
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="JPEG", quality=92)
+        parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
 
     attempts=[]
     configs=[
@@ -3785,7 +3789,7 @@ def render_result(result):
     with st.expander("Lịch sử chọn nguồn API của lượt này"):
 
         if "api_attempts" in locals():
-            with st.expander("v14.1.2 API diagnostic", expanded=False):
+            with st.expander("v14.1.3 API diagnostic", expanded=False):
                 st.json(api_attempts)
         st.dataframe(result.get("attempts", []), hide_index=True)
         st.caption("Không chứa API key. Lỗi trước khi có báo cáo mới chuyển nguồn; không trộn các câu trả lời.")
@@ -4148,7 +4152,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.1.2 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.1.3 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
