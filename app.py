@@ -1379,20 +1379,22 @@ def _normalize_paper_speed(speed_mm_s):
 
 def _convert_rr_to_time(rr_px,grid,speed_mm_s):
     speed=_normalize_paper_speed(speed_mm_s)
-    if rr_px is None:return {"status":"UNRESOLVED","reason":"no_rr_px","speed_received":speed_mm_s}
+    if rr_px is None:return {"status":"UNRESOLVED","reason":"no_rr_px","message":"Chưa có khoảng RR theo pixel.","speed_received":speed_mm_s}
     if not grid or grid.get("status")!="PASS" or not grid.get("small_grid_px"):
-        return {"status":"UNRESOLVED","reason":"rhythm_grid_not_PASS","speed_received":speed}
+        return {"status":"UNRESOLVED","reason":"rhythm_grid_not_PASS","message":"Horizontal grid chưa PASS.","speed_received":speed}
     if speed is None:
-        return {"status":"UNRESOLVED","reason":"paper_speed_not_confirmed","speed_received":speed_mm_s}
+        return {"status":"UNRESOLVED","reason":"paper_speed_not_confirmed",
+                "message":"Chưa xác nhận tốc độ giấy. Nhập 25 hoặc 50 mm/s sau khi kiểm tra ECG để mở khóa ms/HR.",
+                "speed_received":speed_mm_s}
     boxes=float(rr_px)/float(grid["small_grid_px"])
     # one 1-mm horizontal box = 1000/speed ms
     box_ms=1000.0/speed
     rr_ms=boxes*box_ms
     hr=60000.0/rr_ms if rr_ms>0 else None
     if not (250<=rr_ms<=3000):
-        return {"status":"REVIEW","reason":"rr_time_outside_engineering_range","speed_received":speed,
+        return {"status":"REVIEW","reason":"rr_time_outside_engineering_range","message":"Đã quy đổi nhưng RR nằm ngoài guardrail kỹ thuật; cần kiểm tra.","speed_received":speed,
                 "rr_small_boxes":round(boxes,2),"rr_ms":round(rr_ms,1),"heart_rate_bpm":round(hr,1) if hr else None}
-    return {"status":"PASS","reason":None,"speed_received":speed,
+    return {"status":"PASS","reason":None,"message":"Time-base PASS: grid và tốc độ giấy đã đủ để quy đổi pixel → mm → ms.","speed_received":speed,
             "rr_small_boxes":round(boxes,2),"horizontal_box_ms":round(box_ms,1),
             "rr_ms":round(rr_ms,1),"heart_rate_bpm":round(hr,1)}
 
@@ -1446,6 +1448,7 @@ def _rr_from_rhythm_region(ecg_image,rhythm_region,speed_mm_s=None):
     # REVIEW preserves the numeric measurement but prevents it from being promoted to verified evidence.
     conv=_convert_rr_to_time(out['median_rr_px'],grid,speed_mm_s);out['conversion']=conv
     out['conversion_status']=conv.get('status','UNRESOLVED')
+    out['timebase_status']='PASS' if grid.get('status')=='PASS' and _normalize_paper_speed(speed_mm_s) is not None else 'UNRESOLVED'
     out['small_boxes']=conv.get('rr_small_boxes');out['rr_ms']=conv.get('rr_ms');out['heart_rate_bpm']=conv.get('heart_rate_bpm')
     if conv.get('status')=='PASS':
         out['measurement_status']='PASS' if out.get('status')=='PASS' and snapqc.get('status')=='PASS' else 'REVIEW'
@@ -1544,8 +1547,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.10"
-PROMPT_VERSION = "ecg-final-rr-hotfix-v11.3.10"
+APP_VERSION = "v11.3.11"
+PROMPT_VERSION = "ecg-timebase-final-v11.3.11"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2747,8 +2750,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · FINAL RR/HR authority")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.10 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · FINAL time-base authority (RR/HR)")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.11 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3000,27 +3003,33 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.10 FINAL — RR/HR Measurement Authority**")
+    st.markdown("**v11.3.11 FINAL — Time-base Authority (RR/HR benchmark)**")
     if rr_authority:
-        _c=st.columns(10)
+        _c=st.columns(11)
         _c[0].metric("Detection QC",rr_authority.get("status","UNRESOLVED"))
         _c[1].metric("Measurement QC",rr_authority.get("measurement_status","UNRESOLVED"))
-        _c[2].metric("R accepted",rr_authority.get("r_accepted",0))
-        _c[3].metric("Snap QC",(rr_authority.get("snap_qc") or {}).get("status","—"))
-        _c[4].metric("RR px",rr_authority.get("rr_px","—"))
-        _c[5].metric("RR boxes",rr_authority.get("small_boxes","—"))
-        _c[6].metric("RR ms",rr_authority.get("rr_ms","—"))
-        _c[7].metric("HR bpm",rr_authority.get("heart_rate_bpm","—"))
-        _c[8].metric("Grid",(rr_authority.get("rhythm_grid") or {}).get("status","—"))
-        _c[9].metric("RR CV",rr_authority.get("snapped_rr_cv",rr_authority.get("rr_cv","—")))
+        _c[2].metric("Time-base",rr_authority.get("timebase_status","UNRESOLVED"))
+        _c[3].metric("R accepted",rr_authority.get("r_accepted",0))
+        _c[4].metric("Snap QC",(rr_authority.get("snap_qc") or {}).get("status","—"))
+        _c[5].metric("RR px",rr_authority.get("rr_px","—"))
+        _c[6].metric("RR boxes",rr_authority.get("small_boxes","—"))
+        _c[7].metric("RR ms",rr_authority.get("rr_ms","—"))
+        _c[8].metric("HR bpm",rr_authority.get("heart_rate_bpm","—"))
+        _c[9].metric("Grid",(rr_authority.get("rhythm_grid") or {}).get("status","—"))
+        _c[10].metric("RR CV",rr_authority.get("snapped_rr_cv",rr_authority.get("rr_cv","—")))
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.10 FINAL — detector/grid giữ nguyên. Conversion nhận trực tiếp paper speed đã xác nhận; Snap REVIEW vẫn hiển thị số nhưng Measurement QC = REVIEW.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.11 — RR chỉ là benchmark. Mục tiêu chính là khóa time-base px→mm→ms để dùng tiếp cho PR/QRS/QT.",width="stretch")
         if rr_authority.get("measurement_status")=="REVIEW":
             st.info("RR/HR đã đo được nhưng Measurement QC = REVIEW: hiển thị số để bác sĩ kiểm tra, chưa coi là verified evidence.")
         elif rr_authority.get("measurement_status")!="PASS":
             st.info("RR chưa có Measurement PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
+        _conv_now=rr_authority.get("conversion") or {}
+        if _conv_now.get("status")=="UNRESOLVED":
+            st.warning(_conv_now.get("message") or f"RR conversion chưa chạy: {_conv_now.get('reason','không rõ lý do')}.")
+        elif _conv_now.get("status")=="PASS":
+            st.success(f"Time-base PASS · speed {_conv_now.get('speed_received')} mm/s · RR {rr_authority.get('small_boxes')} ô · {rr_authority.get('rr_ms')} ms · HR {rr_authority.get('heart_rate_bpm')} bpm.")
         _rg=rr_authority.get("rhythm_grid") or {}
         with st.expander("Rhythm-II grid evidence",expanded=False):
             st.json(_rg)
