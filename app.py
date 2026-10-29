@@ -1509,6 +1509,166 @@ def measurement_authority_conflicts(data,rr_authority,j_st_evidence):
                                   "ai_value":m.get("value"),"ai_small_boxes":m.get("small_boxes")})
     return {"authority":authority,"conflicts":conflicts}
 
+# ----------------- INTERVAL MEASUREMENT AUTHORITY v12.0 -----------------
+def _interval_ms(px,grid_px,speed):
+    if px is None or not grid_px or not speed:return None
+    return float(px)/float(grid_px)*1000.0/float(speed)
+
+def _robust_landmark_consensus(values, max_mad_px, min_n=2):
+    vals=np.asarray([v for v in values if v is not None and np.isfinite(v)],float)
+    if len(vals)<min_n:return {"status":"UNRESOLVED","reason":"too_few_beats","n":len(vals)}
+    med=float(np.median(vals));mad=float(np.median(np.abs(vals-med)))
+    keep=np.abs(vals-med)<=max(max_mad_px,2.5*mad)
+    kept=vals[keep]
+    if len(kept)<min_n:return {"status":"UNRESOLVED","reason":"consensus_failed","n":len(vals)}
+    med=float(np.median(kept));mad=float(np.median(np.abs(kept-med)))
+    status="PASS" if len(kept)>=3 and mad<=max_mad_px else "REVIEW"
+    return {"status":status,"median_px":med,"mad_px":mad,"n":len(kept),"values_px":[round(float(x),2) for x in kept]}
+
+def _beat_interval_landmarks(signal, r_x, rr_px, grid_px):
+    """Landmarks for one beat. Engineering candidates only; morphology labels are not produced."""
+    y=_tb_interp(signal)
+    if y is None:return None
+    y=_tb_smooth(y,3);n=len(y);r=int(round(r_x))
+    rr=max(20.,float(rr_px));g=max(2.,float(grid_px))
+    # local baseline and derivative
+    baseline=_tb_smooth(y,max(9,int(.08*rr)))
+    z=y-baseline; d=np.gradient(y); ad=np.abs(d)
+    # QRS search tightly around phase-locked fiducial
+    qa=max(2,int(r-.18*rr));qb=min(n-3,int(r+.18*rr))
+    if qb-qa<8:return None
+    qseg=ad[qa:qb]; thr=max(float(np.percentile(qseg,55)),.18*float(np.max(qseg)))
+    active=np.where(qseg>=thr)[0]
+    if not len(active):return None
+    # component around strongest QRS derivative
+    peak=qa+int(np.argmax(qseg))
+    left=peak
+    while left>qa and (ad[left]>=thr*.45 or ad[left-1]>=thr*.45):left-=1
+    right=peak
+    while right<qb-1 and (ad[right]>=thr*.45 or ad[right+1]>=thr*.45):right+=1
+    qrs_on=int(left);qrs_off=int(right)
+    qrs_w=qrs_off-qrs_on
+    if qrs_w<.35*g or qrs_w>6.0*g:return None
+
+    # P onset: search 0.08–0.38 RR before QRS onset, exclude immediate QRS foot.
+    pa=max(2,int(qrs_on-.38*rr));pb=max(pa+5,int(qrs_on-.07*rr))
+    p_on=None;p_conf=0.
+    if pb-pa>=8:
+        pz=z[pa:pb];pd=np.abs(d[pa:pb])
+        # P candidate = coherent low-amplitude deflection with derivative above local baseline noise
+        noise=float(np.median(pd))+1e-6
+        pk=int(np.argmax(np.abs(pz)))
+        if abs(pz[pk])>=max(1.5*np.median(np.abs(pz)),1e-6):
+            center=pa+pk
+            x=center
+            pthr=max(noise*1.35,.10*float(np.max(pd)))
+            while x>pa and abs(d[x])>=pthr:x-=1
+            p_on=int(x);p_conf=min(1.,float(np.max(pd))/(3.*noise))
+
+    # T end: search after QRS offset but before next cycle. Find dominant broad T excursion,
+    # then return-to-baseline point with low derivative.
+    ta=min(n-3,int(qrs_off+.06*rr));tb=min(n-3,int(qrs_off+.58*rr))
+    t_end=None;t_conf=0.
+    if tb-ta>=10:
+        tz=z[ta:tb];center=ta+int(np.argmax(np.abs(tz)))
+        amp=abs(float(z[center]));base_noise=float(np.median(np.abs(z[max(0,ta-int(.08*rr)):ta])))+1e-6
+        if amp>=max(2.*base_noise,1e-6):
+            tol=max(base_noise*1.5,.12*amp)
+            dnoise=float(np.median(ad[ta:tb]))+1e-6
+            for x in range(center+1,tb):
+                if abs(z[x])<=tol and ad[x]<=2.0*dnoise:
+                    # require short persistence near baseline
+                    e=min(tb,x+max(3,int(.025*rr)))
+                    if np.mean(np.abs(z[x:e])<=1.5*tol)>=.65:
+                        t_end=int(x);break
+            if t_end is not None:t_conf=min(1.,amp/(4.*base_noise))
+
+    return {"r_x":r,"qrs_on":qrs_on,"qrs_off":qrs_off,"qrs_width_px":qrs_w,
+            "p_on":p_on,"pr_px":(qrs_on-p_on) if p_on is not None else None,"p_conf":round(p_conf,3),
+            "t_end":t_end,"qt_px":(t_end-qrs_on) if t_end is not None else None,"t_conf":round(t_conf,3)}
+
+def build_interval_authority(ecg_image,rhythm_region,rr_authority,speed_mm_s):
+    out={"engine":"interval-authority-v12.0","status":"UNRESOLVED",
+         "qrs":{"status":"UNRESOLVED"},"pr":{"status":"UNRESOLVED"},"qt":{"status":"UNRESOLVED"},
+         "rules":["Engine landmarks own interval measurements; AI coordinates have no authority.",
+                  "QRS, PR and QT have independent QC.","QTc is calculated only when QT and RR time-base are available.",
+                  "No automatic long/short interval diagnosis is produced."]}
+    if not rhythm_region:return out
+    box=rhythm_region.get("box_pixels")
+    if not box:return out
+    crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("RGB"))
+    grid=(rr_authority or {}).get("rhythm_grid") or {}
+    grid_px=grid.get("small_grid_px")
+    speed=_normalize_paper_speed(speed_mm_s)
+    rr_px=(rr_authority or {}).get("median_rr_px")
+    rxs=(rr_authority or {}).get("fiducials_x") or []
+    if grid.get("status")!="PASS" or not grid_px or speed is None or not rr_px or len(rxs)<2:
+        out["reason"]="timebase_or_r_fiducials_not_ready";return out
+
+    y,clqc=_rhythm_waveform_for_r(crop)
+    if y is None:
+        out["reason"]="rhythm_centerline_unresolved";return out
+    beats=[]
+    for rx in rxs:
+        b=_beat_interval_landmarks(y,rx,rr_px,grid_px)
+        if b:beats.append(b)
+    out["beats_examined"]=len(beats);out["centerline_qc"]=clqc
+    if len(beats)<2:
+        out["reason"]="too_few_interval_beats";return out
+
+    # QRS duration consensus
+    q=_robust_landmark_consensus([b["qrs_width_px"] for b in beats],max(2.,.35*grid_px),2)
+    if q.get("median_px") is not None:
+        qms=_interval_ms(q["median_px"],grid_px,speed)
+        plausible=40<=qms<=220
+        q["duration_ms"]=round(qms,1);q["small_boxes"]=round(q["median_px"]/grid_px,2)
+        if not plausible:q["status"]="REVIEW";q["reason"]="engineering_plausibility_guard"
+    out["qrs"]=q
+
+    # PR consensus: only beats where P onset was actually resolved.
+    prvals=[b["pr_px"] for b in beats if b.get("pr_px") is not None and b.get("p_conf",0)>=.35]
+    pr=_robust_landmark_consensus(prvals,max(3.,.55*grid_px),2)
+    if pr.get("median_px") is not None:
+        prms=_interval_ms(pr["median_px"],grid_px,speed)
+        pr["duration_ms"]=round(prms,1);pr["small_boxes"]=round(pr["median_px"]/grid_px,2)
+        if not (70<=prms<=400):pr["status"]="REVIEW";pr["reason"]="engineering_plausibility_guard"
+    out["pr"]=pr
+
+    # QT consensus
+    qtvals=[b["qt_px"] for b in beats if b.get("qt_px") is not None and b.get("t_conf",0)>=.35]
+    qt=_robust_landmark_consensus(qtvals,max(4.,.70*grid_px),2)
+    if qt.get("median_px") is not None:
+        qtms=_interval_ms(qt["median_px"],grid_px,speed)
+        qt["duration_ms"]=round(qtms,1);qt["small_boxes"]=round(qt["median_px"]/grid_px,2)
+        rrms=(rr_authority or {}).get("rr_ms")
+        if rrms:
+            rr_s=float(rrms)/1000.;qt_s=float(qtms)/1000.
+            qt["qtc_bazett_ms"]=round((qt_s/(rr_s**0.5))*1000.,1)
+            qt["qtc_fridericia_ms"]=round((qt_s/(rr_s**(1/3)))*1000.,1)
+            qt["rr_ms_used"]=rrms
+        if not (180<=qtms<=700):qt["status"]="REVIEW";qt["reason"]="engineering_plausibility_guard"
+    out["qt"]=qt
+    out["beat_landmarks"]=beats
+
+    statuses=[out[k].get("status") for k in ("qrs","pr","qt")]
+    out["status"]="PASS" if all(x=="PASS" for x in statuses) else "REVIEW" if any(x in ("PASS","REVIEW") for x in statuses) else "UNRESOLVED"
+    return out
+
+def interval_authority_overlay(ecg_image,rhythm_region,interval_ev):
+    if not rhythm_region or not interval_ev:return None
+    box=rhythm_region["box_pixels"];crop=ecg_image.crop(tuple(map(int,box))).convert("RGB")
+    arr=np.asarray(crop).copy();h,w=arr.shape[:2]
+    # Different vertical extents encode landmarks without color dependence:
+    # P onset = top 35%, QRS onset = full, QRS offset = middle 70%, T end = bottom 35%.
+    for b in interval_ev.get("beat_landmarks",[]):
+        for key,ya,yb,thick in [("p_on",0,.35,1),("qrs_on",0,1,2),("qrs_off",.15,.85,2),("t_end",.65,1,1)]:
+            x=b.get(key)
+            if x is None:continue
+            xx=max(0,min(w-1,int(round(x))))
+            y1=int(ya*h);y2=max(y1+1,int(yb*h))
+            arr[y1:y2,max(0,xx-thick):min(w,xx+thick+1)]=0
+    return Image.fromarray(arr)
+
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
     img = np.array(pil_img)
@@ -1547,8 +1707,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.11"
-PROMPT_VERSION = "ecg-timebase-final-v11.3.11"
+APP_VERSION = "v12.0"
+PROMPT_VERSION = "ecg-interval-authority-v12.0"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -1616,6 +1776,7 @@ SYSTEM_PROMPT += "\nBẢNG 12 CHUYỂN ĐẠO VÀ ĐỐI CHIẾU\n- lead_feature
 SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐOẠN TRÊN)\n- Mọi source=image_text là CHỮ CHUẨN GHI ĐỀ XUẤT do AI đọc, chưa được xác minh. evidence\n  phải chép đúng cụm chữ chứa giá trị và đơn vị (ví dụ '25 mm/s', '10 mm/mV'). Không dùng\n  chiều cao xung hoặc hình dạng sóng làm image_text. Không thấy chữ: giá trị null,\n  source=unknown, evidence=''. Không tự suy ra gain hỗn hợp hoặc gain giảm một nửa.\n- Chỉ quy đổi ms/bpm/mV khi có chuẩn tương ứng trong user_confirmed_calibration.\n  Chưa có chuẩn: value=null, nhưng có thể ghi số ô và mốc nhìn được. ST theo ô nhỏ\n  vẫn được mô tả nếu đường nền/J rõ; chưa rõ kích thước lưới thì để value=null.\n- Mỗi measurement có start_point/end_point/baseline_point: tọa độ x_pct,y_pct 0–100\n  tính trên ẢNH region_id ĐÃ GỬI (không phải ảnh toàn cảnh nếu đo ở crop).\n  Không đoán tọa độ khi mốc mờ: để null và nêu giới hạn.\n  RR/PR/QRS/QT: A=start_point là mốc bắt đầu, B=end_point là mốc kết thúc; B nằm sau A.\n  ST: A là điểm J, N=baseline_point nằm trên TP/PR dùng đối chiếu. Voltage: A/B hai mốc\n  biên độ, N đường nền. HR/QTc tính từ số đo liên quan, không phải tọa độ mới.\n- Chỉ đưa tối đa 8 số đo có ích, ưu tiên RR, PR, QRS và ST bất thường nếu thấy rõ.\n  Không trả 12 số ST chỉ để điền đủ bảng. lead_features.st_measurement_id tham chiếu\n  số đo ST cùng vùng/chuyển đạo; st_small_boxes sao chép từ chính số đo đó.\n  Chưa đo ST: st_measurement_id='', st_small_boxes=null, vẫn mô tả hướng ST nếu rõ.\n- summary_measurement_ids chỉ liệt kê ID số đo dùng trong diễn giải. Số định lượng phải\n  nằm trong measurements; không lặp số có đơn vị ms/bpm/mm/mV trong rhythm, conduction,\n  repolarization, impression/hypotheses. Diễn giải dùng mô tả định tính và ID tham chiếu.\n- conduction_assessment gồm av_status=normal/abnormal/uncertain,\n  qrs_status=narrow/wide/uncertain và pr_measurement_id/qrs_measurement_id.\n  Chưa có PR được quy đổi hợp lệ: av_status=uncertain, không kết luận PR bình thường.\n  Chưa có QRS được quy đổi hợp lệ: qrs_status=uncertain. Không suy ra block từ số ô\n  chưa biết tốc độ. Chẩn đoán dẫn truyền phải phù hợp tuổi và hình thái, không chỉ độ rộng.\n- Trước kết luận: đánh giá đầu QRS/Q bệnh lý, quan hệ biên độ/hình dạng T với QRS,\n  dẫn truyền AV, điện thế và biến đổi tái cực, các chuyển đạo đối diện/liên quan.\n  Dấu thiếu máu cơ tim có thể kín đáo; không bắt buộc đủ ngưỡng ST chênh lên mới cảnh báo.\n  Không gọi mọi V2 đẳng điện là bệnh lý; cần ngữ cảnh và đối chiếu các chuyển đạo.\n  Chỉ từ ECG hiện tại không được suy diễn diễn biến, kết quả chụp mạch hoặc chẩn đoán\n  của ECG về sau. Không gọi T 'khổng lồ' nếu không có số đo biên độ có căn cứ.\n- Các vùng ảnh có khoảng đệm và có thể chồng lặp/hiện một phần chuyển đạo bên cạnh.\n  Dùng nhãn thật để chọn sóng, không tính phần chồng lặp thành nhát mới.\n"
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
+SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -2750,8 +2911,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · FINAL time-base authority (RR/HR)")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.11 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · QRS + PR + QT/QTc Measurement Authority")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v12.0 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2852,7 +3013,7 @@ else:
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
-    digitizer_result=None; digitizer_evidence=None; rr_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
+    digitizer_result=None; digitizer_evidence=None; rr_authority=None; interval_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
         if not DIGITIZER_AVAILABLE:
             st.warning("Chưa nạp được ecg_digitizer.py ("+DIGITIZER_IMPORT_ERROR+"). AI vẫn có thể đọc ảnh gốc; hãy kiểm tra file engine trên GitHub.")
@@ -2979,6 +3140,7 @@ else:
                 st.error(str(exc));st.stop()
             st.image(region["png"],width="stretch");regions.append(region)
             rr_authority=_rr_from_rhythm_region(ecg,region,_normalize_paper_speed(speed))
+            interval_authority=build_interval_authority(ecg,region,rr_authority,_normalize_paper_speed(speed))
     if st.checkbox("Thêm vùng cần xem kỹ",key="image_focus_"+frame_id):
         with st.expander("Vùng chi tiết bổ sung",expanded=True):
             label = st.text_input("Nhãn vùng bổ sung",value="Vùng cần xem kỹ",key="region_focus_label_"+frame_id)
@@ -3003,6 +3165,27 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
+    if interval_authority:
+        if digitizer_evidence is not None:
+            digitizer_evidence["interval_authority"]=interval_authority
+        st.markdown("**v12.0 — Interval Measurement Authority: QRS + PR + QT/QTc**")
+        _q=interval_authority.get("qrs",{});_p=interval_authority.get("pr",{});_t=interval_authority.get("qt",{})
+        _ic=st.columns(9)
+        _ic[0].metric("Overall",interval_authority.get("status","UNRESOLVED"))
+        _ic[1].metric("QRS QC",_q.get("status","UNRESOLVED"))
+        _ic[2].metric("QRS ms",_q.get("duration_ms","—"))
+        _ic[3].metric("PR QC",_p.get("status","UNRESOLVED"))
+        _ic[4].metric("PR ms",_p.get("duration_ms","—"))
+        _ic[5].metric("QT QC",_t.get("status","UNRESOLVED"))
+        _ic[6].metric("QT ms",_t.get("duration_ms","—"))
+        _ic[7].metric("QTc B",_t.get("qtc_bazett_ms","—"))
+        _ic[8].metric("QTc F",_t.get("qtc_fridericia_ms","—"))
+        _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
+        _iov=interval_authority_overlay(ecg,_rhreg,interval_authority)
+        if _iov is not None:
+            st.image(_iov,caption="v12 landmarks: P onset=top tick · QRS onset=full thick · QRS offset=middle thick · T end=bottom tick. Mỗi interval có QC độc lập.",width="stretch")
+        with st.expander("Interval evidence",expanded=False):
+            st.json({k:interval_authority.get(k) for k in ("status","beats_examined","qrs","pr","qt","rules")})
     st.markdown("**v11.3.11 FINAL — Time-base Authority (RR/HR benchmark)**")
     if rr_authority:
         _c=st.columns(11)
@@ -3080,7 +3263,7 @@ else:
                 "prompt_sha256":hashlib.sha256(prompt.encode()).hexdigest(),"app_version":APP_VERSION,
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
-                "measurement_authority":{"rr":rr_authority,
+                "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,
                     "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
                 "requested_provider":provider,"requested_model":model,
                 "image_settings":{"original_size":list(original.size),"oriented_size":list(oriented.size),
