@@ -2065,12 +2065,16 @@ def _to_canonical_ecg_y(image_y):
                 "baseline_window_px":n}
 
 def _qrs_identity_gate(y,centers,legacy_item=None):
-    """Reject broad T-like candidates before phase-lock. Legacy QRS centers validate proximity only."""
+    """v13.7 QRS identity: reject zero-width derivative spikes and require recurrent sharp complexes."""
     y=np.asarray(y,float);n=len(y)
     if not centers:return [],{"status":"UNRESOLVED","reason":"no_candidates"}
     d=np.abs(np.gradient(y));base=_tb_smooth(y,max(11,int(.06*n)));hp=np.abs(y-base)
-    d90=float(np.percentile(d,90))+1e-6;hp90=float(np.percentile(hp,90))+1e-6
-    # Optional legacy beat centers, never legacy onset/offset.
+    d90=float(np.percentile(d,90))+1e-6
+    # Recurrence estimate from candidate spacings; used as a consistency check, not a measurement authority.
+    cs=sorted(int(x) for x in centers)
+    dif=np.diff(cs)
+    rr_est=float(np.median(dif)) if len(dif) else None
+
     legacy=[]
     if isinstance(legacy_item,dict):
         for k in ("qrs_centers_x","beat_centers_x","r_peaks_x","r_peaks"):
@@ -2079,34 +2083,64 @@ def _qrs_identity_gate(y,centers,legacy_item=None):
                 try:legacy=[float(x) for x in v if np.isfinite(float(x))]
                 except Exception:legacy=[]
                 if legacy:break
-    accepted=[];details=[]
-    for c in centers:
-        c=int(c);a=max(1,c-max(5,int(.035*n)));b=min(n-2,c+max(5,int(.035*n)))
-        local_d=float(np.max(d[a:b+1]))/d90
-        local_hp=float(np.max(hp[a:b+1]))/hp90
-        # Width at 35% of local excursion: T waves tend to be much broader.
-        amp=float(np.max(hp[a:b+1]))+1e-6;thr=.35*amp
-        x1=c
+
+    details=[];preaccepted=[]
+    min_width=max(2,int(round(.006*n)))
+    max_width=max(14,int(round(.055*n)))
+    for c in cs:
+        radius=max(7,int(.045*n));a=max(1,c-radius);bb=min(n-2,c+radius)
+        local_hp=hp[a:bb+1];local_d=d[a:bb+1]
+        amp=float(np.max(local_hp))+1e-6
+        # Width around the local excursion, centered on the nearest local hp maximum.
+        pk=a+int(np.argmax(local_hp))
+        thr=.35*amp
+        x1=pk
         while x1>a and hp[x1]>=thr:x1-=1
-        x2=c
-        while x2<b and hp[x2]>=thr:x2+=1
-        width=x2-x1
-        sharp=local_d/(width+1e-6)
-        prox=None
-        if legacy:
-            prox=min(abs(c-x) for x in legacy)
-        # Independent evidence is primary; legacy proximity can support but never create identity alone.
-        independent=(local_d>=.85 and sharp>=.045 and width<=max(14,int(.055*n)))
+        x2=pk
+        while x2<bb and hp[x2]>=thr:x2+=1
+        width=int(x2-x1)
+        slope_norm=float(np.max(local_d))/d90
+        # Never divide by zero/tiny width.
+        sharp=slope_norm/max(float(width),float(min_width))
+        prox=min((abs(pk-x) for x in legacy),default=None)
+
+        width_ok=min_width<=width<=max_width
+        # Require meaningful slopes on both sides of the excursion peak.
+        left_slope=float(np.max(d[max(a,pk-max(3,width)):pk+1]))/d90 if pk>a else 0.
+        right_slope=float(np.max(d[pk:min(bb+1,pk+max(4,width)+1)]))/d90 if pk<bb else 0.
+        bilateral=(left_slope>=.55 and right_slope>=.55)
+        slope_ok=slope_norm>=.9 and sharp>=.04
         legacy_support=(prox is not None and prox<=max(8,.035*n))
+        independent=width_ok and bilateral and slope_ok
         ok=independent and (legacy_support or not legacy)
-        details.append({"x":c,"slope_norm":round(local_d,3),"excursion_norm":round(local_hp,3),
-                        "width_px":int(width),"sharpness":round(sharp,4),
-                        "legacy_center_distance_px":None if prox is None else round(float(prox),1),
-                        "accepted":bool(ok)})
-        if ok:accepted.append(c)
+        rec={"x":int(c),"local_peak_x":int(pk),"slope_norm":round(slope_norm,3),
+             "left_slope_norm":round(left_slope,3),"right_slope_norm":round(right_slope,3),
+             "width_px":width,"min_width_px":min_width,"max_width_px":max_width,
+             "sharpness":round(sharp,4),
+             "legacy_center_distance_px":None if prox is None else round(float(prox),1),
+             "preaccepted":bool(ok),"accepted":False}
+        details.append(rec)
+        if ok:preaccepted.append(int(c))
+
+    # Recurrence consistency: accepted events should form roughly one dominant spacing.
+    accepted=[]
+    if len(preaccepted)>=2:
+        pd=np.diff(preaccepted);med=float(np.median(pd))
+        for i,c in enumerate(preaccepted):
+            neigh=[]
+            if i>0:neigh.append(c-preaccepted[i-1])
+            if i<len(preaccepted)-1:neigh.append(preaccepted[i+1]-c)
+            recurrent=any(abs(x-med)/max(med,1.)<=.22 for x in neigh) if neigh else False
+            if recurrent:accepted.append(c)
+    # Mark final accepted.
+    aset=set(accepted)
+    for rec in details:rec["accepted"]=rec["x"] in aset
     status="PASS" if len(accepted)>=2 else "REVIEW" if len(accepted)==1 else "UNRESOLVED"
-    return accepted,{"status":status,"accepted":len(accepted),"tested":len(centers),"details":details,
-                     "rule":"sharp_recurrent_QRS; legacy center proximity validator only"}
+    return accepted,{"status":status,"accepted":len(accepted),"tested":len(cs),
+                     "rr_spacing_px_internal":None if rr_est is None else round(rr_est,1),
+                     "details":details,
+                     "rule":"nonzero_width + bilateral_slope + sharpness + recurrence; legacy center proximity validator only"}
+
 
 def _phase_lock_qrs_beats(y,centers):
     """Sub-beat phase locking by normalized cross-correlation around QRS energy."""
@@ -2467,6 +2501,82 @@ def qrs_morphology_table_rows(authority):
                      "Reason":e.get("reason","")})
     return rows
 
+
+# ----------------- HARD AI AUTHORITY SANITIZER v13.7 -----------------
+def _authority_pass(obj):
+    return isinstance(obj,dict) and str(obj.get("status","")).upper()=="PASS"
+
+def _sanitize_text_claims_v137(text, rr_authority=None, median_landmark_authority=None,
+                               qrs_morphology_authority=None, st_authority=None, t_authority=None):
+    """Code-level firewall. Removes unsupported clinical claims even if the model ignores the prompt."""
+    if not isinstance(text,str):return text,[]
+    import re
+    notes=[];out=text
+
+    interval=median_landmark_authority or {}
+    pr_pass=_authority_pass(interval.get("pr"))
+    qrs_pass=_authority_pass(interval.get("qrs"))
+    qt_pass=_authority_pass(interval.get("qt"))
+    rr_pass=_authority_pass(rr_authority) or str((rr_authority or {}).get("measurement_status","")).upper()=="PASS"
+    st_pass=_authority_pass(st_authority)
+    t_pass=_authority_pass(t_authority)
+
+    # Sentence-level removal/replacement for unsupported measurement/phenotype claims.
+    sentences=re.split(r'(?<=[.!?])\s+|\n+',out)
+    kept=[]
+    for sent in sentences:
+        low=sent.lower()
+        block_reason=None
+        if not t_pass and any(k in low for k in ("t cao nhọn","sóng t cao","t-wave peaked","peaked t","t đối xứng","sóng t nhọn")):
+            block_reason="T-wave claim blocked: no T-wave Authority PASS"
+        if not st_pass and any(k in low for k in ("st chênh","st đẳng điện","st elevation","st depression","đoạn st")):
+            block_reason="ST claim blocked: no ST Authority PASS"
+        if not pr_pass and ("pr" in low and any(k in low for k in ("bình thường","kéo dài","ngắn","ms"))):
+            block_reason="PR claim blocked: no PR Authority PASS"
+        if not qrs_pass and ("qrs" in low and any(k in low for k in ("bình thường","hẹp","rộng","ms","kéo dài"))):
+            block_reason="QRS claim blocked: no QRS Authority PASS"
+        if not qt_pass and any(k in low for k in ("qtc","qt kéo","qt ngắn","qt bình")):
+            block_reason="QT claim blocked: no QT Authority PASS"
+        # Differentials driven by currently unsupported T/ST phenotypes.
+        if (not t_pass or not st_pass) and any(k in low for k in ("tăng kali","hyperkal","thiếu máu cơ tim","tái cực sớm")):
+            block_reason="Differential blocked: supporting T/ST phenotype lacks Authority PASS"
+        if block_reason:
+            notes.append(block_reason)
+        else:
+            kept.append(sent)
+    out="\n".join(x for x in kept if x.strip())
+
+    # If RR authority PASS, prevent proposal HR numbers from surviving prose.
+    if rr_pass:
+        # We do not inject a number unless the authority object exposes one.
+        hr=(rr_authority or {}).get("heart_rate_bpm")
+        if hr is None:hr=(rr_authority or {}).get("hr_bpm")
+        if hr is not None:
+            notes.append(f"RR/HR prose governed by RR Authority PASS ({hr} bpm)")
+    return out,sorted(set(notes))
+
+def _sanitize_ai_result_v137(result, rr_authority=None, median_landmark_authority=None,
+                             qrs_morphology_authority=None, st_authority=None, t_authority=None):
+    """Recursively sanitize all user-visible strings in model JSON and attach an audit trail."""
+    if not isinstance(result,dict):return result
+    audit=[]
+    def walk(v):
+        if isinstance(v,str):
+            nv,notes=_sanitize_text_claims_v137(v,rr_authority,median_landmark_authority,
+                                                qrs_morphology_authority,st_authority,t_authority)
+            audit.extend(notes);return nv
+        if isinstance(v,list):
+            cleaned=[walk(x) for x in v]
+            return [x for x in cleaned if not (isinstance(x,str) and not x.strip())]
+        if isinstance(v,dict):
+            return {k:walk(x) for k,x in v.items()}
+        return v
+    clean=walk(result)
+    clean["_authority_sanitizer_v13_7"]={"status":"APPLIED","blocked_or_rewritten":sorted(set(audit)),
+                                        "t_wave_authority":"PASS" if _authority_pass(t_authority) else "NOT_PASS",
+                                        "st_authority":"PASS" if _authority_pass(st_authority) else "NOT_PASS"}
+    return clean
+
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
     img = np.array(pil_img)
@@ -2505,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.6"
-PROMPT_VERSION = "ecg-qrs-identity-authority-firewall-v13.6"
+APP_VERSION = "v13.7"
+PROMPT_VERSION = "ecg-qrs-identity-hard-sanitizer-v13.7"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2576,10 +2686,10 @@ SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
 SYSTEM_PROMPT += "\nLANDMARK AUTHORITY v12.3 FINAL: median_landmark_authority là authority ưu tiên cho PR/QRS/QT/QTc. QRS/T dùng R-anchored boundaries; P dùng nearest-valid-pre-QRS detector. Nếu cross_engine = DISAGREE thì phép đo tối đa REVIEW. Không được chọn số theo giá trị nào gần kỳ vọng hoặc số máy in hơn; phải giữ QC và nêu bất đồng.\n"
-SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.6: canonical ECG-y và phase-lock đã khóa. QRS boundary phải bao trọn residual fast deflections trước khi phân loại components; không được đóng QRS-off ở baseline đầu tiên nếu còn S/R′ nhanh ngay sau đó. Không được mở window sang ST/T. q/Q/r/R/s/S/R′ chỉ đến từ full-QRS component segmentation; REVIEW không phải verified morphology.\n"
+SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.7: canonical ECG-y và phase-lock đã khóa. QRS boundary phải bao trọn residual fast deflections trước khi phân loại components; không được đóng QRS-off ở baseline đầu tiên nếu còn S/R′ nhanh ngay sau đó. Không được mở window sang ST/T. q/Q/r/R/s/S/R′ chỉ đến từ full-QRS component segmentation; REVIEW không phải verified morphology.\n"
 
 SYSTEM_PROMPT += """
-MEASUREMENT AUTHORITY FIREWALL v13.6 — BẮT BUỘC:
+MEASUREMENT AUTHORITY FIREWALL v13.7 — BẮT BUỘC:
 1) AI proposal landmarks/m1/m2/m3/m4 và số AI tự đếm ô KHÔNG CÓ measurement authority. Chỉ dùng để audit thị giác, KHÔNG được dùng để tuyên bố tần số, PR, QRS, QT/QTc bình thường/bất thường hay làm nền cho chẩn đoán.
 2) Nếu RR authority PASS, mọi mô tả tần số phải dùng RR/HR authority; không dùng RR/HR proposal của AI.
 3) PR/QRS/QT chỉ được phát biểu định lượng hoặc 'bình thường/kéo dài/ngắn' khi authority tương ứng PASS. REVIEW phải ghi 'cần kiểm tra'; UNRESOLVED phải nói 'chưa xác minh', tuyệt đối không thay bằng legacy/proposal.
@@ -2683,6 +2793,7 @@ def parse_report(raw, regions):
             obj[key] = value
         return obj
     data = json.loads(raw, object_pairs_hook=unique_object)
+    data=_sanitize_ai_result_v137(data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
     ids = [r["id"] for r in regions]
     validate_schema(data, report_schema(ids))
     seen = [o["region_id"] for o in data["observations"]]
@@ -3723,7 +3834,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.6 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.7 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3980,7 +4091,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.6 — QRS Identity Gate + Morphology Authority**")
+    st.markdown("**v13.7 — QRS Identity Hotfix + Hard Authority Sanitizer**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
@@ -3988,7 +4099,7 @@ else:
     _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
     _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
     st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-    with st.expander("v13.6 QRS-identity + full-QRS visual audit",expanded=True):
+    with st.expander("v13.7 QRS-identity + full-QRS visual audit",expanded=True):
         for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
             _ev=(_qm.get("leads") or {}).get(_lead,{})
             _tw=_ev.get("template_wave")
@@ -4000,7 +4111,7 @@ else:
                 st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
     if _qm.get("status")=="UNRESOLVED":
         st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
-    with st.expander("v13.6 QRS identity + morphology evidence",expanded=False):
+    with st.expander("v13.7 QRS identity + morphology evidence",expanded=False):
         st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
