@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.0"
-PROMPT_VERSION = "ecg-ai-landmark-deterministic-measurement-v14.0"
+APP_VERSION = "v14.1"
+PROMPT_VERSION = "ecg-ai-landmark-deterministic-measurement-v14.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2700,6 +2700,13 @@ MEASUREMENT AUTHORITY FIREWALL v13.7 — BẮT BUỘC:
 """
 
 SYSTEM_PROMPT += """
+V14.1 JSON CONTRACT:
+- Trả về MỘT JSON object duy nhất, không Markdown, không code fence.
+- Phải giữ đầy đủ các key mà ứng dụng yêu cầu: quality_summary, technical_review, lead_landmarks, conduction_assessment, summary_measurement_ids, lead_features, hypotheses, observations, measurements, rhythm, conduction, repolarization, impression, verification_needed, urgency.
+- lead_landmarks phải có đúng 12 lead I, II, III, aVR, aVL, aVF, V1-V6, mỗi lead đúng một lần.
+- Tọa độ landmark là x_pct/y_pct 0..100 của CHÍNH ảnh region_id được gửi; mốc không thấy rõ phải là null.
+- Không thêm key ngoài cấu trúc yêu cầu. Không đổi tên key.
+
 V14 LANDMARK-FIRST WORKFLOW — ƯU TIÊN CAO NHẤT:
 - Vai trò AI trong lượt này là NHẬN DIỆN và ĐỀ XUẤT LANDMARK trên ảnh, không phải làm thước đo cuối cùng.
 - lead_landmarks phải có đúng 12 lead. Chọn MỘT nhát đại diện rõ nhất trong vùng chi tiết của từng lead và đánh dấu bằng tọa độ phần trăm của chính region đó.
@@ -3167,8 +3174,12 @@ def arithmetic_checks(data, known, age_years=None):
 
 
 # ----------------- MỘT YÊU CẦU API CHỨA NHIỀU ẢNH -----------------
-def gemini_config(model_name, thinking, schema):
-    options = {"system_instruction": SYSTEM_PROMPT, "max_output_tokens": 12288, "response_mime_type": "application/json", "response_json_schema": schema}
+def gemini_config(model_name, thinking, schema=None):
+    # v14.1: use JSON MIME mode only. The full ECG schema is validated locally in Python.
+    # Some multimodal Gemini endpoints reject complex response_json_schema with HTTP 400.
+    options = {"system_instruction": SYSTEM_PROMPT,
+               "max_output_tokens": 12288,
+               "response_mime_type": "application/json"}
     if model_name.removeprefix("models/") == GEMINI_MODEL:
         options["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
         options["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
@@ -3183,7 +3194,7 @@ def analyze_gemini(api_key, model, regions, prompt, thinking):
     with genai.Client(api_key=api_key.strip(), http_options=types.HttpOptions(
             timeout=REQUEST_TIMEOUT_SECONDS*1000, retry_options=types.HttpRetryOptions(attempts=1))) as client:
         response = client.models.generate_content_stream(model=model, contents=parts,
-            config=gemini_config(model, thinking, report_schema([r["id"] for r in regions])))
+            config=gemini_config(model, thinking))
         finished = False
         try:
             for chunk in response:
@@ -3246,7 +3257,7 @@ def friendly_api_error(error):
     if isinstance(error, TimeoutError) or "timeout" in message or "timed out" in message:
         return "Phân tích quá thời gian chờ. Chưa có báo cáo hoàn chỉnh."
     if code == "400" or "400" in message:
-        return "Yêu cầu không được model hỗ trợ hoặc cấu hình chưa phù hợp (400). Model cần hỗ trợ ảnh và JSON Schema."
+        return "Yêu cầu bị API từ chối (400). v14.1 dùng JSON mode và kiểm tra schema tại Python; nếu còn lỗi hãy xem lịch sử nguồn/API."
     return "Phân tích không hoàn tất hoặc dữ liệu trả về không hợp lệ. Không tự gửi lại yêu cầu."
 
 
@@ -3467,12 +3478,33 @@ def _point_to_px(point, region):
 
 
 def _region_grid_map(regions, ecg_image):
+    """Detect local 1-mm grid in source pixels, then convert it to the exact sent-image coordinate system."""
     out = {}
     for r in regions:
         try:
-            out[r["id"]] = detect_local_small_grid({"box": r.get("box_pixels")}, ecg_image)
-        except Exception:
-            out[r["id"]] = {"status": "UNRESOLVED", "reason": "grid_exception"}
+            g = detect_local_small_grid({"box": r.get("box_pixels")}, ecg_image)
+            g = dict(g or {})
+            g["small_grid_px_source"] = g.get("small_grid_px")
+            box = r.get("box_pixels")
+            sent = r.get("sent_size")
+            if g.get("status") == "PASS" and g.get("small_grid_px") and box and sent:
+                src_w = max(1.0, float(box[2] - box[0]))
+                src_h = max(1.0, float(box[3] - box[1]))
+                sent_w, sent_h = map(float, sent)
+                sx, sy = sent_w/src_w, sent_h/src_h
+                # Time axis is horizontal, voltage axis is vertical.
+                g["small_grid_px_x_sent"] = round(float(g["small_grid_px"]) * sx, 4)
+                g["small_grid_px_y_sent"] = round(float(g["small_grid_px"]) * sy, 4)
+                g["sent_scale_x"] = round(sx, 6)
+                g["sent_scale_y"] = round(sy, 6)
+                g["coordinate_system"] = "sent_image"
+            else:
+                g["small_grid_px_x_sent"] = None
+                g["small_grid_px_y_sent"] = None
+            out[r["id"]] = g
+        except Exception as e:
+            out[r["id"]] = {"status": "UNRESOLVED", "reason": "grid_exception",
+                            "detail": type(e).__name__}
     return out
 
 
@@ -3507,103 +3539,120 @@ def _morphology_from_landmarks(lm, region):
 
 
 def build_v14_measurement_authority(data, regions, ecg_image, known):
-    """AI locates landmarks; code alone converts coordinates to boxes/ms/mm/mV."""
+    """v14.1: AI identifies landmarks; deterministic code measures them in the sent-image coordinate system."""
     if not isinstance(data, dict):
-        return {"status": "UNRESOLVED", "leads": {}, "rows": [], "reason": "no_ai_landmarks"}
-    rmap = {r["id"]: r for r in regions}
-    gmap = _region_grid_map(regions, ecg_image)
-    speed = known.get("speed_mm_s")
-    leads, rows, pass_n, review_n = {}, [], 0, 0
+        return {"status":"UNRESOLVED","leads":{},"rows":[],"reason":"no_ai_landmarks"}
 
-    for lm in data.get("lead_landmarks", []):
-        lead = lm.get("lead")
-        region = rmap.get(lm.get("region_id"))
-        quality = lm.get("quality")
-        ev = {"lead": lead, "status": "UNRESOLVED", "quality": quality,
-              "region_id": lm.get("region_id"), "cycle_id": lm.get("cycle_id"),
-              "morphology": None, "measurements": {}, "grid": None}
-        if region is None or quality == "not_visible":
-            ev["reason"] = "region_or_landmark_not_visible"
-            leads[lead] = ev
-            continue
+    rmap={r["id"]:r for r in regions}
+    gmap=_region_grid_map(regions,ecg_image)
+    speed=known.get("speed_mm_s")
+    leads,rows={},[]
+    pass_n=review_n=0
 
-        grid = gmap.get(region["id"], {})
-        ev["grid"] = grid
-        pxmm = grid.get("small_grid_px") if grid.get("status") == "PASS" else None
-        morph = _morphology_from_landmarks(lm, region)
-        ev["morphology"] = morph
-        pts = {k: _point_to_px(lm.get(k), region) for k in (
-            "p_on", "p_peak", "p_off", "qrs_on", "q_peak", "r_peak", "s_peak",
-            "r_prime_peak", "j_point", "t_peak", "t_end", "baseline_point")}
+    def finite_point(p):
+        if p is None:return False
+        return bool(np.all(np.isfinite(p)))
 
-        def time_measure(a, b):
-            if pts.get(a) is None or pts.get(b) is None:
-                return None
-            dx = float(pts[b][0] - pts[a][0])
-            if dx <= 0:
-                return {"status": "REVIEW", "reason": "landmark_order", "px": round(dx, 2)}
-            if not pxmm or not speed:
-                return {"status": "REVIEW", "reason": "grid_or_speed_not_pass", "px": round(dx, 2)}
-            boxes = dx / pxmm
-            return {"status": "PASS", "px": round(dx, 2), "small_boxes": round(boxes, 2),
-                    "ms": round(boxes * 1000.0 / float(speed), 1)}
+    for lm in data.get("lead_landmarks",[]):
+        lead=lm.get("lead"); region=rmap.get(lm.get("region_id")); quality=lm.get("quality")
+        ev={"lead":lead,"status":"UNRESOLVED","quality":quality,"region_id":lm.get("region_id"),
+            "cycle_id":lm.get("cycle_id"),"morphology":None,"measurements":{},"grid":None,
+            "geometry_qc":"UNRESOLVED"}
+        if region is None or quality=="not_visible":
+            ev["reason"]="region_or_landmark_not_visible";leads[lead]=ev;continue
+
+        grid=gmap.get(region["id"],{});ev["grid"]=grid
+        pxmm_x=grid.get("small_grid_px_x_sent") if grid.get("status")=="PASS" else None
+        pxmm_y=grid.get("small_grid_px_y_sent") if grid.get("status")=="PASS" else None
+        pts={k:_point_to_px(lm.get(k),region) for k in
+             ("p_on","p_peak","p_off","qrs_on","q_peak","r_peak","s_peak",
+              "r_prime_peak","j_point","t_peak","t_end","baseline_point")}
+
+        # Hard landmark geometry checks before any quantitative authority.
+        issues=[]
+        q0,j,tend=pts.get("qrs_on"),pts.get("j_point"),pts.get("t_end")
+        if finite_point(q0) and finite_point(j) and not (q0[0] < j[0]):issues.append("QRS-on>=J")
+        if finite_point(j) and finite_point(pts.get("t_peak")) and not (j[0] < pts["t_peak"][0]):issues.append("T-peak<=J")
+        if finite_point(j) and finite_point(tend) and not (j[0] < tend[0]):issues.append("T-end<=J")
+        if finite_point(pts.get("p_on")) and finite_point(q0) and not (pts["p_on"][0] < q0[0]):issues.append("P-on>=QRS-on")
+        for name in ("q_peak","r_peak","s_peak","r_prime_peak"):
+            p=pts.get(name)
+            if finite_point(p) and finite_point(q0) and finite_point(j) and not (q0[0] <= p[0] <= j[0]):
+                issues.append(name+"_outside_QRS")
+        ev["geometry_issues"]=issues
+        ev["geometry_qc"]="PASS" if not issues else "REVIEW"
+
+        morph=_morphology_from_landmarks(lm,region)
+        if issues and morph.get("status")=="PASS":
+            morph=dict(morph);morph["status"]="REVIEW";morph["reason"]=";".join(issues)
+        ev["morphology"]=morph
+
+        def time_measure(a,b):
+            pa,pb=pts.get(a),pts.get(b)
+            if not finite_point(pa) or not finite_point(pb):return None
+            dx=float(pb[0]-pa[0])
+            if dx<=0:return {"status":"REVIEW","reason":"landmark_order","px":round(dx,2)}
+            if not pxmm_x or not speed:
+                return {"status":"REVIEW","reason":"local_grid_x_or_speed_not_pass","px":round(dx,2)}
+            boxes=dx/float(pxmm_x)
+            return {"status":"PASS","px":round(dx,2),"small_boxes":round(boxes,2),
+                    "ms":round(boxes*1000.0/float(speed),1)}
 
         def amp_measure(pkey):
-            if pts.get(pkey) is None or pts.get("baseline_point") is None:
-                return None
-            dy = float(pts["baseline_point"][1] - pts[pkey][1])
-            if not pxmm:
-                return {"status": "REVIEW", "reason": "grid_not_pass", "px": round(dy, 2)}
-            mm = dy / pxmm
-            gain = _lead_gain(lead, known)
-            out = {"status": "PASS" if gain else "REVIEW", "px": round(dy, 2), "mm": round(mm, 2)}
-            if gain:
-                out["mV"] = round(mm / float(gain), 3)
-            else:
-                out["reason"] = "gain_not_confirmed"
+            p,base=pts.get(pkey),pts.get("baseline_point")
+            if not finite_point(p) or not finite_point(base):return None
+            dy=float(base[1]-p[1])  # positive ECG deflection => positive value
+            if not pxmm_y:
+                return {"status":"REVIEW","reason":"local_grid_y_not_pass","px":round(dy,2)}
+            mm=dy/float(pxmm_y);gain=_lead_gain(lead,known)
+            out={"status":"PASS" if gain else "REVIEW","px":round(dy,2),"mm":round(mm,2)}
+            if gain:out["mV"]=round(mm/float(gain),3)
+            else:out["reason"]="gain_not_confirmed"
             return out
 
-        for nm, a, b in (("PR", "p_on", "qrs_on"), ("QRS", "qrs_on", "j_point"), ("QT", "qrs_on", "t_end")):
-            m = time_measure(a, b)
-            if m:
-                ev["measurements"][nm] = m
-        for nm, pkey in (("R_amp", "r_peak"), ("S_amp", "s_peak"), ("T_amp", "t_peak"), ("ST_J", "j_point")):
-            m = amp_measure(pkey)
-            if m:
-                ev["measurements"][nm] = m
+        for nm,a1,b1 in (("PR","p_on","qrs_on"),("QRS","qrs_on","j_point"),("QT","qrs_on","t_end")):
+            m=time_measure(a1,b1)
+            if m:ev["measurements"][nm]=m
+        for nm,pkey in (("R_amp","r_peak"),("S_amp","s_peak"),("T_amp","t_peak"),("ST_J","j_point")):
+            m=amp_measure(pkey)
+            if m:ev["measurements"][nm]=m
 
-        statuses = [m.get("status") for m in ev["measurements"].values()]
-        if quality == "clear" and morph.get("status") == "PASS" and "PASS" in statuses:
-            ev["status"] = "PASS"
-            pass_n += 1
-        elif quality != "not_visible" and (statuses or morph.get("status") != "UNRESOLVED"):
-            ev["status"] = "REVIEW"
-            review_n += 1
+        # A geometry conflict downgrades all measurements from this lead.
+        if issues:
+            for m in ev["measurements"].values():
+                if m.get("status")=="PASS":
+                    m["status"]="REVIEW";m["reason"]="landmark_geometry_conflict"
+
+        statuses=[m.get("status") for m in ev["measurements"].values()]
+        if quality=="clear" and ev["geometry_qc"]=="PASS" and morph.get("status")=="PASS" and "PASS" in statuses:
+            ev["status"]="PASS";pass_n+=1
+        elif quality!="not_visible" and (statuses or morph.get("status")!="UNRESOLVED"):
+            ev["status"]="REVIEW";review_n+=1
         else:
-            ev["reason"] = "insufficient_landmarks"
-        leads[lead] = ev
+            ev["reason"]="insufficient_landmarks"
+        leads[lead]=ev
 
-        row = {"Lead": lead, "QC": ev["status"], "AI morphology": lm.get("morphology_candidate") or "—",
-               "Code sequence": morph.get("sequence") or "—", "Grid": grid.get("status", "UNRESOLVED")}
-        for nm in ("PR", "QRS", "QT"):
-            m = ev["measurements"].get(nm)
-            row[nm + " ms"] = m.get("ms") if m else None
-        for nm in ("R_amp", "S_amp", "T_amp"):
-            m = ev["measurements"].get(nm)
-            row[nm + " mV"] = m.get("mV") if m else None
-        stj = ev["measurements"].get("ST_J")
-        row["ST@J mm"] = stj.get("mm") if stj else None
+        row={"Lead":lead,"QC":ev["status"],"Landmark QC":ev["geometry_qc"],
+             "AI morphology":lm.get("morphology_candidate") or "—",
+             "Code sequence":morph.get("sequence") or "—",
+             "Grid":grid.get("status","UNRESOLVED")}
+        for nm in ("PR","QRS","QT"):
+            m=ev["measurements"].get(nm);row[nm+" ms"]=m.get("ms") if m and m.get("status")=="PASS" else None
+        for nm in ("R_amp","S_amp","T_amp"):
+            m=ev["measurements"].get(nm);row[nm+" mV"]=m.get("mV") if m and m.get("status")=="PASS" else None
+        stj=ev["measurements"].get("ST_J")
+        row["ST@J mm"]=stj.get("mm") if stj and stj.get("status")=="PASS" else None
         rows.append(row)
 
-    overall = "PASS" if pass_n >= 8 else "REVIEW" if pass_n + review_n >= 6 else "UNRESOLVED"
-    return {"engine": "v14-ai-landmark-deterministic-measurement", "status": overall,
-            "pass_count": pass_n, "review_count": review_n, "leads": leads, "rows": rows,
-            "region_grids": gmap,
-            "rules": ["AI proposes landmark identity/coordinates.",
-                      "Code converts pixels to boxes/ms/mm/mV.",
-                      "Only PASS local grid plus user-confirmed speed/gain can create quantitative authority.",
-                      "AI-written numeric values never override this table."]}
-
+    overall="PASS" if pass_n>=8 else "REVIEW" if pass_n+review_n>=6 else "UNRESOLVED"
+    return {"engine":"v14.1-ai-landmark-scale-safe-measurement","status":overall,
+            "pass_count":pass_n,"review_count":review_n,"leads":leads,"rows":rows,
+            "region_grids":gmap,
+            "rules":["AI proposes identity and coordinates only.",
+                     "Python validates landmark geometry before measurement.",
+                     "Horizontal and vertical sent-image grid scales are converted independently.",
+                     "Only PASS local grid + confirmed speed/gain can create quantitative authority.",
+                     "AI-written numbers never override deterministic measurements."]}
 
 def _annotate_v14_landmarks(region, lm):
     img = Image.open(io.BytesIO(region["png"])).convert("RGB")
@@ -3721,7 +3770,7 @@ def render_result(result):
         st.write(data["quality_summary"])
         _v14 = result.get("v14_measurement_authority") or {}
         _tc = data.get("technical_review") or {}
-        st.subheader("v14 — AI Landmark → Deterministic Measurement")
+        st.subheader("v14.1 — AI Landmark → Scale-safe Deterministic Measurement")
         _c = st.columns(4)
         _c[0].metric("Measurement QC", _v14.get("status", "UNRESOLVED"))
         _c[1].metric("PASS leads", _v14.get("pass_count", 0))
@@ -4070,8 +4119,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark Proposal → Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.0 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
