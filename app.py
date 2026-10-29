@@ -1183,28 +1183,137 @@ def _snap_phase_fiducials_to_qrs(crop,y,matched,rr_guess):
                     "max_offset_deviation_px":round(max_dev,2),"search_radius_px":rad,
                     "offsets_px":offsets}
 
+def _rhythm_grid_peak_positions(profile):
+    """Locate vertical red-grid lines from a 1-D column profile."""
+    v=np.asarray(profile,dtype=float)
+    if len(v)<40:return []
+    # Remove illumination/page-fold trend while preserving narrow grid lines.
+    k=max(11,int(round(len(v)*.025)));k+=(k%2==0)
+    trend=np.convolve(v,np.ones(k)/k,mode="same")
+    z=v-trend
+    # robust local peaks; do not require every 1-mm line to be visible
+    thr=float(np.percentile(z,72))
+    peaks=[]
+    for i in range(2,len(z)-2):
+        if z[i]>=thr and z[i]>=z[i-1] and z[i]>=z[i+1] and z[i]>=z[i-2] and z[i]>=z[i+2]:
+            if not peaks or i-peaks[-1]>=2:peaks.append(i)
+            elif z[i]>z[peaks[-1]]:peaks[-1]=i
+    return peaks
+
+def _grid_spacing_from_peak_diffs(peaks):
+    """Infer fundamental 1-mm spacing from line-to-line gaps, allowing missing lines."""
+    if len(peaks)<8:return None
+    d=np.diff(np.asarray(peaks,float))
+    d=d[(d>=2.5)&(d<=45)]
+    if len(d)<6:return None
+    # Candidate small-grid periods; score gaps against integer multiples 1..6.
+    lo=max(3.,float(np.percentile(d,8))*.65)
+    hi=min(18.,float(np.percentile(d,55))*1.15)
+    if hi<=lo:hi=lo+5
+    candidates=np.linspace(lo,hi,180)
+    best=None
+    for c in candidates:
+        mult=np.clip(np.rint(d/c),1,6)
+        residual=np.abs(d-mult*c)/c
+        support=float(np.mean(residual<=.18))
+        direct=float(np.mean((mult==1)&(residual<=.18)))
+        score=.72*support+.28*direct-.18*float(np.median(residual))
+        if best is None or score>best[0]:
+            best=(score,float(c),support,direct,float(np.median(residual)))
+    if best is None:return None
+    return {"small_px":best[1],"support":best[2],"direct_fraction":best[3],"residual":best[4]}
+
+def _grid_spacing_autocorr(profile):
+    """Independent small-grid period from autocorrelation, favoring the fundamental over 5-mm harmonic."""
+    v=np.asarray(profile,dtype=float)
+    if len(v)<80:return None
+    k=max(13,int(round(len(v)*.035)));k+=(k%2==0)
+    z=v-np.convolve(v,np.ones(k)/k,mode="same")
+    z=z-np.mean(z)
+    vals=[]
+    maxlag=min(70,len(z)//4)
+    for lag in range(3,maxlag+1):
+        a=z[:-lag];b=z[lag:];den=np.std(a)*np.std(b)
+        vals.append((lag,float(np.mean(a*b)/den) if den>1e-9 else 0.))
+    if not vals:return None
+    d=dict(vals);peaks=[]
+    for lag,val in vals[1:-1]:
+        if val>=d.get(lag-1,-9) and val>=d.get(lag+1,-9):peaks.append((lag,val))
+    strong=[p for p in peaks if p[1]>=.16]
+    if not strong:return None
+    # ECG grid fundamental is the shortest convincing periodic peak; validate harmonic later.
+    lag,val=min(strong,key=lambda z:z[0])
+    return {"small_px":float(lag),"confidence":float(val)}
+
+def _grid_major_validation(profile,small):
+    """Search autocorrelation around 5× small spacing."""
+    if not small:return None
+    v=np.asarray(profile,dtype=float);v=v-np.mean(v)
+    lo=max(8,int(round(4.2*small)));hi=min(int(round(5.8*small)),len(v)//3)
+    vals=[]
+    for lag in range(lo,hi+1):
+        a=v[:-lag];b=v[lag:];den=np.std(a)*np.std(b)
+        vals.append((lag,float(np.mean(a*b)/den) if den>1e-9 else 0.))
+    if not vals:return None
+    lag,conf=max(vals,key=lambda z:z[1])
+    return {"major_px":float(lag),"ratio":float(lag/small),"confidence":float(conf)}
+
 def _rhythm_horizontal_grid(crop):
-    """Conservative horizontal 1-mm spacing for Rhythm II.
-    Uses vertical red grid-line periodicity and validates a 5x major-grid harmonic.
+    """v11.3.7: consensus horizontal 1-mm scale for Rhythm II.
+    Evidence: red-line peak gaps + autocorrelation + 5× major-grid harmonic.
     """
-    f=crop.astype(float); h,w=f.shape[:2]
-    red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2]); gray=f.mean(axis=2)
-    # vertical grid lines create column peaks
-    profile=np.mean(red,axis=0)+.22*(255-np.mean(gray,axis=0))
-    positions=_profile_line_positions(profile)
-    small,support=_fundamental_spacing(positions)
-    if small is None:return {"status":"UNRESOLVED","reason":"small_grid_not_found"}
-    major,major_conf=_major_grid_spacing(profile,small)
-    ratio=(major/small) if major else None
-    major_ok=bool(ratio is not None and 4.45<=ratio<=5.55)
+    f=crop.astype(float);h,w=f.shape[:2]
+    red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2]);gray=f.mean(axis=2)
+    # Average over central vertical band to reduce text/border contamination.
+    ya=int(.12*h);yb=int(.88*h)
+    profile=np.mean(red[ya:yb],axis=0)+.16*(255-np.mean(gray[ya:yb],axis=0))
+    peaks=_rhythm_grid_peak_positions(profile)
+    hist=_grid_spacing_from_peak_diffs(peaks)
+    ac=_grid_spacing_autocorr(profile)
+
+    candidates=[]
+    if hist:candidates.append(("hist",hist["small_px"]))
+    if ac:candidates.append(("autocorr",ac["small_px"]))
+    if not candidates:
+        return {"status":"UNRESOLVED","reason":"no_horizontal_grid_period","peak_count":len(peaks)}
+
+    # Consensus must agree to within 22%; if only one estimator exists, remain REVIEW at best.
+    if hist and ac:
+        agree=abs(hist["small_px"]-ac["small_px"])/max(hist["small_px"],ac["small_px"])<=.22
+        small=float(np.median([hist["small_px"],ac["small_px"]]))
+    else:
+        agree=False
+        small=float(candidates[0][1])
+
+    major=_grid_major_validation(profile,small)
+    major_ok=bool(major and 4.45<=major["ratio"]<=5.55 and major["confidence"]>=.12)
     enough=(w/small)>=35
-    if support>=.68 and major_ok and enough:status="PASS"
-    elif support>=.55 and major_ok and enough:status="REVIEW"
-    else:status="UNRESOLVED"
-    return {"status":status,"small_grid_px":round(float(small),3) if status!="UNRESOLVED" else None,
-            "fine_support":round(float(support),3),"major_grid_px":round(float(major),3) if major else None,
-            "major_to_small_ratio":round(float(ratio),3) if ratio else None,
-            "major_validator":major_ok,"estimated_small_boxes":round(w/small,1),"reason":None if status!="UNRESOLVED" else "rhythm_grid_not_cross_validated"}
+    hist_ok=bool(hist and hist["support"]>=.62 and hist["residual"]<=.20)
+    ac_ok=bool(ac and ac["confidence"]>=.16)
+
+    # Three-way policy: PASS requires estimator agreement + credible major harmonic.
+    if agree and hist_ok and ac_ok and major_ok and enough:
+        status="PASS"
+    elif (hist_ok or ac_ok) and major_ok and enough:
+        status="REVIEW"
+    else:
+        status="UNRESOLVED"
+
+    return {"status":status,"small_grid_px":round(small,3) if status!="UNRESOLVED" else None,
+            "peak_count":len(peaks),
+            "hist_small_px":round(hist["small_px"],3) if hist else None,
+            "hist_support":round(hist["support"],3) if hist else None,
+            "hist_residual":round(hist["residual"],3) if hist else None,
+            "autocorr_small_px":round(ac["small_px"],3) if ac else None,
+            "autocorr_confidence":round(ac["confidence"],3) if ac else None,
+            "estimators_agree":bool(agree),
+            "major_grid_px":round(major["major_px"],3) if major else None,
+            "major_to_small_ratio":round(major["ratio"],3) if major else None,
+            "major_confidence":round(major["confidence"],3) if major else None,
+            "major_validator":major_ok,
+            "estimated_small_boxes":round(w/small,1),
+            "reason":None if status!="UNRESOLVED" else "horizontal_grid_consensus_failed"}
+
 
 def _convert_rr_to_time(rr_px,grid,speed_mm_s):
     if rr_px is None:return {"status":"UNRESOLVED","reason":"no_rr_px"}
@@ -1365,8 +1474,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.6"
-PROMPT_VERSION = "ecg-snapped-rr-ms-hr-v11.3.6"
+APP_VERSION = "v11.3.7"
+PROMPT_VERSION = "ecg-rhythm-grid-consensus-v11.3.7"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2568,8 +2677,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · snapped QRS fiducials + RR→ms→HR")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.6 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Rhythm-II horizontal-grid consensus + RR/HR")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.7 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2821,7 +2930,7 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.6 — Measurement Authority: snapped QRS → RR → ms → HR**")
+    st.markdown("**v11.3.7 — Measurement Authority: snapped QRS + grid consensus → RR/HR**")
     if rr_authority:
         _c=st.columns(9)
         _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
@@ -2836,9 +2945,13 @@ else:
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.6 — tick ngắn = phase prediction; vạch mảnh = fiducial đã snap vào dominant QRS extremum; 2 vạch đậm = cặp RR được chọn. RR→ms→HR chỉ xuất khi horizontal grid PASS.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.7 — R detector giữ nguyên v11.3.6. RR→ms→HR chỉ mở khi peak-spacing + autocorrelation + major-grid 5× đồng thuận.",width="stretch")
         if rr_authority.get("status")!="PASS":
             st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
+        _rg=rr_authority.get("rhythm_grid") or {}
+        with st.expander("Rhythm-II grid evidence",expanded=False):
+            st.json(_rg)
+            st.caption("Grid PASS cần: peak-spacing và autocorrelation đồng thuận, đồng thời có major-grid xấp xỉ 5× small-grid.")
     if any(min(r["sent_size"]) < 128 for r in regions):
         st.warning("Có vùng ảnh hẹp hoặc độ phân giải thấp. Phóng lớn không khôi phục chi tiết đã mất; cân nhắc ảnh gốc rõ hơn.")
     st.subheader("3. Phân tích")
