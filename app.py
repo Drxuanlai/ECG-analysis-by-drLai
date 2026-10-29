@@ -772,6 +772,78 @@ def build_j_st_evidence(result,ecg_image,qrs_ev,centerline_ev,recording_speed=No
     out["status"]="PASS" if n>=8 else "REVIEW" if n+r>=6 else "UNRESOLVED"
     return out
 
+# ----------------- MEASUREMENT AUTHORITY ENGINE v11.3 -----------------
+def _rr_from_digitizer_rhythm(result):
+    """Use Digitizer's II-rhythm centerline when available; no AI coordinates."""
+    item=(result or {}).get("leads",{}).get("II-rhythm",{})
+    sig=item.get("signal_px")
+    if sig is None:return {"status":"UNRESOLVED","reason":"no_digitizer_rhythm"}
+    cleaned,clqc=clean_centerline_signal(sig)
+    if clqc.get("status")=="FAIL":return {"status":"UNRESOLVED","reason":"rhythm_centerline_fail","centerline_qc":clqc}
+    y=_tb_interp(cleaned)
+    if y is None:return {"status":"UNRESOLVED","reason":"no_centerline"}
+    y=_tb_smooth(y,3); n=len(y); base=_tb_smooth(y,max(9,int(n*.025)))
+    slope=np.abs(np.gradient(y)); hp=np.abs(y-base)
+    score=_tb_smooth(slope,3)+.30*_tb_smooth(hp,3)
+    dist=max(18,int(n*.055));thr=float(np.percentile(score,87));cand=[]
+    for pp in np.argsort(score)[::-1]:
+        pp=int(pp)
+        if score[pp]<thr:break
+        if .03*n<pp<.97*n and all(abs(pp-q)>=dist for q in cand):cand.append(pp)
+        if len(cand)>=24:break
+    cand=sorted(cand)
+    if len(cand)<3:return {"status":"UNRESOLVED","reason":"fewer_than_3_qrs_fiducials","candidates":cand}
+    # choose periodic candidates with steep local QRS morphology; broad T peaks score lower on slope.
+    dif=np.diff(cand); med=float(np.median(dif)); good=[]
+    for p in cand:
+        r=max(3,int(.012*n));a=max(0,p-r);b=min(n,p+r+1)
+        if float(np.max(slope[a:b]))>=float(np.percentile(slope,72)):good.append(p)
+    if len(good)<3:return {"status":"UNRESOLVED","reason":"qrs_steepness_gate","candidates":good}
+    rr=np.diff(good); rrmed=float(np.median(rr)); keep=[good[0]]
+    for p in good[1:]:
+        d=p-keep[-1]
+        if .70*rrmed<=d<=1.30*rrmed:keep.append(p)
+    if len(keep)<3:keep=good
+    rr=np.diff(keep);med=float(np.median(rr));cv=float(np.std(rr)/med) if len(rr)>=2 and med>0 else 1.
+    status="PASS" if len(keep)>=5 and cv<=.12 else "REVIEW" if len(keep)>=3 and cv<=.22 else "UNRESOLVED"
+    if status=="UNRESOLVED":return {"status":status,"reason":"unstable_rr_chain","fiducials_x":keep,"rr_cv":round(cv,3)}
+    k=int(np.argmin(np.abs(rr-med)));a=int(keep[k]);b=int(keep[k+1])
+    return {"status":status,"source":"engine","fiducials_x":keep,"beats":len(keep),
+            "start_x":a,"end_x":b,"rr_px":round(float(b-a),2),"median_rr_px":round(med,2),
+            "rr_cv":round(cv,3),"consecutive":True,"small_boxes":None,"rr_ms":None,
+            "conversion_status":"PENDING_VERIFIED_RHYTHM_GRID","centerline_qc":clqc}
+
+def rr_authority_overlay_from_digitizer(ecg_image,result,rr):
+    item=(result or {}).get("leads",{}).get("II-rhythm",{})
+    box=item.get("box")
+    if not box or rr.get("status")=="UNRESOLVED":return None
+    crop=ecg_image.crop(tuple(map(int,box))).convert("RGB");arr=np.asarray(crop).copy()
+    work=item.get("work_size") or [len(item.get("signal_px",[])),crop.height]
+    sx=crop.width/max(1.,float(work[0]))
+    for x in (rr.get("start_x"),rr.get("end_x")):
+        if x is None:continue
+        xx=max(0,min(crop.width-1,int(round(x*sx))))
+        arr[:,max(0,xx-2):min(crop.width,xx+3)]=0
+    return Image.fromarray(arr)
+
+def measurement_authority_conflicts(data,rr_authority,j_st_evidence):
+    authority={"rr_ms":{"status":(rr_authority or {}).get("status","UNRESOLVED"),
+                        "value":(rr_authority or {}).get("rr_ms"),"source":"engine"}}
+    for lead,e in (j_st_evidence or {}).get("leads",{}).items():
+        authority[f"st_mm:{lead}"]={"status":e.get("status","UNRESOLVED"),
+                                   "small_boxes":e.get("st_at_j_small_boxes") if e.get("status")=="PASS" else None,
+                                   "source":"engine"}
+    conflicts=[]
+    for m in data.get("measurements",[]):
+        p=m.get("parameter");lead=m.get("lead","");key=f"st_mm:{lead}" if p=="st_mm" else p
+        if p in ("rr_ms","st_mm"):
+            a=authority.get(key)
+            if not a or a.get("status")!="PASS":
+                conflicts.append({"measurement_id":m.get("id"),"status":"BLOCKED",
+                                  "reason":"engine_authority_not_PASS","parameter":p,"lead":lead,
+                                  "ai_value":m.get("value"),"ai_small_boxes":m.get("small_boxes")})
+    return {"authority":authority,"conflicts":conflicts}
+
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
     img = np.array(pil_img)
@@ -810,8 +882,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.2d"
-PROMPT_VERSION = "ecg-calibration-pulse-mask-v11.2d"
+APP_VERSION = "v11.3"
+PROMPT_VERSION = "ecg-measurement-authority-v11.3"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -879,6 +951,7 @@ SYSTEM_PROMPT += "\nBẢNG 12 CHUYỂN ĐẠO VÀ ĐỐI CHIẾU\n- lead_feature
 SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐOẠN TRÊN)\n- Mọi source=image_text là CHỮ CHUẨN GHI ĐỀ XUẤT do AI đọc, chưa được xác minh. evidence\n  phải chép đúng cụm chữ chứa giá trị và đơn vị (ví dụ '25 mm/s', '10 mm/mV'). Không dùng\n  chiều cao xung hoặc hình dạng sóng làm image_text. Không thấy chữ: giá trị null,\n  source=unknown, evidence=''. Không tự suy ra gain hỗn hợp hoặc gain giảm một nửa.\n- Chỉ quy đổi ms/bpm/mV khi có chuẩn tương ứng trong user_confirmed_calibration.\n  Chưa có chuẩn: value=null, nhưng có thể ghi số ô và mốc nhìn được. ST theo ô nhỏ\n  vẫn được mô tả nếu đường nền/J rõ; chưa rõ kích thước lưới thì để value=null.\n- Mỗi measurement có start_point/end_point/baseline_point: tọa độ x_pct,y_pct 0–100\n  tính trên ẢNH region_id ĐÃ GỬI (không phải ảnh toàn cảnh nếu đo ở crop).\n  Không đoán tọa độ khi mốc mờ: để null và nêu giới hạn.\n  RR/PR/QRS/QT: A=start_point là mốc bắt đầu, B=end_point là mốc kết thúc; B nằm sau A.\n  ST: A là điểm J, N=baseline_point nằm trên TP/PR dùng đối chiếu. Voltage: A/B hai mốc\n  biên độ, N đường nền. HR/QTc tính từ số đo liên quan, không phải tọa độ mới.\n- Chỉ đưa tối đa 8 số đo có ích, ưu tiên RR, PR, QRS và ST bất thường nếu thấy rõ.\n  Không trả 12 số ST chỉ để điền đủ bảng. lead_features.st_measurement_id tham chiếu\n  số đo ST cùng vùng/chuyển đạo; st_small_boxes sao chép từ chính số đo đó.\n  Chưa đo ST: st_measurement_id='', st_small_boxes=null, vẫn mô tả hướng ST nếu rõ.\n- summary_measurement_ids chỉ liệt kê ID số đo dùng trong diễn giải. Số định lượng phải\n  nằm trong measurements; không lặp số có đơn vị ms/bpm/mm/mV trong rhythm, conduction,\n  repolarization, impression/hypotheses. Diễn giải dùng mô tả định tính và ID tham chiếu.\n- conduction_assessment gồm av_status=normal/abnormal/uncertain,\n  qrs_status=narrow/wide/uncertain và pr_measurement_id/qrs_measurement_id.\n  Chưa có PR được quy đổi hợp lệ: av_status=uncertain, không kết luận PR bình thường.\n  Chưa có QRS được quy đổi hợp lệ: qrs_status=uncertain. Không suy ra block từ số ô\n  chưa biết tốc độ. Chẩn đoán dẫn truyền phải phù hợp tuổi và hình thái, không chỉ độ rộng.\n- Trước kết luận: đánh giá đầu QRS/Q bệnh lý, quan hệ biên độ/hình dạng T với QRS,\n  dẫn truyền AV, điện thế và biến đổi tái cực, các chuyển đạo đối diện/liên quan.\n  Dấu thiếu máu cơ tim có thể kín đáo; không bắt buộc đủ ngưỡng ST chênh lên mới cảnh báo.\n  Không gọi mọi V2 đẳng điện là bệnh lý; cần ngữ cảnh và đối chiếu các chuyển đạo.\n  Chỉ từ ECG hiện tại không được suy diễn diễn biến, kết quả chụp mạch hoặc chẩn đoán\n  của ECG về sau. Không gọi T 'khổng lồ' nếu không có số đo biên độ có căn cứ.\n- Các vùng ảnh có khoảng đệm và có thể chồng lặp/hiện một phần chuyển đạo bên cạnh.\n  Dùng nhãn thật để chọn sóng, không tính phần chồng lặp thành nhát mới.\n"
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
+SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
 SYSTEM_PROMPT += "\nV10.2: Nếu st_small_boxes khác 0 thì st_measurement_id bắt buộc phải trỏ tới một measurement st_mm có landmarks; nếu không đủ mốc, đặt st_small_boxes=null và detail_st=uncertain thay vì đoán số. Nếu tuổi/triệu chứng/bệnh sử/sinh hiệu chưa được cung cấp, không được kết luận urgency=non_urgent chỉ từ ECG; dùng indeterminate/needs_clinical_context theo giá trị schema phù hợp. Chuẩn ghi đọc trực tiếp từ chữ in trên ảnh có thể dùng source=image_text khi evidence chứa đúng số và đơn vị; không gọi đó là user-confirmed.\n"
@@ -1705,13 +1778,13 @@ def render_result(result):
         else:
             st.caption("AI chưa trả số đo đủ rõ để lập bảng.")
         if data["measurements"]:
-            with st.expander("Xem mốc đo AI đề xuất trên ảnh — CHƯA XÁC MINH"):
+            with st.expander("AI proposal landmarks — KHÔNG CÓ MEASUREMENT AUTHORITY"):
                 by_id = {m["id"]:m for m in data["measurements"]}
                 selected_id = st.selectbox("Chọn số đo",list(by_id),key="measurement_preview_"+result["signature"][:16])
                 m = by_id[selected_id]
                 region = next(r for r in result["regions"] if r["id"] == m["region_id"])
                 st.image(annotated_measurement(region,m),width="stretch")
-                st.caption("A: mốc đầu/điểm J · B: mốc cuối · N: đường nền. Vị trí do AI đề xuất; code chỉ vẽ lại, chưa đo hay xác minh dạng sóng. Ảnh gốc gửi AI không bị sửa.")
+                st.caption("A: mốc đầu/điểm J · B: mốc cuối · N: đường nền. Vị trí do AI đề xuất; chỉ để audit lỗi thị giác. Code KHÔNG coi đây là measurement landmark và không dùng để xác minh số đo. Ảnh gốc gửi AI không bị sửa.")
                 st.write(m["landmarks"])
         for c in result["arithmetic"]["checks"]:
             if c["status"] == "warning":
@@ -2012,8 +2085,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · calibration-pulse exclusion + two-beat consensus + J/ST")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.2d thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · measurement authority · engine-owned RR")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2112,7 +2185,7 @@ else:
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
-    digitizer_result=None; digitizer_evidence=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
+    digitizer_result=None; digitizer_evidence=None; rr_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
         if not DIGITIZER_AVAILABLE:
             st.warning("Chưa nạp được ecg_digitizer.py ("+DIGITIZER_IMPORT_ERROR+"). AI vẫn có thể đọc ảnh gốc; hãy kiểm tra file engine trên GitHub.")
@@ -2131,10 +2204,12 @@ else:
                     _speed_for_st = speed if speed in (25,50) else None
                     j_st_evidence=build_j_st_evidence(digitizer_result,ecg,qrs_template_evidence,centerline_evidence,_speed_for_st)
                     digitizer_evidence["j_st_engine"]=j_st_evidence
+                    rr_authority=_rr_from_digitizer_rhythm(digitizer_result)
+                    digitizer_evidence["measurement_authority"]={"rr":rr_authority}
                 dq=digitizer_result.get("overall_qc",{})
                 st.write(f"QC Digitizer: **{dq.get('status','?')}** · PASS {dq.get('lead_pass',0)} · REVIEW {dq.get('lead_review',0)} · FAIL {dq.get('lead_fail',0)}")
                 cal=digitizer_result.get("calibration",{})
-                st.caption("Grid: "+str(cal.get("status"))+
+                st.caption("Global grid (legacy/supplementary): "+str(cal.get("status"))+
                     (" · %.2f px/mm"%cal["px_per_mm"] if cal.get("px_per_mm") else " · chưa cho phép quy đổi px/mm")+
                     " · OCR nhãn: "+(", ".join(sorted(ocr_evidence.get("label_anchors",{}))) or "chưa đủ chắc"))
                 if dq.get("status")!="PASS":
@@ -2161,7 +2236,7 @@ else:
                             _ov=template_qrs_overlay(ecg,digitizer_result.get("leads",{}).get(_lead,{}),_lm)
                             if _ov is not None: st.image(_ov,caption=f"{_lead} · {_lm.get('status')} · QRS {_lm.get('qrs_width_px')} px · ô nhỏ chưa xác minh",width="stretch")
                     if j_st_evidence:
-                        st.markdown("**v11.2b — Calibration-validated local grid + J/ST candidates**")
+                        st.markdown("**v11.3 — Calibration-validated local grid + J/ST candidates**")
                         _strows=[]
                         for _lead in LEADS:
                             _e=j_st_evidence.get("leads",{}).get(_lead,{})
@@ -2262,6 +2337,18 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
+    st.markdown("**v11.3 — Measurement Authority: RR**")
+    if rr_authority:
+        _c=st.columns(4)
+        _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
+        _c[1].metric("QRS beats",rr_authority.get("beats",0))
+        _c[2].metric("RR px",rr_authority.get("rr_px","—"))
+        _c[3].metric("RR CV",rr_authority.get("rr_cv","—"))
+        _ov=rr_authority_overlay_from_digitizer(ecg,digitizer_result,rr_authority)
+        if _ov is not None:
+            st.image(_ov,caption="RR ENGINE — hai vạch phải đi qua hai QRS liên tiếp. Marker AI không có authority.",width="stretch")
+        if rr_authority.get("status")!="PASS":
+            st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
     if any(min(r["sent_size"]) < 128 for r in regions):
         st.warning("Có vùng ảnh hẹp hoặc độ phân giải thấp. Phóng lớn không khôi phục chi tiết đã mất; cân nhắc ảnh gốc rõ hơn.")
     st.subheader("3. Phân tích")
@@ -2278,6 +2365,15 @@ else:
                 try:
                     data = parse_report(outcome["raw_response"],regions)
                     checks = arithmetic_checks(data,known,age_years=age)
+                    authority_report = measurement_authority_conflicts(data,rr_authority,j_st_evidence)
+                    # Authority warnings are separate from arithmetic consistency:
+                    # an AI proposal may be internally consistent yet still have no measurement authority.
+                    for _cf in authority_report.get("conflicts",[]):
+                        checks["checks"].append({"status":"warning",
+                            "message":f"{_cf.get('measurement_id')}: AI proposal bị BLOCK — engine authority chưa PASS; không dùng tọa độ/số AI làm bằng chứng định lượng.",
+                            "measurement_ids":[_cf.get("measurement_id")],"category":"measurement_authority"})
+                    if authority_report.get("conflicts"):
+                        checks["has_blocking_warning"]=True
                 except (ValueError,TypeError,KeyError) as exc:
                     outcome["error"] = "API đã trả dữ liệu nhưng cấu trúc không hợp lệ hoặc thiếu vùng quan sát. Chưa có báo cáo hoàn chỉnh; không tự gửi lại."
                     data = None
@@ -2287,6 +2383,8 @@ else:
                 "prompt_sha256":hashlib.sha256(prompt.encode()).hexdigest(),"app_version":APP_VERSION,
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
+                "measurement_authority":{"rr":rr_authority,
+                    "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
                 "requested_provider":provider,"requested_model":model,
                 "image_settings":{"original_size":list(original.size),"oriented_size":list(oriented.size),
                     "auto_rotation_ccw":auto_angle,"manual_rotation_ccw":manual,"ecg_box_in_oriented_image":list(whole_box),
