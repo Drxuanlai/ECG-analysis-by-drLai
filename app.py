@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.1"
-PROMPT_VERSION = "ecg-ai-landmark-deterministic-measurement-v14.1"
+APP_VERSION = "v14.1.1"
+PROMPT_VERSION = "ecg-ai-landmark-api-fallback-v14.1.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3186,31 +3186,55 @@ def gemini_config(model_name, thinking, schema=None):
     return types.GenerateContentConfig(**options)
 
 
-def analyze_gemini(api_key, model, regions, prompt, thinking):
-    parts = [types.Part.from_text(text=prompt)]
-    for r in regions:
-        parts += [types.Part.from_text(text=f"ẢNH {r['id']} — {r['label']}"),
-                  types.Part.from_bytes(data=r["png"], mime_type="image/png")]
-    with genai.Client(api_key=api_key.strip(), http_options=types.HttpOptions(
-            timeout=REQUEST_TIMEOUT_SECONDS*1000, retry_options=types.HttpRetryOptions(attempts=1))) as client:
-        response = client.models.generate_content_stream(model=model, contents=parts,
-            config=gemini_config(model, thinking))
-        finished = False
-        try:
-            for chunk in response:
-                if chunk.text:
-                    yield chunk.text
-                for candidate in chunk.candidates or []:
-                    reason = getattr(candidate.finish_reason, "value", candidate.finish_reason)
-                    if reason == "STOP":
-                        finished = True
-                    elif reason:
-                        raise RuntimeError("Luồng bị gián đoạn: " + str(reason))
-            if not finished:
-                raise RuntimeError("Thiếu tín hiệu hoàn tất báo cáo.")
-        finally:
-            response.close()
+def gemini_plain_config(model_name, thinking):
+    """Fallback: no JSON MIME/schema constraints; JSON contract remains in the prompt and Python validates locally."""
+    options = {"system_instruction": SYSTEM_PROMPT, "max_output_tokens": 12288}
+    if model_name.removeprefix("models/") == GEMINI_MODEL:
+        options["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
+        options["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
+    return types.GenerateContentConfig(**options)
 
+def _clean_api_error(exc):
+    msg=str(exc)
+    # Never expose API keys/tokens if an SDK error happens to echo request metadata.
+    msg=re.sub(r'AIza[0-9A-Za-z_-]{20,}', '[REDACTED_API_KEY]', msg)
+    msg=re.sub(r'(?i)(api[_ -]?key\s*[:=]\s*)\S+', r'\1[REDACTED]', msg)
+    return msg[:1800]
+
+def analyze_gemini(api_key, model, regions, prompt, thinking):
+    client = genai.Client(api_key=api_key)
+    parts = [types.Part.from_text(text=user_text)]
+    for image in images:
+        buf=io.BytesIO(); image.convert("RGB").save(buf,format="JPEG",quality=92)
+        parts.append(types.Part.from_bytes(data=buf.getvalue(),mime_type="image/jpeg"))
+
+    attempts=[]
+    configs=[
+        ("json_mode", gemini_config(model, thinking)),
+        ("plain_json_prompt", gemini_plain_config(model, thinking)),
+    ]
+    last_exc=None
+    for mode,cfg in configs:
+        t0=time.time()
+        try:
+            response=client.models.generate_content_stream(model=model,contents=parts,config=cfg)
+            chunks=[]
+            for chunk in response:
+                txt=getattr(chunk,"text",None)
+                if txt:chunks.append(txt)
+            raw="".join(chunks).strip()
+            attempts.append({"mode":mode,"status":"OK","seconds":round(time.time()-t0,2),"chars":len(raw)})
+            if raw:
+                return raw,attempts
+            last_exc=RuntimeError("empty_response")
+            attempts[-1]["status"]="EMPTY"
+        except Exception as exc:
+            last_exc=exc
+            attempts.append({"mode":mode,"status":"ERROR","seconds":round(time.time()-t0,2),
+                             "error":_clean_api_error(exc)})
+            # Only the first configuration falls back automatically.
+            continue
+    raise RuntimeError("Gemini attempts failed: "+json.dumps(attempts,ensure_ascii=False))
 
 def analyze_openai(api_key, model, regions, prompt):
     content = [{"type": "text", "text": prompt}]
@@ -3429,7 +3453,7 @@ def run_with_failover(routes, regions, prompt, runtime=None, collect=None):
         selected, calls = route, calls+1
         st.caption(f"Đang dùng {route['name']} · {route['model']} · lần gọi {calls}/{MAX_ROUTE_ATTEMPTS}")
         try:
-            generator = analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"]) if route["provider"] == "Google Gemini" else analyze_openai(route["key"],route["model"],regions,prompt)
+            generator, api_attempts = analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"]) if route["provider"] == "Google Gemini" else analyze_openai(route["key"],route["model"],regions,prompt)
             remaining = max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-started))
             outcome = collect(generator,route["provider"],min(STREAM_BUDGET_SECONDS,remaining))
         finally:
@@ -3759,6 +3783,10 @@ def render_result(result):
     st.subheader("Kết quả quan sát")
     st.caption(f"{result['app_version']} · {result['provider']} · {result['model']} · {result['total_seconds']:.1f} giây · {len(result['regions'])} ảnh/lần gọi · {result.get('api_calls', 1)} lần gọi")
     with st.expander("Lịch sử chọn nguồn API của lượt này"):
+
+        if "api_attempts" in locals():
+            with st.expander("v14.1.1 API diagnostic", expanded=False):
+                st.json(api_attempts)
         st.dataframe(result.get("attempts", []), hide_index=True)
         st.caption("Không chứa API key. Lỗi trước khi có báo cáo mới chuyển nguồn; không trộn các câu trả lời.")
     st.info("Mọi số đo và diễn giải AI đều chưa được bác sĩ kiểm chứng. Số học khớp không chứng minh số đo trên ảnh đúng.")
@@ -4120,7 +4148,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.1 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.1.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4377,32 +4405,38 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**Experimental QC — legacy waveform detector (không phải reader chính v14)**")
-    _qm=qrs_morphology_authority or {}
-    _qc=st.columns(4)
-    _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
-    _qc[1].metric("PASS leads",_qm.get("pass_count",0))
-    _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
-    _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
-    st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-    with st.expander("Experimental waveform QC visual audit",expanded=False):
-        for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
-            _ev=(_qm.get("leads") or {}).get(_lead,{})
-            _tw=_ev.get("template_wave")
-            if not _tw: continue
-            _win={"on":_ev.get("template_qrs_on"),"off":_ev.get("template_qrs_off")}
-            _img=_morphology_audit_image(np.asarray(_tw,float),_win,_ev)
-            if _img is not None:
-                st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
-                st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
-    if _qm.get("status")=="UNRESOLVED":
-        st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
-    with st.expander("Experimental waveform QC evidence",expanded=False):
-        st.json(_qm)
-    st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    if median_landmark_authority:
-        if digitizer_evidence is not None:
-            digitizer_evidence["median_landmark_authority"]=median_landmark_authority
+    show_legacy_qc = st.checkbox(
+        "Hiển thị bộ detector thử nghiệm v13 (debug)",
+        value=False,
+        help="Mặc định tắt. Chỉ bật khi cần đối chiếu/debug; không phải reader chính v14."
+    )
+    if show_legacy_qc:
+        st.markdown("**Experimental QC — legacy waveform detector (không phải reader chính v14)**")
+        _qm=qrs_morphology_authority or {}
+        _qc=st.columns(4)
+        _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
+        _qc[1].metric("PASS leads",_qm.get("pass_count",0))
+        _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
+        _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
+        st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
+        with st.expander("Experimental waveform QC visual audit",expanded=False):
+            for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
+                _ev=(_qm.get("leads") or {}).get(_lead,{})
+                _tw=_ev.get("template_wave")
+                if not _tw: continue
+                _win={"on":_ev.get("template_qrs_on"),"off":_ev.get("template_qrs_off")}
+                _img=_morphology_audit_image(np.asarray(_tw,float),_win,_ev)
+                if _img is not None:
+                    st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
+                    st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
+        if _qm.get("status")=="UNRESOLVED":
+            st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
+        with st.expander("Experimental waveform QC evidence",expanded=False):
+            st.json(_qm)
+        st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
+        if median_landmark_authority:
+            if digitizer_evidence is not None:
+                digitizer_evidence["median_landmark_authority"]=median_landmark_authority
         st.markdown("**v12.3 FINAL — Interval Measurement Authority**")
         _mq=median_landmark_authority.get("qrs",{});_mp=median_landmark_authority.get("pr",{});_mt=median_landmark_authority.get("qt",{})
         _mc=st.columns(10)
