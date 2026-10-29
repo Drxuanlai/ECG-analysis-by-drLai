@@ -1924,6 +1924,58 @@ def interval_authority_overlay(ecg_image,rhythm_region,interval_ev):
     return Image.fromarray(arr)
 
 # ----------------- PER-LEAD QRS MORPHOLOGY AUTHORITY v13.0 -----------------
+def _qrs_components_from_window(y,on,off,baseline=None):
+    y=np.asarray(y,float);on=max(1,int(on));off=min(len(y)-2,int(off))
+    if off-on<4:return []
+    if baseline is None:
+        span=max(5,off-on); vals=np.r_[y[max(0,on-span):on],y[off:min(len(y),off+span)]]
+        baseline=float(np.median(vals)) if len(vals) else float(np.median(y[on:off+1]))
+    z=-(y[on:off+1]-baseline);amp=float(np.max(np.abs(z)))+1e-6
+    thr=max(.10*amp,float(np.median(np.abs(z)))*.55)
+    sign=np.zeros(len(z),int);sign[z>=thr]=1;sign[z<=-thr]=-1
+    for i in range(1,len(sign)-1):
+        if sign[i]==0 and sign[i-1]==sign[i+1]!=0:sign[i]=sign[i-1]
+    runs=[];i=0
+    while i<len(sign):
+        if sign[i]==0:i+=1;continue
+        sg=int(sign[i]);j=i+1
+        while j<len(sign) and sign[j]==sg:j+=1
+        seg=z[i:j];pk=i+int(np.argmax(seg) if sg>0 else np.argmin(seg))
+        runs.append({"sign":sg,"start":on+i,"end":on+j-1,"peak_x":on+pk,
+                     "amp_px":round(float(abs(z[pk])),2),"signed_amp_px":round(float(z[pk]),2),"width_px":j-i})
+        i=j
+    merged=[]
+    for r in runs:
+        if merged and r["sign"]==merged[-1]["sign"] and r["start"]-merged[-1]["end"]<=3:
+            a=merged[-1]
+            if r["amp_px"]>a["amp_px"]:
+                a["peak_x"]=r["peak_x"];a["amp_px"]=r["amp_px"];a["signed_amp_px"]=r["signed_amp_px"]
+            a["end"]=r["end"];a["width_px"]=a["end"]-a["start"]+1
+        else:merged.append(dict(r))
+    return merged
+
+def _label_qrs_components(components):
+    if not components:return None,[]
+    pos_seen=0;labels=[];maxamp=max(c["amp_px"] for c in components)+1e-6
+    for c in components:
+        small=c["amp_px"]<.45*maxamp
+        if c["sign"]>0:
+            pos_seen+=1;label=("r" if small else "R") if pos_seen==1 else ("r′" if small else "R′")
+        else:
+            label=("q" if small else "Q") if pos_seen==0 else ("s" if small else "S")
+        labels.append(label)
+    if all(c["sign"]<0 for c in components) and len(components)==1:labels=["QS"]
+    return "".join(labels),labels
+
+def _morphology_one_wave(y,on,off):
+    comps=_qrs_components_from_window(y,on,off);code,labels=_label_qrs_components(comps)
+    if not code:return {"status":"UNRESOLVED","reason":"no_qrs_components"}
+    for c,label in zip(comps,labels):c["label"]=label
+    total=sum(c["amp_px"] for c in comps);mx=max(c["amp_px"] for c in comps);prominence=mx/(total+1e-6)
+    return {"status":"PASS" if 1<=len(comps)<=4 and prominence>=.34 else "REVIEW",
+            "morphology":code,"components":comps,"component_count":len(comps),
+            "dominant_fraction":round(float(prominence),3)}
+
 def _lead_wave_from_digitizer_item(item):
     """v13.1 bridge: expose the actual numeric trace already produced by ecg_digitizer."""
     if not isinstance(item,dict):return None
@@ -2112,8 +2164,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.1"
-PROMPT_VERSION = "ecg-waveform-bridge-independent-qrs-v13.1"
+APP_VERSION = "v13.1.1"
+PROMPT_VERSION = "ecg-waveform-bridge-independent-qrs-v13.1.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3319,7 +3371,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.1 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.1.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3576,7 +3628,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.1 — Waveform Bridge + Independent QRS Morphology Authority**")
+    st.markdown("**v13.1.1 — Waveform Bridge + Independent QRS Morphology Authority**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
