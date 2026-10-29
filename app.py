@@ -976,35 +976,61 @@ def _accept_qrs_events(events,crop,centerline=None):
     if status=="UNRESOLVED":qc["reason"]="insufficient_direct_rr_pairs"
     return chain,qc
 
+def _cluster_qrs_events_v1134(events, crop):
+    if not events: return []
+    w=crop.shape[1]; gap=max(5,int(.016*w)); ev=sorted(events,key=lambda e:e["x"]); groups=[[ev[0]]]
+    for e in ev[1:]:
+        if e["x"]-groups[-1][-1]["x"]<=gap: groups[-1].append(e)
+        else: groups.append([e])
+    out=[]
+    for g in groups:
+        xs=np.array([e["x"] for e in g],float); sc=np.array([max(e["score"],1e-6) for e in g],float)
+        out.append({"x":int(round(float(np.sum(xs*sc)/np.sum(sc)))),"score":float(np.max(sc)),"edge_count":len(g)})
+    return out
+
+def _reconstruct_rr_v1134(clusters, crop):
+    if len(clusters)<4: return [], {"status":"UNRESOLVED","reason":"fewer_than_4_qrs_clusters"}
+    xs=np.array([c["x"] for c in clusters],float); w=crop.shape[1]
+    pair=[]
+    for lag in (1,2,3):
+        if len(xs)>lag: pair.extend(((xs[lag:]-xs[:-lag])/lag).tolist())
+    pair=np.array([d for d in pair if .045*w<=d<=.16*w],float)
+    if len(pair)<3: return [], {"status":"UNRESOLVED","reason":"rr_guess_failed"}
+    guesses=[float(np.percentile(pair,q)) for q in (25,40,50,60,75)]
+    best=None
+    for rr0 in guesses:
+        for seed in clusters:
+            phase=float(seed["x"]%rr0); slots={}
+            for c in clusters:
+                k=int(round((c["x"]-phase)/rr0)); ex=phase+k*rr0; err=abs(c["x"]-ex)/rr0
+                if err<=.18 and (k not in slots or err<slots[k][0]): slots[k]=(err,c)
+            if len(slots)<3: continue
+            ks=sorted(slots); first,last=ks[0],ks[-1]; accepted=[slots[k][1] for k in ks]
+            missed=sum(k not in slots for k in range(first,last+1)); missfrac=missed/max(1,len(accepted))
+            residual=float(np.median([slots[k][0] for k in ks])); strength=float(np.median([c["score"] for c in accepted]))
+            score=len(accepted)-3.5*missfrac-2*residual+.001*strength
+            if best is None or score>best[0]: best=(score,rr0,accepted,missed,missfrac,residual)
+    if best is None: return [], {"status":"UNRESOLVED","reason":"sequence_reconstruction_failed"}
+    _,rr0,accepted,missed,missfrac,residual=best; ax=np.array([c["x"] for c in accepted],float); dif=np.diff(ax); mult=np.clip(np.rint(dif/rr0),1,3).astype(int)
+    direct=[i for i,k in enumerate(mult) if k==1 and abs(dif[i]-rr0)/rr0<=.18]; norm=dif/mult; cv=float(np.std(norm)/np.mean(norm)) if len(norm)>=2 else None
+    if missfrac>.25 or missed>max(2,int(.25*len(accepted))): status="UNRESOLVED"; reason="too_many_inferred_missed_qrs"
+    elif len(accepted)>=8 and len(direct)>=5 and (cv is None or cv<=.14) and residual<=.12: status="PASS"; reason=None
+    elif len(accepted)>=5 and len(direct)>=3 and (cv is None or cv<=.20): status="REVIEW"; reason=None
+    else: status="UNRESOLVED"; reason="insufficient_rr_sequence_quality"
+    return accepted,{"status":status,"reason":reason,"rr_guess_px":round(rr0,2),"qrs_detected":len(accepted),"rr_intervals_usable":len(direct),"missed_qrs_inferred":int(missed),"missed_fraction":round(missfrac,3),"rr_cv":round(cv,3) if cv is not None else None,"phase_residual":round(residual,3)}
+
 def _rr_from_rhythm_region(ecg_image,rhythm_region):
-    """v11.3.3 image-first vertical-stroke QRS detection; centerline is supplementary."""
     if not rhythm_region:return {"status":"UNRESOLVED","reason":"no_rhythm_region"}
     box=rhythm_region.get("box_pixels")
     if not box:return {"status":"UNRESOLVED","reason":"no_rhythm_box"}
     crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("RGB"))
-    if crop.size==0:return {"status":"UNRESOLVED","reason":"empty_rhythm_crop"}
-    events,profile,eqc=_qrs_vertical_events(crop)
-    chain,qc=_accept_qrs_events(events,crop)
-    out={"status":qc.get("status","UNRESOLVED"),"source":"engine_image_first_qrs",
-         "vertical_events":len(events),"qrs_detected":qc.get("qrs_detected",0),
-         "rr_intervals_usable":qc.get("rr_intervals_usable",0),
-         "missed_qrs_inferred":qc.get("missed_qrs_inferred",0),
-         "rr_cv":qc.get("rr_cv"),"rr_guess_px":qc.get("rr_guess_px"),
-         "image_quality_ratio":qc.get("image_quality_ratio"),
-         "event_qc":eqc,"chain_qc":qc,"rhythm_box":box,"rhythm_size":[crop.shape[1],crop.shape[0]],
-         "small_boxes":None,"rr_ms":None,"conversion_status":"PENDING_VERIFIED_RHYTHM_GRID"}
-    if out["status"]=="UNRESOLVED":
-        out["reason"]=qc.get("reason") or eqc.get("reason");return out
-    xs=[int(e["x"]) for e in chain];out["fiducials_x"]=xs
-    rr0=float(qc["rr_guess_px"]); dif=np.diff(xs); mult=np.clip(np.rint(dif/rr0),1,3)
-    direct=[i for i,k in enumerate(mult) if int(k)==1 and abs(dif[i]-rr0)/rr0<=.16]
-    if not direct:
-        out["status"]="UNRESOLVED";out["reason"]="no_direct_consecutive_pair";return out
-    # Representative directly consecutive pair closest to fundamental RR.
-    k=min(direct,key=lambda i:abs(dif[i]-rr0))
-    out["start_x"]=xs[k];out["end_x"]=xs[k+1];out["rr_px"]=round(float(dif[k]),2)
-    out["median_rr_px"]=round(float(np.median([dif[i] for i in direct])),2);out["consecutive"]=True
-    return out
+    events,_,eqc=_qrs_vertical_events(crop); clusters=_cluster_qrs_events_v1134(events,crop); accepted,qc=_reconstruct_rr_v1134(clusters,crop)
+    out={"status":qc.get("status","UNRESOLVED"),"source":"engine_qrs_cluster_rr","vertical_events":len(events),"qrs_clusters":len(clusters),"qrs_detected":qc.get("qrs_detected",0),"rr_intervals_usable":qc.get("rr_intervals_usable",0),"missed_qrs_inferred":qc.get("missed_qrs_inferred",0),"missed_fraction":qc.get("missed_fraction"),"rr_cv":qc.get("rr_cv"),"rr_guess_px":qc.get("rr_guess_px"),"phase_residual":qc.get("phase_residual"),"cluster_x":[int(c["x"]) for c in clusters],"small_boxes":None,"rr_ms":None,"conversion_status":"PENDING_VERIFIED_RHYTHM_GRID"}
+    out["fiducials_x"]=[int(c["x"]) for c in accepted]
+    if out["status"]=="UNRESOLVED": out["reason"]=qc.get("reason"); return out
+    xs=np.array(out["fiducials_x"],float); rr0=float(qc["rr_guess_px"]); dif=np.diff(xs); direct=[i for i,d in enumerate(dif) if abs(d-rr0)/rr0<=.18]
+    if not direct: out["status"]="UNRESOLVED";out["reason"]="no_direct_consecutive_pair";return out
+    k=min(direct,key=lambda i:abs(dif[i]-rr0));out["start_x"]=int(xs[k]);out["end_x"]=int(xs[k+1]);out["rr_px"]=round(float(dif[k]),2);out["median_rr_px"]=round(float(np.median([dif[i] for i in direct])),2);out["consecutive"]=True;return out
 
 
 def rr_authority_overlay_from_region(ecg_image,rhythm_region,rr):
@@ -1092,8 +1118,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.3"
-PROMPT_VERSION = "ecg-image-first-qrs-v11.3.3"
+APP_VERSION = "v11.3.4"
+PROMPT_VERSION = "ecg-qrs-cluster-rr-v11.3.4"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2295,8 +2321,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · image-first Rhythm-II QRS detector")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.3 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · QRS clustering + RR reconstruction")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.4 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2548,20 +2574,21 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.3 — Measurement Authority: RR (image-first QRS)**")
+    st.markdown("**v11.3.4 — Measurement Authority: QRS clusters → RR**")
     if rr_authority:
-        _c=st.columns(7)
+        _c=st.columns(8)
         _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
         _c[1].metric("Vertical events",rr_authority.get("vertical_events",0))
-        _c[2].metric("QRS accepted",rr_authority.get("qrs_detected",0))
-        _c[3].metric("RR usable",rr_authority.get("rr_intervals_usable",0))
-        _c[4].metric("Missed inferred",rr_authority.get("missed_qrs_inferred",0))
-        _c[5].metric("RR px",rr_authority.get("rr_px","—"))
-        _c[6].metric("RR CV",rr_authority.get("rr_cv","—"))
+        _c[2].metric("QRS clusters",rr_authority.get("qrs_clusters",0))
+        _c[3].metric("QRS accepted",rr_authority.get("qrs_detected",0))
+        _c[4].metric("RR usable",rr_authority.get("rr_intervals_usable",0))
+        _c[5].metric("Missed",rr_authority.get("missed_qrs_inferred",0))
+        _c[6].metric("RR px",rr_authority.get("rr_px","—"))
+        _c[7].metric("RR CV",rr_authority.get("rr_cv","—"))
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.3 — vạch mảnh = tất cả QRS accepted; hai vạch đậm = cặp QRS liên tiếp dùng đo RR. Khoảng 2×/3× RR chỉ được ghi là detector bỏ sót beat, không dùng làm RR.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.4 — QRS được cluster trước khi dựng chuỗi RR. Nếu missed >25% accepted → UNRESOLVED. Hai vạch đậm chỉ được chọn từ cặp 1×RR trực tiếp.",width="stretch")
         if rr_authority.get("status")!="PASS":
             st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
     if any(min(r["sent_size"]) < 128 for r in regions):
