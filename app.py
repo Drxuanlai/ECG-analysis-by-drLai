@@ -1370,21 +1370,30 @@ def _rhythm_horizontal_grid(crop):
             "reason":None if status!="UNRESOLVED" else "harmonic_grid_validation_failed"}
 
 
+def _normalize_paper_speed(speed_mm_s):
+    try:
+        v=float(speed_mm_s)
+    except (TypeError,ValueError):
+        return None
+    return v if np.isfinite(v) and 1.0<=v<=200.0 else None
+
 def _convert_rr_to_time(rr_px,grid,speed_mm_s):
-    if rr_px is None:return {"status":"UNRESOLVED","reason":"no_rr_px"}
+    speed=_normalize_paper_speed(speed_mm_s)
+    if rr_px is None:return {"status":"UNRESOLVED","reason":"no_rr_px","speed_received":speed_mm_s}
     if not grid or grid.get("status")!="PASS" or not grid.get("small_grid_px"):
-        return {"status":"UNRESOLVED","reason":"rhythm_grid_not_PASS"}
-    if speed_mm_s not in (25,50):
-        return {"status":"UNRESOLVED","reason":"paper_speed_not_confirmed"}
+        return {"status":"UNRESOLVED","reason":"rhythm_grid_not_PASS","speed_received":speed}
+    if speed is None:
+        return {"status":"UNRESOLVED","reason":"paper_speed_not_confirmed","speed_received":speed_mm_s}
     boxes=float(rr_px)/float(grid["small_grid_px"])
     # one 1-mm horizontal box = 1000/speed ms
-    box_ms=1000.0/float(speed_mm_s)
+    box_ms=1000.0/speed
     rr_ms=boxes*box_ms
     hr=60000.0/rr_ms if rr_ms>0 else None
     if not (250<=rr_ms<=3000):
-        return {"status":"REVIEW","reason":"rr_time_outside_engineering_range",
+        return {"status":"REVIEW","reason":"rr_time_outside_engineering_range","speed_received":speed,
                 "rr_small_boxes":round(boxes,2),"rr_ms":round(rr_ms,1),"heart_rate_bpm":round(hr,1) if hr else None}
-    return {"status":"PASS","rr_small_boxes":round(boxes,2),"horizontal_box_ms":round(box_ms,1),
+    return {"status":"PASS","reason":None,"speed_received":speed,
+            "rr_small_boxes":round(boxes,2),"horizontal_box_ms":round(box_ms,1),
             "rr_ms":round(rr_ms,1),"heart_rate_bpm":round(hr,1)}
 
 def _rr_from_rhythm_region(ecg_image,rhythm_region,speed_mm_s=None):
@@ -1535,8 +1544,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.9"
-PROMPT_VERSION = "ecg-rr-conversion-gating-v11.3.9"
+APP_VERSION = "v11.3.10"
+PROMPT_VERSION = "ecg-final-rr-hotfix-v11.3.10"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2738,8 +2747,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · RR conversion gating hotfix")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.9 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · FINAL RR/HR authority")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.10 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2966,7 +2975,7 @@ else:
             except ValueError as exc:
                 st.error(str(exc));st.stop()
             st.image(region["png"],width="stretch");regions.append(region)
-            rr_authority=_rr_from_rhythm_region(ecg,region,speed if speed in (25,50) else None)
+            rr_authority=_rr_from_rhythm_region(ecg,region,_normalize_paper_speed(speed))
     if st.checkbox("Thêm vùng cần xem kỹ",key="image_focus_"+frame_id):
         with st.expander("Vùng chi tiết bổ sung",expanded=True):
             label = st.text_input("Nhãn vùng bổ sung",value="Vùng cần xem kỹ",key="region_focus_label_"+frame_id)
@@ -2991,7 +3000,7 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.9 — RR/HR: detection QC ≠ measurement QC**")
+    st.markdown("**v11.3.10 FINAL — RR/HR Measurement Authority**")
     if rr_authority:
         _c=st.columns(10)
         _c[0].metric("Detection QC",rr_authority.get("status","UNRESOLVED"))
@@ -3007,7 +3016,7 @@ else:
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.9 — detector/grid giữ nguyên v11.3.8. Snap REVIEW không xóa RR boxes/ms/HR; nó chỉ hạ Measurement QC xuống REVIEW.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.10 FINAL — detector/grid giữ nguyên. Conversion nhận trực tiếp paper speed đã xác nhận; Snap REVIEW vẫn hiển thị số nhưng Measurement QC = REVIEW.",width="stretch")
         if rr_authority.get("measurement_status")=="REVIEW":
             st.info("RR/HR đã đo được nhưng Measurement QC = REVIEW: hiển thị số để bác sĩ kiểm tra, chưa coi là verified evidence.")
         elif rr_authority.get("measurement_status")!="PASS":
@@ -3016,6 +3025,18 @@ else:
         with st.expander("Rhythm-II grid evidence",expanded=False):
             st.json(_rg)
             st.caption("Grid PASS cho phép hai estimator đồng thuận trực tiếp HOẶC quan hệ harmonic nguyên (đặc biệt 5×), nhưng vẫn phải xác nhận major-grid ≈5× fundamental 1 mm.")
+        _conv=rr_authority.get("conversion") or {}
+        with st.expander("RR conversion diagnostics",expanded=False):
+            st.json({"speed_input_ui":speed,
+                     "speed_received":_conv.get("speed_received"),
+                     "conversion_status":rr_authority.get("conversion_status"),
+                     "measurement_status":rr_authority.get("measurement_status"),
+                     "reason":_conv.get("reason"),
+                     "small_grid_px":_rg.get("small_grid_px"),
+                     "median_rr_px":rr_authority.get("median_rr_px"),
+                     "rr_small_boxes":rr_authority.get("small_boxes"),
+                     "rr_ms":rr_authority.get("rr_ms"),
+                     "heart_rate_bpm":rr_authority.get("heart_rate_bpm")})
     if any(min(r["sent_size"]) < 128 for r in regions):
         st.warning("Có vùng ảnh hẹp hoặc độ phân giải thấp. Phóng lớn không khôi phục chi tiết đã mất; cân nhắc ảnh gốc rõ hơn.")
     st.subheader("3. Phân tích")
