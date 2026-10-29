@@ -1258,61 +1258,116 @@ def _grid_major_validation(profile,small):
     lag,conf=max(vals,key=lambda z:z[1])
     return {"major_px":float(lag),"ratio":float(lag/small),"confidence":float(conf)}
 
+def _harmonic_relation(a,b,max_harmonic=10,tol=.16):
+    """Return whether two periodic estimates represent the same fundamental or an integer harmonic."""
+    if not a or not b:return None
+    small=min(float(a),float(b));large=max(float(a),float(b))
+    ratio=large/small
+    k=int(round(ratio))
+    if 1<=k<=max_harmonic and abs(ratio-k)/max(1,k)<=tol:
+        return {"fundamental":small,"harmonic":large,"multiple":k,
+                "ratio":ratio,"relative_error":abs(ratio-k)/max(1,k)}
+    return None
+
+def _major_from_fundamental(profile,small):
+    """Validate a true 5-mm major-grid harmonic around 5× the resolved 1-mm fundamental."""
+    if not small:return None
+    v=np.asarray(profile,dtype=float);v=v-np.mean(v)
+    target=5.*float(small)
+    lo=max(6,int(round(.82*target)));hi=min(int(round(1.18*target)),len(v)//3)
+    vals=[]
+    for lag in range(lo,hi+1):
+        a=v[:-lag];b=v[lag:];den=np.std(a)*np.std(b)
+        vals.append((lag,float(np.mean(a*b)/den) if den>1e-9 else 0.))
+    if not vals:return None
+    lag,conf=max(vals,key=lambda z:z[1])
+    ratio=lag/float(small)
+    return {"major_px":float(lag),"ratio":float(ratio),"confidence":float(conf),
+            "valid":bool(4.45<=ratio<=5.55 and conf>=.12)}
+
 def _rhythm_horizontal_grid(crop):
-    """v11.3.7: consensus horizontal 1-mm scale for Rhythm II.
-    Evidence: red-line peak gaps + autocorrelation + 5× major-grid harmonic.
+    """v11.3.8: harmonic-aware horizontal 1-mm resolver.
+    A 5-mm autocorrelation peak is allowed to validate a 1-mm peak-spacing fundamental.
     """
     f=crop.astype(float);h,w=f.shape[:2]
     red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2]);gray=f.mean(axis=2)
-    # Average over central vertical band to reduce text/border contamination.
     ya=int(.12*h);yb=int(.88*h)
     profile=np.mean(red[ya:yb],axis=0)+.16*(255-np.mean(gray[ya:yb],axis=0))
+
     peaks=_rhythm_grid_peak_positions(profile)
     hist=_grid_spacing_from_peak_diffs(peaks)
     ac=_grid_spacing_autocorr(profile)
 
-    candidates=[]
-    if hist:candidates.append(("hist",hist["small_px"]))
-    if ac:candidates.append(("autocorr",ac["small_px"]))
-    if not candidates:
+    if not hist and not ac:
         return {"status":"UNRESOLVED","reason":"no_horizontal_grid_period","peak_count":len(peaks)}
 
-    # Consensus must agree to within 22%; if only one estimator exists, remain REVIEW at best.
-    if hist and ac:
-        agree=abs(hist["small_px"]-ac["small_px"])/max(hist["small_px"],ac["small_px"])<=.22
-        small=float(np.median([hist["small_px"],ac["small_px"]]))
-    else:
-        agree=False
-        small=float(candidates[0][1])
+    hpx=hist["small_px"] if hist else None
+    apx=ac["small_px"] if ac else None
+    relation=_harmonic_relation(hpx,apx,max_harmonic=10,tol=.16) if hpx and apx else None
 
-    major=_grid_major_validation(profile,small)
-    major_ok=bool(major and 4.45<=major["ratio"]<=5.55 and major["confidence"]>=.12)
-    enough=(w/small)>=35
+    resolver_mode=None
+    fundamental=None
+    harmonic_multiple=None
+    harmonic_error=None
+
+    # Case A: estimators directly agree -> same fundamental.
+    if hpx and apx and abs(hpx-apx)/max(hpx,apx)<=.22:
+        fundamental=float(np.median([hpx,apx]))
+        resolver_mode="direct_consensus"
+        harmonic_multiple=1
+        harmonic_error=abs(hpx-apx)/max(hpx,apx)
+    # Case B: one estimator is an integer harmonic of the other.
+    elif relation and relation["multiple"] in (2,3,4,5,10):
+        fundamental=float(relation["fundamental"])
+        resolver_mode=f"harmonic_{relation['multiple']}x"
+        harmonic_multiple=int(relation["multiple"])
+        harmonic_error=float(relation["relative_error"])
+    # Case C: only histogram has strong direct line-spacing evidence.
+    elif hist and hist["support"]>=.72 and hist["residual"]<=.12:
+        fundamental=float(hpx)
+        resolver_mode="histogram_primary"
+    else:
+        fundamental=float(hpx if hpx else apx)
+        resolver_mode="single_estimator"
+
+    major=_major_from_fundamental(profile,fundamental)
+    major_ok=bool(major and major.get("valid"))
+    enough=(w/fundamental)>=35
     hist_ok=bool(hist and hist["support"]>=.62 and hist["residual"]<=.20)
     ac_ok=bool(ac and ac["confidence"]>=.16)
 
-    # Three-way policy: PASS requires estimator agreement + credible major harmonic.
-    if agree and hist_ok and ac_ok and major_ok and enough:
+    # Independent validation logic:
+    # direct consensus OR credible integer harmonic, plus a 5-mm major harmonic.
+    harmonic_ok=bool(relation and relation["multiple"] in (2,3,4,5,10) and relation["relative_error"]<=.16)
+    direct_ok=bool(hpx and apx and abs(hpx-apx)/max(hpx,apx)<=.22)
+
+    if enough and major_ok and hist_ok and (direct_ok or harmonic_ok):
         status="PASS"
-    elif (hist_ok or ac_ok) and major_ok and enough:
+    elif enough and major_ok and hist_ok:
+        status="REVIEW"
+    elif enough and major_ok and ac_ok and resolver_mode=="direct_consensus":
         status="REVIEW"
     else:
         status="UNRESOLVED"
 
-    return {"status":status,"small_grid_px":round(small,3) if status!="UNRESOLVED" else None,
+    return {"status":status,
+            "small_grid_px":round(fundamental,3) if status!="UNRESOLVED" else None,
+            "resolver_mode":resolver_mode,
             "peak_count":len(peaks),
-            "hist_small_px":round(hist["small_px"],3) if hist else None,
+            "hist_small_px":round(hpx,3) if hpx else None,
             "hist_support":round(hist["support"],3) if hist else None,
             "hist_residual":round(hist["residual"],3) if hist else None,
-            "autocorr_small_px":round(ac["small_px"],3) if ac else None,
+            "autocorr_period_px":round(apx,3) if apx else None,
             "autocorr_confidence":round(ac["confidence"],3) if ac else None,
-            "estimators_agree":bool(agree),
+            "harmonic_multiple":harmonic_multiple,
+            "harmonic_ratio":round(relation["ratio"],3) if relation else None,
+            "harmonic_error":round(harmonic_error,3) if harmonic_error is not None else None,
             "major_grid_px":round(major["major_px"],3) if major else None,
             "major_to_small_ratio":round(major["ratio"],3) if major else None,
             "major_confidence":round(major["confidence"],3) if major else None,
             "major_validator":major_ok,
-            "estimated_small_boxes":round(w/small,1),
-            "reason":None if status!="UNRESOLVED" else "horizontal_grid_consensus_failed"}
+            "estimated_small_boxes":round(w/fundamental,1),
+            "reason":None if status!="UNRESOLVED" else "harmonic_grid_validation_failed"}
 
 
 def _convert_rr_to_time(rr_px,grid,speed_mm_s):
@@ -1474,8 +1529,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.7"
-PROMPT_VERSION = "ecg-rhythm-grid-consensus-v11.3.7"
+APP_VERSION = "v11.3.8"
+PROMPT_VERSION = "ecg-harmonic-grid-resolver-v11.3.8"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2677,8 +2732,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Rhythm-II horizontal-grid consensus + RR/HR")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.7 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · harmonic-aware Rhythm-II grid + RR/HR")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.8 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2930,7 +2985,7 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.7 — Measurement Authority: snapped QRS + grid consensus → RR/HR**")
+    st.markdown("**v11.3.8 — Measurement Authority: harmonic-aware grid → RR/HR**")
     if rr_authority:
         _c=st.columns(9)
         _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
@@ -2945,13 +3000,13 @@ else:
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.7 — R detector giữ nguyên v11.3.6. RR→ms→HR chỉ mở khi peak-spacing + autocorrelation + major-grid 5× đồng thuận.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.8 — R detector giữ nguyên. Grid resolver hiểu autocorrelation 5× có thể là major-grid harmonic của fundamental 1 mm; không còn lấy median hai period bất đồng.",width="stretch")
         if rr_authority.get("status")!="PASS":
             st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
         _rg=rr_authority.get("rhythm_grid") or {}
         with st.expander("Rhythm-II grid evidence",expanded=False):
             st.json(_rg)
-            st.caption("Grid PASS cần: peak-spacing và autocorrelation đồng thuận, đồng thời có major-grid xấp xỉ 5× small-grid.")
+            st.caption("Grid PASS cho phép hai estimator đồng thuận trực tiếp HOẶC quan hệ harmonic nguyên (đặc biệt 5×), nhưng vẫn phải xác nhận major-grid ≈5× fundamental 1 mm.")
     if any(min(r["sent_size"]) < 128 for r in regions):
         st.warning("Có vùng ảnh hẹp hoặc độ phân giải thấp. Phóng lớn không khôi phục chi tiết đã mất; cân nhắc ảnh gốc rõ hơn.")
     st.subheader("3. Phân tích")
