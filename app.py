@@ -850,8 +850,48 @@ def _rr_from_digitizer_rhythm_legacy(result):
             "rr_cv":round(cv,3),"consecutive":True,"small_boxes":None,"rr_ms":None,
             "conversion_status":"PENDING_VERIFIED_RHYTHM_GRID","centerline_qc":clqc}
 
+def _rr_vertical_stroke_profile(crop):
+    """Image evidence for narrow near-vertical ECG ink. QRS should outrank broad T waves."""
+    f=crop.astype(float); gray=f.mean(axis=2); red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2])
+    # dark neutral/black ink, penalize red grid
+    ink=(255-gray)-.60*np.maximum(red,0)
+    h,w=ink.shape; ya=int(.14*h);yb=int(.86*h); band=ink[ya:yb]
+    cut=float(np.percentile(band,84)); mask=band>=cut
+    prof=np.zeros(w,float)
+    for x in range(w):
+        ys=np.where(mask[:,x])[0]
+        if not len(ys):continue
+        # longest contiguous dark vertical run/span around this column
+        runs=[];start=prev=int(ys[0])
+        for yy in ys[1:]:
+            yy=int(yy)
+            if yy<=prev+1:prev=yy
+            else:runs.append(prev-start+1);start=prev=yy
+        runs.append(prev-start+1)
+        longest=max(runs)
+        span=float(ys.max()-ys.min()+1)
+        # vertical QRS strokes are both contiguous and tall; isolated grid intersections score less
+        prof[x]=.72*longest+.28*min(span,2.2*longest)
+    return _tb_smooth(prof,3)
+
+def _rr_periodic_chains(candidates, rr_guess):
+    chains=[]
+    for start in candidates:
+        cur=[start]
+        for p in candidates:
+            if p<=cur[-1]:continue
+            d=p-cur[-1]
+            if .72*rr_guess<=d<=1.28*rr_guess:cur.append(p)
+        if len(cur)>=3:chains.append(cur)
+    # deduplicate near-identical chains
+    unique=[]
+    for c in chains:
+        if not any(len(c)==len(u) and np.median(np.abs(np.asarray(c)-np.asarray(u)))<4 for u in unique):
+            unique.append(c)
+    return unique
+
 def _rr_from_rhythm_region(ecg_image,rhythm_region):
-    """v11.3.1: RR authority runs on the reviewed Rhythm-II ROI itself."""
+    """v11.3.2: periodicity + independent vertical-stroke evidence to reject T-wave phase."""
     if not rhythm_region:return {"status":"UNRESOLVED","reason":"no_rhythm_region"}
     box=rhythm_region.get("box_pixels")
     if not box:return {"status":"UNRESOLVED","reason":"no_rhythm_box"}
@@ -859,67 +899,93 @@ def _rr_from_rhythm_region(ecg_image,rhythm_region):
     if crop.size==0:return {"status":"UNRESOLVED","reason":"empty_rhythm_crop"}
     h,w=crop.shape[:2]; f=crop.astype(float)
     gray=f.mean(axis=2); red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2])
-    # Suppress red grid and text margins. Track dark waveform within the central 72% vertically.
-    ink=(255-gray)-.45*np.maximum(red,0)
-    ya=int(.14*h);yb=int(.86*h); band=ink[ya:yb]
-    # waveform row is near a continuous horizontal baseline; use column-wise candidates then continuity.
-    thr=float(np.percentile(band,80)); raw=np.full(w,np.nan,float)
-    prev=None
+    ink=(255-gray)-.45*np.maximum(red,0); ya=int(.14*h);yb=int(.86*h);band=ink[ya:yb]
+    thr=float(np.percentile(band,80));raw=np.full(w,np.nan,float);prev=None
     for x in range(w):
         inds=np.where(band[:,x]>=thr)[0]
         if not len(inds):continue
         ys=ya+inds
-        if prev is None:
-            # start near middle, avoiding top/bottom text
-            pick=ys[np.argmin(np.abs(ys-h*.52))]
+        if prev is None:pick=ys[np.argmin(np.abs(ys-h*.52))]
         else:
-            # continuity cost; still allow steep QRS jumps
-            vals=band[inds,x]
-            cost=np.abs(ys-prev)-.18*vals
-            pick=ys[int(np.argmin(cost))]
+            vals=band[inds,x];cost=np.abs(ys-prev)-.18*vals;pick=ys[int(np.argmin(cost))]
         raw[x]=float(pick);prev=float(pick)
     cleaned,clqc=clean_centerline_signal(raw)
     if clqc.get("status")=="FAIL":return {"status":"UNRESOLVED","reason":"rhythm_roi_centerline_fail","centerline_qc":clqc}
     y=_tb_interp(cleaned)
     if y is None:return {"status":"UNRESOLVED","reason":"no_rhythm_centerline","centerline_qc":clqc}
-    y=_tb_smooth(y,3);n=len(y)
-    baseline=_tb_smooth(y,max(11,int(n*.035))); slope=np.abs(np.gradient(y)); hp=np.abs(y-baseline)
-    # QRS is steep; T is broad. Derivative dominates score.
-    score=_tb_smooth(slope,3)+.18*_tb_smooth(hp,3)
-    min_dist=max(14,int(n*.045));thr2=float(np.percentile(score,88));cand=[]
-    for pp in np.argsort(score)[::-1]:
+    y=_tb_smooth(y,3);n=len(y);baseline=_tb_smooth(y,max(11,int(n*.035)))
+    slope=np.abs(np.gradient(y));hp=np.abs(y-baseline)
+    vertical=_rr_vertical_stroke_profile(crop)
+    # Generate a generous event set so both QRS and T phases can compete.
+    slope_n=slope/(np.percentile(slope,95)+1e-6)
+    hp_n=hp/(np.percentile(hp,95)+1e-6)
+    vert_n=vertical/(np.percentile(vertical,95)+1e-6)
+    event=.55*slope_n+.10*hp_n+.35*vert_n
+    min_dist=max(12,int(n*.030));threshold=float(np.percentile(event,78));cand=[]
+    for pp in np.argsort(event)[::-1]:
         pp=int(pp)
-        if score[pp]<thr2:break
+        if event[pp]<threshold:break
         if .025*n<pp<.975*n and all(abs(pp-q)>=min_dist for q in cand):cand.append(pp)
-        if len(cand)>=28:break
+        if len(cand)>=40:break
     cand=sorted(cand)
-    if len(cand)<3:return {"status":"UNRESOLVED","reason":"fewer_than_3_qrs_candidates","candidates":cand,"centerline_qc":clqc}
-    # Find dominant RR cluster rather than requiring all candidates to be clean.
-    dif=np.diff(cand); dif=dif[dif>min_dist*.8]
-    if not len(dif):return {"status":"UNRESOLVED","reason":"no_rr_spacing","candidates":cand}
-    # mode-like robust RR estimate
-    med0=float(np.median(dif))
-    plausible=[d for d in dif if .55*med0<=d<=1.45*med0]
-    rr0=float(np.median(plausible if plausible else dif))
-    chain=[]
-    for start in cand:
-        cur=[start]
-        for p in cand:
-            if p<=cur[-1]:continue
-            d=p-cur[-1]
-            if .72*rr0<=d<=1.28*rr0:cur.append(p)
-            elif d>1.28*rr0 and d<1.8*rr0:continue
-        if len(cur)>len(chain):chain=cur
-    if len(chain)<3:return {"status":"UNRESOLVED","reason":"no_periodic_qrs_chain","candidates":cand}
-    rr=np.diff(chain);med=float(np.median(rr));cv=float(np.std(rr)/med) if len(rr)>=2 and med>0 else 1.
-    status="PASS" if len(chain)>=5 and cv<=.14 else "REVIEW" if len(chain)>=3 and cv<=.24 else "UNRESOLVED"
-    if status=="UNRESOLVED":return {"status":status,"reason":"unstable_rr_chain","fiducials_x":chain,"rr_cv":round(cv,3)}
-    k=int(np.argmin(np.abs(rr-med)));a=int(chain[k]);b=int(chain[k+1])
-    return {"status":status,"source":"engine_rhythm_roi","beats":len(chain),"fiducials_x":chain,
-            "start_x":a,"end_x":b,"rr_px":round(float(b-a),2),"median_rr_px":round(med,2),
-            "rr_cv":round(cv,3),"consecutive":True,"small_boxes":None,"rr_ms":None,
+    if len(cand)<6:return {"status":"UNRESOLVED","reason":"too_few_events","candidates":cand,"centerline_qc":clqc}
+
+    # Estimate cardiac cycle from repeated-event spacings; QRS and T may create half-cycle spacings,
+    # so test several robust RR hypotheses and let phase chains compete.
+    dif=np.diff(cand); dif=dif[dif>min_dist*.9]
+    if not len(dif):return {"status":"UNRESOLVED","reason":"no_event_spacing"}
+    hypotheses=[]
+    for q in (50,65,75,85):
+        d=float(np.percentile(dif,q))
+        for mult in (1.,2.):
+            rr=d*mult
+            if .08*n<=rr<=.20*n:hypotheses.append(rr)
+    if not hypotheses:
+        hypotheses=[float(np.median(dif))*2.]
+    allchains=[]
+    for rr0 in hypotheses:
+        allchains.extend(_rr_periodic_chains(cand,rr0))
+    if not allchains:return {"status":"UNRESOLVED","reason":"no_periodic_phase_chain","candidates":cand}
+
+    scored=[]
+    rad=max(2,int(.006*n))
+    for chain in allchains:
+        rr=np.diff(chain);med=float(np.median(rr));cv=float(np.std(rr)/med) if len(rr)>=2 and med>0 else 1.
+        vs=[];ss=[];ws=[]
+        for x in chain:
+            a=max(0,x-rad);b=min(n,x+rad+1)
+            vs.append(float(np.max(vert_n[a:b])))
+            ss.append(float(np.max(slope_n[a:b])))
+            # narrowness: high vertical/slope evidence relative to broad amplitude
+            ws.append(float((np.max(vert_n[a:b])+.6*np.max(slope_n[a:b]))/(.25+np.max(hp_n[a:b]))))
+        morphology=float(np.median(ws))
+        image_qrs=float(np.median(vs))
+        steep=float(np.median(ss))
+        periodic=max(0.,1.-min(cv,.5)/.5)
+        chain_score=.42*morphology+.28*image_qrs+.18*steep+.12*periodic
+        scored.append((chain_score,chain,med,cv,morphology,image_qrs,steep))
+    scored.sort(key=lambda z:z[0],reverse=True)
+    best=scored[0]; second=scored[1] if len(scored)>1 else None
+    separation=best[0]-second[0] if second else best[0]
+    _,chain,med,cv,morph,image_qrs,steep=best
+
+    # Critical safety rule: a beautifully periodic chain is not enough.
+    # QRS-vs-T image separation must also be convincing.
+    if separation<.10 or morph<.55 or image_qrs<.50:
+        return {"status":"UNRESOLVED","reason":"qrs_vs_t_not_separated","beats":len(chain),
+                "rr_cv":round(cv,3),"phase_separation":round(separation,3),
+                "qrs_shape_score":round(morph,3),"vertical_stroke_score":round(image_qrs,3),
+                "fiducials_x":chain,"centerline_qc":clqc}
+    status="PASS" if len(chain)>=5 and cv<=.14 and separation>=.16 else "REVIEW"
+    rr=np.diff(chain);k=int(np.argmin(np.abs(rr-med)));aa=int(chain[k]);bb=int(chain[k+1])
+    return {"status":status,"source":"engine_rhythm_roi_qrs_vs_t","beats":len(chain),"fiducials_x":chain,
+            "start_x":aa,"end_x":bb,"rr_px":round(float(bb-aa),2),"median_rr_px":round(med,2),
+            "rr_cv":round(cv,3),"phase_separation":round(separation,3),
+            "qrs_shape_score":round(morph,3),"vertical_stroke_score":round(image_qrs,3),
+            "consecutive":True,"small_boxes":None,"rr_ms":None,
             "conversion_status":"PENDING_VERIFIED_RHYTHM_GRID","centerline_qc":clqc,
             "rhythm_box":box,"rhythm_size":[w,h]}
+
 
 def rr_authority_overlay_from_region(ecg_image,rhythm_region,rr):
     if not rhythm_region or rr.get("status")=="UNRESOLVED":return None
@@ -1000,8 +1066,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.1"
-PROMPT_VERSION = "ecg-orientation-rr-hotfix-v11.3.1"
+APP_VERSION = "v11.3.2"
+PROMPT_VERSION = "ecg-rr-qrs-vs-t-v11.3.2"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2203,8 +2269,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · orientation + Rhythm-II RR authority hotfix")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.1 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · RR QRS-vs-T discriminator")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.2 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2456,17 +2522,19 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3 — Measurement Authority: RR**")
+    st.markdown("**v11.3.2 — Measurement Authority: RR (QRS-vs-T)**")
     if rr_authority:
-        _c=st.columns(4)
+        _c=st.columns(6)
         _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
         _c[1].metric("QRS beats",rr_authority.get("beats",0))
         _c[2].metric("RR px",rr_authority.get("rr_px","—"))
         _c[3].metric("RR CV",rr_authority.get("rr_cv","—"))
+        _c[4].metric("QRS/T sep",rr_authority.get("phase_separation","—"))
+        _c[5].metric("Vertical",rr_authority.get("vertical_stroke_score","—"))
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE — hai vạch phải đi qua hai QRS liên tiếp. Marker AI không có authority.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.2 — periodicity + vertical-stroke QRS evidence. Hai vạch phải đi qua hai QRS liên tiếp; nếu QRS/T không tách đủ rõ → UNRESOLVED.",width="stretch")
         if rr_authority.get("status")!="PASS":
             st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
     if any(min(r["sent_size"]) < 128 for r in regions):
