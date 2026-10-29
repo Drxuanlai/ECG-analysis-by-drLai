@@ -2468,7 +2468,7 @@ def _classify_per_lead_independent(item,ecg_image=None):
 
 def build_qrs_morphology_authority(digitizer_result,digitizer_evidence=None,ecg_image=None):
     """v13.1: use native signal_px bridge and independent QRS windows; never legacy O/J."""
-    result={"engine":"qrs-morphology-v13.6","status":"UNRESOLVED","leads":{},
+    result={"engine":"qrs-morphology-v13.7.1","status":"UNRESOLVED","leads":{},
             "rules":["Uses native per-lead signal_px waveform bridge.", "Converts image-y once to canonical ECG-y before QRS detection/alignment.", "Phase-locks QRS beats by local cross-correlation before median morphology.", "Canonical positive values mean upward ECG deflection.", "Full QRS boundaries use residual-fast-deflection look-ahead so post-R S/R-prime is not cut off at the first baseline return.", "Components are segmented around the dominant QRS anchor using baseline crossings; real post-R S waves are retained.", "R-prime requires a separated negative deflection between positive components.", "Polarity remains REVIEW until visually audited against the original lead.",
                      "QRS window is independently detected from slope/energy + median-beat consensus.",
                      "Legacy O/J coordinates are never used as morphology ground truth.",
@@ -2572,10 +2572,10 @@ def _sanitize_ai_result_v137(result, rr_authority=None, median_landmark_authorit
             return {k:walk(x) for k,x in v.items()}
         return v
     clean=walk(result)
-    clean["_authority_sanitizer_v13_7"]={"status":"APPLIED","blocked_or_rewritten":sorted(set(audit)),
-                                        "t_wave_authority":"PASS" if _authority_pass(t_authority) else "NOT_PASS",
-                                        "st_authority":"PASS" if _authority_pass(st_authority) else "NOT_PASS"}
-    return clean
+    audit_record={"status":"APPLIED","blocked_or_rewritten":sorted(set(audit)),
+                  "t_wave_authority":"PASS" if _authority_pass(t_authority) else "NOT_PASS",
+                  "st_authority":"PASS" if _authority_pass(st_authority) else "NOT_PASS"}
+    return clean,audit_record
 
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.7"
-PROMPT_VERSION = "ecg-qrs-identity-hard-sanitizer-v13.7"
+APP_VERSION = "v13.7.1"
+PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2793,8 +2793,9 @@ def parse_report(raw, regions):
             obj[key] = value
         return obj
     data = json.loads(raw, object_pairs_hook=unique_object)
-    data=_sanitize_ai_result_v137(data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
     ids = [r["id"] for r in regions]
+    # v13.7.1: validate the model's ORIGINAL JSON first. The sanitizer must never mutate
+    # schema shape before strict validation.
     validate_schema(data, report_schema(ids))
     seen = [o["region_id"] for o in data["observations"]]
     if sorted(seen) != sorted(ids):
@@ -3541,6 +3542,11 @@ def render_result(result):
                 st.caption(c["message"])
         if result["arithmetic"].get("has_blocking_warning",False):
             st.warning("Có số đo/mốc bị gắn cờ. Không dùng các số đo đó làm căn cứ định lượng; diễn giải định tính vẫn hiển thị để bác sĩ đối chiếu ECG gốc.")
+        _sa=result.get("authority_sanitizer") or {}
+        if _sa.get("status") == "APPLIED":
+            _blocked=_sa.get("blocked_or_rewritten") or []
+            if _blocked:
+                st.info("Authority sanitizer đã chặn các claim không có PASS: " + " | ".join(_blocked))
         st.subheader("Diễn giải AI — cần bác sĩ xác minh")
         for label, field in [("Nhịp", "rhythm"), ("Dẫn truyền", "conduction"), ("Tái cực", "repolarization")]:
             st.write(label + ": " + data[field])
@@ -3834,7 +3840,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.7 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.7.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4091,7 +4097,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.7 — QRS Identity Hotfix + Hard Authority Sanitizer**")
+    st.markdown("**v13.7.1 — QRS Identity + Schema-safe Authority Sanitizer**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
@@ -4099,7 +4105,7 @@ else:
     _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
     _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
     st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-    with st.expander("v13.7 QRS-identity + full-QRS visual audit",expanded=True):
+    with st.expander("v13.7.1 QRS-identity + full-QRS visual audit",expanded=True):
         for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
             _ev=(_qm.get("leads") or {}).get(_lead,{})
             _tw=_ev.get("template_wave")
@@ -4111,7 +4117,7 @@ else:
                 st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
     if _qm.get("status")=="UNRESOLVED":
         st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
-    with st.expander("v13.7 QRS identity + morphology evidence",expanded=False):
+    with st.expander("v13.7.1 QRS identity + morphology evidence",expanded=False):
         st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
@@ -4211,9 +4217,13 @@ else:
             actual_provider, actual_model = selected["provider"], selected["model"]
             actual_thinking = selected["thinking"]
             data, checks = None, None
+            sanitizer_audit = None
             if outcome["api_completed"]:
                 try:
                     data = parse_report(outcome["raw_response"],regions)
+                    # Schema is now proven valid. Sanitize only user-visible semantic content.
+                    data, sanitizer_audit = _sanitize_ai_result_v137(
+                        data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
                     checks = arithmetic_checks(data,known,age_years=age)
                     authority_report = measurement_authority_conflicts(data,rr_authority,j_st_evidence)
                     # Authority warnings are separate from arithmetic consistency:
@@ -4232,6 +4242,7 @@ else:
                 "time_utc":datetime.now(timezone.utc).isoformat(),"regions":regions,"prompt":prompt,
                 "prompt_sha256":hashlib.sha256(prompt.encode()).hexdigest(),"app_version":APP_VERSION,
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
+                "authority_sanitizer":sanitizer_audit,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
                 "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,"median_landmarks":median_landmark_authority,"qrs_morphology":qrs_morphology_authority,
                     "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
