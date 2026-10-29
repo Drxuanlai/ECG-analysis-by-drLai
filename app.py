@@ -1923,6 +1923,157 @@ def interval_authority_overlay(ecg_image,rhythm_region,interval_ev):
             arr[y1:y2,max(0,xx-thick):min(w,xx+thick+1)]=0
     return Image.fromarray(arr)
 
+# ----------------- PER-LEAD QRS MORPHOLOGY AUTHORITY v13.0 -----------------
+def _lead_wave_from_digitizer_item(item):
+    """Recover a 1-D lead waveform from digitizer evidence when available."""
+    if not isinstance(item,dict): return None
+    for key in ("centerline_y","centerline","trace_y","waveform_y","y"):
+        v=item.get(key)
+        if isinstance(v,(list,tuple)) and len(v)>=20:
+            try:return _tb_interp(np.asarray(v,float))
+            except Exception:return None
+    return None
+
+def _qrs_components_from_window(y,on,off,baseline=None):
+    """Segment signed QRS deflections inside a trusted window."""
+    y=np.asarray(y,float);on=max(1,int(on));off=min(len(y)-2,int(off))
+    if off-on<4:return []
+    if baseline is None:
+        pre=y[max(0,on-max(5,(off-on))):on]
+        post=y[off:min(len(y),off+max(5,(off-on)))]
+        vals=np.r_[pre,post]
+        baseline=float(np.median(vals)) if len(vals) else float(np.median(y[on:off+1]))
+    # Image y grows downward: invert so positive ECG deflection is positive.
+    z=-(y[on:off+1]-baseline)
+    amp=float(np.max(np.abs(z)))+1e-6
+    thr=max(.10*amp,float(np.median(np.abs(z)))*.55)
+    sign=np.zeros(len(z),int);sign[z>=thr]=1;sign[z<=-thr]=-1
+    # Fill very short zero gaps between same-sign runs.
+    for i in range(1,len(sign)-1):
+        if sign[i]==0 and sign[i-1]==sign[i+1]!=0:sign[i]=sign[i-1]
+    runs=[];i=0
+    while i<len(sign):
+        if sign[i]==0:i+=1;continue
+        sg=int(sign[i]);j=i+1
+        while j<len(sign) and sign[j]==sg:j+=1
+        seg=z[i:j];pk=i+int(np.argmax(seg) if sg>0 else np.argmin(seg))
+        runs.append({"sign":sg,"start":on+i,"end":on+j-1,"peak_x":on+pk,
+                     "amp_px":round(float(abs(z[pk])),2),"signed_amp_px":round(float(z[pk]),2),
+                     "width_px":j-i})
+        i=j
+    # merge adjacent same-sign fragments separated by <=2 px
+    merged=[]
+    for r in runs:
+        if merged and r["sign"]==merged[-1]["sign"] and r["start"]-merged[-1]["end"]<=3:
+            a=merged[-1]
+            if r["amp_px"]>a["amp_px"]:
+                a["peak_x"]=r["peak_x"];a["amp_px"]=r["amp_px"];a["signed_amp_px"]=r["signed_amp_px"]
+            a["end"]=r["end"];a["width_px"]=a["end"]-a["start"]+1
+        else:merged.append(dict(r))
+    return merged
+
+def _label_qrs_components(components):
+    """Standard ECG letter sequence without diagnosing a conduction pattern."""
+    if not components:return None,[]
+    pos_seen=0;neg_seen=0;labels=[]
+    maxamp=max(c["amp_px"] for c in components)+1e-6
+    for idx,c in enumerate(components):
+        small=c["amp_px"]<.45*maxamp
+        if c["sign"]>0:
+            pos_seen+=1
+            if pos_seen==1:base="r" if small else "R"
+            else:base="r′" if small else "R′"
+        else:
+            neg_seen+=1
+            # negative before first positive = q/Q; after positive = s/S.
+            if pos_seen==0:base="q" if small else "Q"
+            else:base="s" if small else "S"
+        labels.append(base)
+    # All-negative complex is QS when there is one dominant negative component.
+    if all(c["sign"]<0 for c in components):
+        if len(components)==1:labels=["QS"]
+    return "".join(labels),labels
+
+def _morphology_one_wave(y,on,off):
+    comps=_qrs_components_from_window(y,on,off)
+    code,labels=_label_qrs_components(comps)
+    if not code:return {"status":"UNRESOLVED","reason":"no_qrs_components"}
+    for c,l in zip(comps,labels):c["label"]=l
+    # confidence based on component prominence and sane component count
+    total=sum(c["amp_px"] for c in comps);mx=max(c["amp_px"] for c in comps)
+    prominence=mx/(total+1e-6)
+    status="PASS" if 1<=len(comps)<=4 and prominence>=.34 else "REVIEW"
+    return {"status":status,"morphology":code,"components":comps,
+            "component_count":len(comps),"dominant_fraction":round(prominence,3)}
+
+def _extract_digitizer_lead_items(digitizer_result):
+    """Best-effort normalize existing digitizer lead records without assuming one schema."""
+    out={}
+    if not isinstance(digitizer_result,dict):return out
+    candidates=[]
+    for key in ("leads","lead_results","results","per_lead","digitized_leads"):
+        v=digitizer_result.get(key)
+        if isinstance(v,list):candidates.extend(v)
+        elif isinstance(v,dict):
+            for name,item in v.items():
+                if isinstance(item,dict):
+                    z=dict(item);z.setdefault("lead",name);candidates.append(z)
+    for item in candidates:
+        if not isinstance(item,dict):continue
+        name=str(item.get("lead") or item.get("name") or item.get("label") or "").strip()
+        if name in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
+            out[name]=item
+    return out
+
+def build_qrs_morphology_authority(digitizer_result,digitizer_evidence=None):
+    """v13.0 conservative per-lead morphology. Never trusts legacy O/J unless its own landmark QC is PASS."""
+    leads=_extract_digitizer_lead_items(digitizer_result)
+    result={"engine":"qrs-morphology-v13.0","status":"UNRESOLVED","leads":{},
+            "rules":["Legacy O/J overlay is not morphology ground truth.",
+                     "Morphology requires a lead waveform plus a QRS window with PASS/REVIEW provenance.",
+                     "Calibration-pulse regions must not be classified as QRS components.",
+                     "Labels describe waveform sequence only; they do not by themselves diagnose BBB, infarction or hypertrophy."]}
+    if not leads:
+        result["reason"]="no_per_lead_waveform_records";return result
+    pass_n=review_n=0
+    for name,item in leads.items():
+        y=_lead_wave_from_digitizer_item(item)
+        landmark=str(item.get("landmark_status") or item.get("landmark") or item.get("qrs_qc") or "").upper()
+        # Accept several possible existing field names, but only explicit numeric boundaries.
+        on=item.get("qrs_onset_x",item.get("qrs_onset",item.get("onset_x")))
+        off=item.get("qrs_offset_x",item.get("qrs_offset",item.get("offset_x")))
+        ev={"status":"UNRESOLVED","source":"per_lead_digitizer_waveform"}
+        if y is None:
+            ev["reason"]="waveform_not_exposed_by_digitizer"
+        elif on is None or off is None:
+            ev["reason"]="qrs_window_not_exposed"
+        else:
+            try:on=float(on);off=float(off)
+            except Exception:
+                ev["reason"]="invalid_qrs_window";result["leads"][name]=ev;continue
+            # Legacy landmark must at least be explicitly PASS/REVIEW. UNRESOLVED cannot create morphology authority.
+            if landmark not in ("PASS","REVIEW"):
+                ev["reason"]="qrs_window_qc_not_authoritative"
+            else:
+                m=_morphology_one_wave(y,on,off);ev.update(m)
+                ev["qrs_onset_x"]=round(on,2);ev["qrs_offset_x"]=round(off,2);ev["window_qc"]=landmark
+                if landmark=="REVIEW" and ev.get("status")=="PASS":ev["status"]="REVIEW"
+        if ev["status"]=="PASS":pass_n+=1
+        elif ev["status"]=="REVIEW":review_n+=1
+        result["leads"][name]=ev
+    result["pass_count"]=pass_n;result["review_count"]=review_n
+    result["status"]="PASS" if pass_n>=8 and review_n<=4 else "REVIEW" if pass_n+review_n>=4 else "UNRESOLVED"
+    return result
+
+def qrs_morphology_table_rows(authority):
+    rows=[]
+    for lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
+        e=(authority or {}).get("leads",{}).get(lead,{})
+        rows.append({"Lead":lead,"QC":e.get("status","UNRESOLVED"),"Morphology":e.get("morphology","—"),
+                     "Components":e.get("component_count","—"),"Window QC":e.get("window_qc","—"),
+                     "Reason":e.get("reason","")})
+    return rows
+
 # ----------------- BỘ TIỀN XỬ LÝ ẢNH (OPENCV) -----------------
 def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0, sharpen_level=1.0, rotation_angle=0):
     img = np.array(pil_img)
@@ -1961,8 +2112,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v12.3 FINAL"
-PROMPT_VERSION = "ecg-final-interval-authority-v12.3"
+APP_VERSION = "v13.0"
+PROMPT_VERSION = "ecg-per-lead-qrs-morphology-v13.0"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2032,6 +2183,7 @@ SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
 SYSTEM_PROMPT += "\nLANDMARK AUTHORITY v12.3 FINAL: median_landmark_authority là authority ưu tiên cho PR/QRS/QT/QTc. QRS/T dùng R-anchored boundaries; P dùng nearest-valid-pre-QRS detector. Nếu cross_engine = DISAGREE thì phép đo tối đa REVIEW. Không được chọn số theo giá trị nào gần kỳ vọng hoặc số máy in hơn; phải giữ QC và nêu bất đồng.\n"
+SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.0: chỉ qrs_morphology_authority có quyền cung cấp nhãn q/Q/R/S/R′ định lượng theo lead. Overlay O/J legacy không phải ground truth và không được dùng nếu v13 UNRESOLVED/REVIEW. Morphology code mô tả chuỗi deflection, không tự động đồng nghĩa block nhánh, nhồi máu hay phì đại.\n"
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -3166,8 +3318,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · FINAL Interval Authority · nearest-pre-QRS P detector")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v12.3 FINAL thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Per-lead QRS Morphology Authority")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.0 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3268,7 +3420,7 @@ else:
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
-    digitizer_result=None; digitizer_evidence=None; rr_authority=None; interval_authority=None; median_landmark_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
+    digitizer_result=None; digitizer_evidence=None; rr_authority=None; interval_authority=None; median_landmark_authority=None; qrs_morphology_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
         if not DIGITIZER_AVAILABLE:
             st.warning("Chưa nạp được ecg_digitizer.py ("+DIGITIZER_IMPORT_ERROR+"). AI vẫn có thể đọc ảnh gốc; hãy kiểm tra file engine trên GitHub.")
@@ -3421,6 +3573,21 @@ else:
     signature = request_fingerprint(regions,prompt,provider,model,str(thinking)+route_signature)
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
+    qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence)
+    if digitizer_evidence is not None:
+        digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
+    st.markdown("**v13.0 — Per-lead QRS Morphology Authority**")
+    _qm=qrs_morphology_authority or {}
+    _qc=st.columns(4)
+    _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
+    _qc[1].metric("PASS leads",_qm.get("pass_count",0))
+    _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
+    _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
+    st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
+    if _qm.get("status")=="UNRESOLVED":
+        st.info("v13.0 chưa có đủ per-lead waveform + QRS window có authority. Không dùng O/J legacy nằm sai pha để ép morphology.")
+    with st.expander("QRS morphology evidence",expanded=False):
+        st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
         if digitizer_evidence is not None:
@@ -3541,7 +3708,7 @@ else:
                 "prompt_sha256":hashlib.sha256(prompt.encode()).hexdigest(),"app_version":APP_VERSION,
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
-                "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,"median_landmarks":median_landmark_authority,
+                "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,"median_landmarks":median_landmark_authority,"qrs_morphology":qrs_morphology_authority,
                     "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
                 "requested_provider":provider,"requested_model":model,
                 "image_settings":{"original_size":list(original.size),"oriented_size":list(oriented.size),
