@@ -2172,6 +2172,70 @@ def _morphology_audit_image(template,win,morph):
         pass
     return img
 
+def _full_qrs_window_v135(ecg_tpl,rough_win):
+    """Expand rough R-anchored QRS window to include residual fast deflections (e.g. post-R S/R-prime)."""
+    y=np.asarray(ecg_tpl,float);n=len(y)
+    if not rough_win:return None
+    on=int(rough_win["on"]);off=int(rough_win["off"]);anchor=int(rough_win["anchor"])
+    on=max(2,on);off=min(n-3,off)
+    # Local baseline/noise from areas outside rough QRS.
+    span=max(8,int(.30*n))
+    shoulders=np.r_[y[max(0,on-span):max(0,on-2)],y[min(n,off+3):min(n,off+span)]]
+    base=float(np.median(shoulders)) if len(shoulders) else 0.
+    z=y-base;ad=np.abs(np.gradient(y))
+    qamp=max(float(np.max(np.abs(z[max(0,on-3):min(n,off+4)]))),1e-6)
+    amp_noise=float(np.median(np.abs(shoulders-np.median(shoulders))))+1e-6 if len(shoulders) else .02*qamp
+    slope_noise=float(np.median(ad))+1e-6
+    amp_thr=max(2.0*amp_noise,.065*qamp)
+    slope_thr=max(2.0*slope_noise,.065*float(np.max(ad[max(0,on-3):min(n,off+4)])))
+    # Maximum expansion is deliberately bounded to avoid swallowing ST/T.
+    max_each=max(5,int(.16*n))
+    stable_run=max(3,int(.025*n))
+
+    def residual_exists(a,b):
+        a=max(1,int(a));b=min(n-2,int(b))
+        if b<=a:return False
+        zz=np.abs(z[a:b+1]);dd=ad[a:b+1]
+        active=(zz>=amp_thr)&(dd>=.65*slope_thr)
+        # A real residual deflection needs more than an isolated pixel.
+        return int(np.sum(active))>=2 and float(np.max(zz))>=amp_thr
+
+    # LEFT: if activity remains just before rough onset, extend through it until stable baseline.
+    left_limit=max(2,on-max_each)
+    x=on
+    while x>left_limit:
+        look_a=max(left_limit,x-max(4,stable_run+2))
+        if residual_exists(look_a,x-1):
+            x-=1;continue
+        inds=range(max(left_limit,x-stable_run),x)
+        if len(list(inds))>=2 and all(abs(z[i])<amp_thr and ad[i]<slope_thr for i in inds):
+            break
+        x-=1
+    full_on=int(x)
+
+    # RIGHT: critical v13.5 fix. Do not stop at first baseline crossing if a fast S/R-prime follows.
+    right_limit=min(n-3,off+max_each)
+    x=off
+    while x<right_limit:
+        look_b=min(right_limit,x+max(5,stable_run+3))
+        if residual_exists(x+1,look_b):
+            x+=1;continue
+        inds=range(x+1,min(right_limit+1,x+1+stable_run))
+        vals=list(inds)
+        if len(vals)>=2 and all(abs(z[i])<amp_thr and ad[i]<slope_thr for i in vals):
+            break
+        x+=1
+    full_off=int(x)
+
+    # Final sanity: full window must contain anchor and stay a minority of local template.
+    if not (full_on<anchor<full_off):return None
+    if full_off-full_on>max(int(.48*n),8):return None
+    return {"on":full_on,"off":full_off,"anchor":anchor,
+            "rough_on":on,"rough_off":off,
+            "expanded_left_px":on-full_on,"expanded_right_px":full_off-off,
+            "amp_threshold":round(amp_thr,3),"slope_threshold":round(slope_thr,3),
+            "method":"residual_fast_deflection_lookahead_v13.5"}
+
 def _canonical_qrs_components(ecg_tpl,on,off,anchor):
     """v13.4: segment true signed deflections around the dominant QRS anchor in canonical ECG-y."""
     y=np.asarray(ecg_tpl,float);on=max(1,int(on));off=min(len(y)-2,int(off));anchor=int(anchor)
@@ -2283,10 +2347,13 @@ def _classify_per_lead_independent(item,ecg_image=None):
     centers=_independent_qrs_centers(ecg_y,exclusion)
     tpl,ridx,meta,phaseqc=_phase_lock_qrs_beats(ecg_y,centers)
     if tpl is None:return {"status":"UNRESOLVED","reason":"fewer_than_2_phase_lockable_qrs","qrs_candidates":len(centers)}
-    win=_independent_qrs_window_from_template(tpl,ridx)
-    if not win:return {"status":"UNRESOLVED","reason":"independent_qrs_window_failed","qrs_candidates":len(centers),"phase_lock_qc":phaseqc}
+    rough_win=_independent_qrs_window_from_template(tpl,ridx)
+    if not rough_win:return {"status":"UNRESOLVED","reason":"independent_qrs_window_failed","qrs_candidates":len(centers),"phase_lock_qc":phaseqc}
+    win=_full_qrs_window_v135(tpl,rough_win)
+    if not win:return {"status":"UNRESOLVED","reason":"full_qrs_boundary_failed","qrs_candidates":len(centers),"phase_lock_qc":phaseqc,
+                       "rough_qrs_window":rough_win}
 
-    # v13.4: classify directly in canonical ECG-y around the QRS anchor.
+    # v13.5: component classifier sees the FULL QRS, including residual post-R S/R-prime.
     morph=_morphology_canonical(np.asarray(tpl,float),win["on"],win["off"],win["anchor"])
     if morph.get("status")=="UNRESOLVED":return morph
 
@@ -2311,14 +2378,15 @@ def _classify_per_lead_independent(item,ecg_image=None):
                  "median_template_corr":phaseqc.get("median_corr"),
                  "phase_lock_qc":phaseqc,"polarity_audit":polarity,
                  "template_qrs_on":win["on"],"template_qrs_off":win["off"],"template_anchor":win["anchor"],
+                 "full_qrs_boundary":win,"rough_qrs_window":rough_win,
                  "calibration_exclusion":exclusion,"centerline_qc":clqc,
                  "template_wave":[round(float(v),3) for v in tpl]})
     return morph
 
 def build_qrs_morphology_authority(digitizer_result,digitizer_evidence=None,ecg_image=None):
     """v13.1: use native signal_px bridge and independent QRS windows; never legacy O/J."""
-    result={"engine":"qrs-morphology-v13.4","status":"UNRESOLVED","leads":{},
-            "rules":["Uses native per-lead signal_px waveform bridge.", "Converts image-y once to canonical ECG-y before QRS detection/alignment.", "Phase-locks QRS beats by local cross-correlation before median morphology.", "Canonical positive values mean upward ECG deflection.", "Components are segmented around the dominant QRS anchor using baseline crossings; real post-R S waves are retained.", "R-prime requires a separated negative deflection between positive components.", "Polarity remains REVIEW until visually audited against the original lead.",
+    result={"engine":"qrs-morphology-v13.5","status":"UNRESOLVED","leads":{},
+            "rules":["Uses native per-lead signal_px waveform bridge.", "Converts image-y once to canonical ECG-y before QRS detection/alignment.", "Phase-locks QRS beats by local cross-correlation before median morphology.", "Canonical positive values mean upward ECG deflection.", "Full QRS boundaries use residual-fast-deflection look-ahead so post-R S/R-prime is not cut off at the first baseline return.", "Components are segmented around the dominant QRS anchor using baseline crossings; real post-R S waves are retained.", "R-prime requires a separated negative deflection between positive components.", "Polarity remains REVIEW until visually audited against the original lead.",
                      "QRS window is independently detected from slope/energy + median-beat consensus.",
                      "Legacy O/J coordinates are never used as morphology ground truth.",
                      "Calibration-pulse intervals are excluded before QRS detection.",
@@ -2388,8 +2456,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.4"
-PROMPT_VERSION = "ecg-r-centered-component-authority-v13.4"
+APP_VERSION = "v13.5"
+PROMPT_VERSION = "ecg-full-qrs-boundary-authority-v13.5"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2459,7 +2527,7 @@ SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
 SYSTEM_PROMPT += "\nLANDMARK AUTHORITY v12.3 FINAL: median_landmark_authority là authority ưu tiên cho PR/QRS/QT/QTc. QRS/T dùng R-anchored boundaries; P dùng nearest-valid-pre-QRS detector. Nếu cross_engine = DISAGREE thì phép đo tối đa REVIEW. Không được chọn số theo giá trị nào gần kỳ vọng hoặc số máy in hơn; phải giữ QC và nêu bất đồng.\n"
-SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.4: canonical ECG-y đã khóa. Components q/Q/r/R/s/S/R′ phải đến từ R-centered baseline-crossing segmentation. S thật sau R không được bỏ chỉ vì nhỏ; Q chỉ là negative component trước positive R; R′ chỉ hợp lệ khi có negative separation trước positive thứ hai. Lead REVIEW không phải verified morphology.\n"
+SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.5: canonical ECG-y và phase-lock đã khóa. QRS boundary phải bao trọn residual fast deflections trước khi phân loại components; không được đóng QRS-off ở baseline đầu tiên nếu còn S/R′ nhanh ngay sau đó. Không được mở window sang ST/T. q/Q/r/R/s/S/R′ chỉ đến từ full-QRS component segmentation; REVIEW không phải verified morphology.\n"
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -3595,7 +3663,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.4 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.5 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3852,7 +3920,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.4 — R-centered QRS Component Authority**")
+    st.markdown("**v13.5 — Full-QRS Boundary + Component Authority**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
@@ -3860,7 +3928,7 @@ else:
     _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
     _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
     st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-    with st.expander("v13.4 R-centered component visual audit",expanded=True):
+    with st.expander("v13.5 full-QRS component visual audit",expanded=True):
         for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
             _ev=(_qm.get("leads") or {}).get(_lead,{})
             _tw=_ev.get("template_wave")
@@ -3871,8 +3939,8 @@ else:
                 st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
                 st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
     if _qm.get("status")=="UNRESOLVED":
-        st.info("v13.4 chưa resolve đủ lead. Component segmentation không được nới để ép PASS; kiểm tra đặc biệt V2/V3/V4 regression controls.")
-    with st.expander("v13.4 R-centered component evidence",expanded=False):
+        st.info("v13.5 chưa resolve đủ lead. Full-QRS boundary không được nới để nuốt ST/T; kiểm tra V2/V3/V4 và bảo đảm III không regression.")
+    with st.expander("v13.5 full-QRS boundary + component evidence",expanded=False):
         st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
