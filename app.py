@@ -2052,8 +2052,100 @@ def _independent_qrs_window_from_template(template,ridx):
     if width<3 or width>.42*n:return None
     return {"on":int(q_on),"off":int(q_off),"anchor":int(anchor),"width":int(width)}
 
+def _phase_lock_qrs_beats(y,centers):
+    """Sub-beat phase locking by normalized cross-correlation around QRS energy."""
+    if len(centers)<2:return None,None,None,{}
+    dif=np.diff(centers);rr=float(np.median(dif)) if len(dif) else max(30.,len(y)/3.)
+    pre=max(12,int(.20*rr));post=max(14,int(.24*rr))
+    raw=[];meta=[]
+    for c in centers:
+        a=int(c-pre);b=int(c+post+1)
+        if a<0 or b>len(y):continue
+        w=np.asarray(y[a:b],float)
+        edge=max(3,int(.12*len(w)));w=w-float(np.median(np.r_[w[:edge],w[-edge:]]))
+        raw.append(w);meta.append({"center":int(c),"start":a})
+    if len(raw)<2:return None,None,None,{}
+    ref=np.median(np.vstack(raw),axis=0)
+    maxshift=max(3,int(.055*len(ref)))
+    locked=[];shifts=[];corrs=[]
+    for w in raw:
+        best=None
+        for sh in range(-maxshift,maxshift+1):
+            if sh<0:a=w[-sh:];b=ref[:len(a)]
+            elif sh>0:a=w[:-sh];b=ref[sh:sh+len(a)]
+            else:a=w;b=ref
+            if len(a)<12 or np.std(a)<1e-6 or np.std(b)<1e-6:continue
+            cc=float(np.corrcoef(a,b)[0,1])
+            if best is None or cc>best[0]:best=(cc,sh)
+        if best is None:continue
+        cc,sh=best
+        shifted=np.full_like(w,np.nan,dtype=float)
+        if sh<0:shifted[:sh]=w[-sh:]
+        elif sh>0:shifted[sh:]=w[:-sh]
+        else:shifted[:]=w
+        locked.append(shifted);shifts.append(int(sh));corrs.append(cc)
+    if len(locked)<2:return None,None,None,{}
+    stack=np.vstack(locked)
+    tpl=np.nanmedian(stack,axis=0)
+    # interpolate only small edge/gap NaNs for downstream boundary detector
+    tpl=_tb_interp(tpl)
+    qc={"status":"PASS" if len(corrs)>=3 and np.median(corrs)>=.86 else "REVIEW",
+        "beats":len(corrs),"median_corr":round(float(np.median(corrs)),3),
+        "median_abs_shift_px":round(float(np.median(np.abs(shifts))),2),
+        "max_abs_shift_px":int(max(abs(x) for x in shifts)),"shifts_px":shifts}
+    return tpl,pre,meta,qc
+
+def _polarity_audit_from_item(item,template,win):
+    """Audit sign convention. signal_px is image-y, so ECG-positive must map to decreasing y.
+    We record this explicitly rather than silently assuming morphology polarity is verified.
+    """
+    if template is None or not win:return {"status":"UNRESOLVED","reason":"no_template"}
+    on,off=win["on"],win["off"]
+    seg=np.asarray(template[on:off+1],float)
+    if len(seg)<4:return {"status":"UNRESOLVED","reason":"short_qrs"}
+    # Baseline from template edges; image-up excursion = baseline - y.
+    span=max(4,off-on)
+    pre=np.asarray(template[max(0,on-span):on],float)
+    post=np.asarray(template[off+1:min(len(template),off+1+span)],float)
+    vals=np.r_[pre,post]
+    base=float(np.median(vals)) if len(vals) else float(np.median(seg))
+    ecg=base-seg
+    pos=float(np.max(ecg));neg=float(abs(np.min(ecg)))
+    dominant="positive" if pos>neg else "negative"
+    # Native signal_px convention is known from digitizer construction, but visual agreement
+    # is not independently proven here, so authority remains REVIEW until audit overlay is inspected.
+    return {"status":"REVIEW","mapping":"ecg_positive = baseline - signal_px",
+            "baseline_y":round(base,2),"positive_excursion_px":round(pos,2),
+            "negative_excursion_px":round(neg,2),"dominant_polarity":dominant,
+            "reason":"requires_visual_audit_against_original_lead"}
+
+def _morphology_audit_image(template,win,morph):
+    """Large monochrome median-QRS audit with boundaries and component peak markers."""
+    if template is None or not win:return None
+    vals=np.asarray(template,float);W=900;H=300;margin=25
+    lo,hi=np.percentile(vals,[2,98])
+    if hi-lo<1e-6:hi=lo+1
+    xs=np.linspace(margin,W-margin,len(vals))
+    ys=(H-margin)-((vals-lo)/(hi-lo))*(H-2*margin)
+    canvas=np.full((H,W,3),255,np.uint8)
+    for i in range(len(xs)-1):
+        x1,y1=int(xs[i]),int(ys[i]);x2,y2=int(xs[i+1]),int(ys[i+1])
+        steps=max(abs(x2-x1),abs(y2-y1),1)
+        xx=np.linspace(x1,x2,steps+1).astype(int);yy=np.linspace(y1,y2,steps+1).astype(int)
+        canvas[np.clip(yy,0,H-1),np.clip(xx,0,W-1)]=0
+    for key,th in (("on",2),("off",2)):
+        v=win.get(key)
+        if v is not None:
+            x=int(margin+(W-2*margin)*v/max(1,len(vals)-1))
+            canvas[:,max(0,x-th):min(W,x+th+1)]=0
+    for c in (morph or {}).get("components",[]):
+        v=c.get("peak_x")
+        if v is None:continue
+        x=int(margin+(W-2*margin)*v/max(1,len(vals)-1))
+        canvas[:int(.22*H),max(0,x-1):min(W,x+2)]=0
+    return Image.fromarray(canvas)
+
 def _classify_per_lead_independent(item,ecg_image=None):
-    """Bridge signal_px -> pulse mask -> independent QRS consensus -> morphology."""
     raw=_lead_wave_from_digitizer_item(item)
     if raw is None:return {"status":"UNRESOLVED","reason":"waveform_not_exposed_by_digitizer"}
     lqc=(item.get("qc") or {}).get("status","FAIL")
@@ -2065,36 +2157,32 @@ def _classify_per_lead_independent(item,ecg_image=None):
     y=_tb_interp(cleaned)
     if y is None:return {"status":"UNRESOLVED","reason":"centerline_support"}
     centers=_independent_qrs_centers(y,exclusion)
-    tpl,ridx,used=_median_qrs_template(y,centers)
-    if tpl is None:return {"status":"UNRESOLVED","reason":"fewer_than_2_independent_qrs","qrs_candidates":len(centers)}
+    tpl,ridx,meta,phaseqc=_phase_lock_qrs_beats(y,centers)
+    if tpl is None:return {"status":"UNRESOLVED","reason":"fewer_than_2_phase_lockable_qrs","qrs_candidates":len(centers)}
     win=_independent_qrs_window_from_template(tpl,ridx)
-    if not win:return {"status":"UNRESOLVED","reason":"independent_qrs_window_failed","qrs_candidates":len(centers)}
-    m=_morphology_one_wave(tpl,win["on"],win["off"])
-    if m.get("status")=="UNRESOLVED":return m
-    # Beat-template consistency
-    corrs=[]
-    pre=ridx;post=len(tpl)-ridx-1
-    for c in used:
-        aa=int(c-pre);bb=int(c+post+1)
-        if aa<0 or bb>len(y):continue
-        w=np.asarray(y[aa:bb],float);edge=max(3,int(.12*len(w)))
-        w=w-float(np.median(np.r_[w[:edge],w[-edge:]]))
-        if np.std(w)>1e-6 and np.std(tpl)>1e-6:corrs.append(float(np.corrcoef(w,tpl)[0,1]))
-    medcorr=float(np.median(corrs)) if corrs else 0.
-    consensus="PASS" if len(corrs)>=2 and medcorr>=.82 else "REVIEW"
-    if consensus=="REVIEW" and m.get("status")=="PASS":m["status"]="REVIEW"
-    if lqc=="REVIEW" and m.get("status")=="PASS":m["status"]="REVIEW"
-    m.update({"source":"signal_px_waveform_bridge","window_source":"independent_qrs_template",
-              "window_qc":consensus,"digitizer_lead_qc":lqc,"qrs_candidates":len(centers),
-              "beats_used":len(used),"median_template_corr":round(medcorr,3),
-              "template_qrs_on":win["on"],"template_qrs_off":win["off"],"template_anchor":win["anchor"],
-              "calibration_exclusion":exclusion,"centerline_qc":clqc})
-    return m
+    if not win:return {"status":"UNRESOLVED","reason":"independent_qrs_window_failed","qrs_candidates":len(centers),"phase_lock_qc":phaseqc}
+    morph=_morphology_one_wave(tpl,win["on"],win["off"])
+    if morph.get("status")=="UNRESOLVED":return morph
+    polarity=_polarity_audit_from_item(item,tpl,win)
+    # v13.2 safety: morphology cannot PASS until polarity visual audit is confirmed.
+    status=morph.get("status","REVIEW")
+    if phaseqc.get("status")!="PASS" or polarity.get("status")!="PASS" or lqc!="PASS" or clqc.get("status")!="PASS":
+        status="REVIEW"
+    morph.update({"status":status,"source":"signal_px_waveform_bridge",
+                 "window_source":"phase_locked_independent_qrs_template",
+                 "window_qc":phaseqc.get("status","REVIEW"),"digitizer_lead_qc":lqc,
+                 "qrs_candidates":len(centers),"beats_used":phaseqc.get("beats",0),
+                 "median_template_corr":phaseqc.get("median_corr"),
+                 "phase_lock_qc":phaseqc,"polarity_audit":polarity,
+                 "template_qrs_on":win["on"],"template_qrs_off":win["off"],"template_anchor":win["anchor"],
+                 "calibration_exclusion":exclusion,"centerline_qc":clqc,
+                 "template_wave":[round(float(v),3) for v in tpl]})
+    return morph
 
 def build_qrs_morphology_authority(digitizer_result,digitizer_evidence=None,ecg_image=None):
     """v13.1: use native signal_px bridge and independent QRS windows; never legacy O/J."""
-    result={"engine":"qrs-morphology-v13.1","status":"UNRESOLVED","leads":{},
-            "rules":["Uses native per-lead signal_px waveform bridge.",
+    result={"engine":"qrs-morphology-v13.2","status":"UNRESOLVED","leads":{},
+            "rules":["Uses native per-lead signal_px waveform bridge.", "Phase-locks QRS beats by local cross-correlation before median morphology.", "Polarity remains REVIEW until visually audited against the original lead.",
                      "QRS window is independently detected from slope/energy + median-beat consensus.",
                      "Legacy O/J coordinates are never used as morphology ground truth.",
                      "Calibration-pulse intervals are excluded before QRS detection.",
@@ -2164,8 +2252,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.1.1"
-PROMPT_VERSION = "ecg-waveform-bridge-independent-qrs-v13.1.1"
+APP_VERSION = "v13.2"
+PROMPT_VERSION = "ecg-polarity-phase-lock-morphology-v13.2"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2235,7 +2323,7 @@ SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
 SYSTEM_PROMPT += "\nLANDMARK AUTHORITY v12.3 FINAL: median_landmark_authority là authority ưu tiên cho PR/QRS/QT/QTc. QRS/T dùng R-anchored boundaries; P dùng nearest-valid-pre-QRS detector. Nếu cross_engine = DISAGREE thì phép đo tối đa REVIEW. Không được chọn số theo giá trị nào gần kỳ vọng hoặc số máy in hơn; phải giữ QC và nêu bất đồng.\n"
-SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.1: qrs_morphology_authority dùng native signal_px + independent QRS-window consensus. O/J legacy tuyệt đối không phải ground truth morphology. Chỉ lead PASS được dùng như verified morphology; REVIEW phải nêu cần kiểm tra; UNRESOLVED không được AI tự hoàn thành. Morphology code không tự động đồng nghĩa block nhánh, nhồi máu hay phì đại.\n"
+SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.2: morphology dùng signal_px + phase-locked median QRS + independent boundaries. Polarity phải được visual-audit; lead REVIEW không được coi morphology là verified. O/J legacy không có authority. Không được chọn morphology theo kỳ vọng lâm sàng hoặc hình máy in nếu engine chưa PASS.\n"
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -3371,7 +3459,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.1.1 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.2 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3628,7 +3716,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.1.1 — Waveform Bridge + Independent QRS Morphology Authority**")
+    st.markdown("**v13.2 — Polarity + Phase-locked QRS Morphology Audit**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
@@ -3636,9 +3724,19 @@ else:
     _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
     _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
     st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
+    with st.expander("v13.2 visual morphology audit",expanded=True):
+        for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
+            _ev=(_qm.get("leads") or {}).get(_lead,{})
+            _tw=_ev.get("template_wave")
+            if not _tw: continue
+            _win={"on":_ev.get("template_qrs_on"),"off":_ev.get("template_qrs_off")}
+            _img=_morphology_audit_image(np.asarray(_tw,float),_win,_ev)
+            if _img is not None:
+                st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
+                st.image(_img,caption=f"{_lead}: phase-locked median QRS · thick lines=QRS boundaries · top ticks=component peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
     if _qm.get("status")=="UNRESOLVED":
-        st.info("v13.1 chưa resolve đủ lead. Engine dùng signal_px thật của digitizer và tự dựng QRS window; O/J legacy không tham gia morphology.")
-    with st.expander("v13.1 waveform bridge + morphology evidence",expanded=False):
+        st.info("v13.2 chưa resolve đủ lead. Phase-lock/polarity audit không được nới để ép PASS; hãy kiểm tra visual morphology audit.")
+    with st.expander("v13.2 phase-lock + polarity evidence",expanded=False):
         st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
