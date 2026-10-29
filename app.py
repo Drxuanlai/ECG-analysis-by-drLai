@@ -1746,6 +1746,7 @@ def median_beat_overlay_image(authority):
     x=np.linspace(margin,W-margin,len(vals))
     lo,hi=np.percentile(vals,[2,98])
     if hi-lo<1e-6:hi=lo+1
+    # Canonical ECG-y: larger positive value is drawn higher on screen.
     yy=(H-margin)-((vals-lo)/(hi-lo))*(H-2*margin)
     canvas=np.full((H,W,3),255,np.uint8)
     # draw waveform
@@ -2052,6 +2053,17 @@ def _independent_qrs_window_from_template(template,ridx):
     if width<3 or width>.42*n:return None
     return {"on":int(q_on),"off":int(q_off),"anchor":int(anchor),"width":int(width)}
 
+def _to_canonical_ecg_y(image_y):
+    """Convert image-y (down is positive) to canonical ECG-y (upward ECG deflection is positive)."""
+    y=np.asarray(image_y,float)
+    if len(y)<5:return y,{"status":"UNRESOLVED","reason":"short_signal"}
+    # Slowly varying baseline preserves QRS/ST morphology while removing page curvature/row drift.
+    n=max(15,int(round(len(y)*.09))); n+=(n%2==0)
+    base=_tb_smooth(y,n)
+    ecg=base-y
+    return ecg,{"status":"PASS","mapping":"canonical_ecg_y = local_baseline(image_y) - image_y",
+                "baseline_window_px":n}
+
 def _phase_lock_qrs_beats(y,centers):
     """Sub-beat phase locking by normalized cross-correlation around QRS energy."""
     if len(centers)<2:return None,None,None,{}
@@ -2154,22 +2166,42 @@ def _classify_per_lead_independent(item,ecg_image=None):
     masked=_apply_exclusion_to_signal(raw,exclusion)
     cleaned,clqc=clean_centerline_signal(masked)
     if clqc.get("status")=="FAIL":return {"status":"UNRESOLVED","reason":"centerline_qc_fail","centerline_qc":clqc}
-    y=_tb_interp(cleaned)
-    if y is None:return {"status":"UNRESOLVED","reason":"centerline_support"}
-    centers=_independent_qrs_centers(y,exclusion)
-    tpl,ridx,meta,phaseqc=_phase_lock_qrs_beats(y,centers)
+    image_y=_tb_interp(cleaned)
+    if image_y is None:return {"status":"UNRESOLVED","reason":"centerline_support"}
+
+    # v13.3 canonical coordinate: EVERYTHING below uses ECG-y, never raw image-y.
+    ecg_y,coordqc=_to_canonical_ecg_y(image_y)
+    if coordqc.get("status")!="PASS":return {"status":"UNRESOLVED","reason":"canonical_coordinate_failed"}
+
+    centers=_independent_qrs_centers(ecg_y,exclusion)
+    tpl,ridx,meta,phaseqc=_phase_lock_qrs_beats(ecg_y,centers)
     if tpl is None:return {"status":"UNRESOLVED","reason":"fewer_than_2_phase_lockable_qrs","qrs_candidates":len(centers)}
     win=_independent_qrs_window_from_template(tpl,ridx)
     if not win:return {"status":"UNRESOLVED","reason":"independent_qrs_window_failed","qrs_candidates":len(centers),"phase_lock_qc":phaseqc}
-    morph=_morphology_one_wave(tpl,win["on"],win["off"])
+
+    # Classifier previously inverted image-y internally. tpl is now canonical ECG-y,
+    # so convert once to synthetic image-y solely for the legacy component helper.
+    # This preserves one sign convention without rewriting its tested segmentation logic.
+    synthetic_image_y=-np.asarray(tpl,float)
+    morph=_morphology_one_wave(synthetic_image_y,win["on"],win["off"])
     if morph.get("status")=="UNRESOLVED":return morph
-    polarity=_polarity_audit_from_item(item,tpl,win)
-    # v13.2 safety: morphology cannot PASS until polarity visual audit is confirmed.
+
+    # Direct canonical polarity audit.
+    qseg=np.asarray(tpl[win["on"]:win["off"]+1],float)
+    pos=float(np.max(qseg)) if len(qseg) else 0.
+    neg=float(abs(np.min(qseg))) if len(qseg) else 0.
+    polarity={"status":"REVIEW",
+              "mapping":"canonical ECG-y: positive array value = upward ECG deflection",
+              "positive_excursion_px":round(pos,2),"negative_excursion_px":round(neg,2),
+              "dominant_polarity":"positive" if pos>=neg else "negative",
+              "reason":"requires_visual_audit_against_original_lead"}
+
     status=morph.get("status","REVIEW")
     if phaseqc.get("status")!="PASS" or polarity.get("status")!="PASS" or lqc!="PASS" or clqc.get("status")!="PASS":
         status="REVIEW"
-    morph.update({"status":status,"source":"signal_px_waveform_bridge",
-                 "window_source":"phase_locked_independent_qrs_template",
+    morph.update({"status":status,"source":"signal_px_to_canonical_ecg_y",
+                 "coordinate_qc":coordqc,
+                 "window_source":"phase_locked_canonical_qrs_template",
                  "window_qc":phaseqc.get("status","REVIEW"),"digitizer_lead_qc":lqc,
                  "qrs_candidates":len(centers),"beats_used":phaseqc.get("beats",0),
                  "median_template_corr":phaseqc.get("median_corr"),
@@ -2181,8 +2213,8 @@ def _classify_per_lead_independent(item,ecg_image=None):
 
 def build_qrs_morphology_authority(digitizer_result,digitizer_evidence=None,ecg_image=None):
     """v13.1: use native signal_px bridge and independent QRS windows; never legacy O/J."""
-    result={"engine":"qrs-morphology-v13.2","status":"UNRESOLVED","leads":{},
-            "rules":["Uses native per-lead signal_px waveform bridge.", "Phase-locks QRS beats by local cross-correlation before median morphology.", "Polarity remains REVIEW until visually audited against the original lead.",
+    result={"engine":"qrs-morphology-v13.3","status":"UNRESOLVED","leads":{},
+            "rules":["Uses native per-lead signal_px waveform bridge.", "Converts image-y once to canonical ECG-y before QRS detection/alignment.", "Phase-locks QRS beats by local cross-correlation before median morphology.", "Canonical positive values mean upward ECG deflection.", "Polarity remains REVIEW until visually audited against the original lead.",
                      "QRS window is independently detected from slope/energy + median-beat consensus.",
                      "Legacy O/J coordinates are never used as morphology ground truth.",
                      "Calibration-pulse intervals are excluded before QRS detection.",
@@ -2252,8 +2284,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.2"
-PROMPT_VERSION = "ecg-polarity-phase-lock-morphology-v13.2"
+APP_VERSION = "v13.3"
+PROMPT_VERSION = "ecg-canonical-coordinate-morphology-v13.3"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2323,7 +2355,7 @@ SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
 SYSTEM_PROMPT += "\nLANDMARK AUTHORITY v12.3 FINAL: median_landmark_authority là authority ưu tiên cho PR/QRS/QT/QTc. QRS/T dùng R-anchored boundaries; P dùng nearest-valid-pre-QRS detector. Nếu cross_engine = DISAGREE thì phép đo tối đa REVIEW. Không được chọn số theo giá trị nào gần kỳ vọng hoặc số máy in hơn; phải giữ QC và nêu bất đồng.\n"
-SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.2: morphology dùng signal_px + phase-locked median QRS + independent boundaries. Polarity phải được visual-audit; lead REVIEW không được coi morphology là verified. O/J legacy không có authority. Không được chọn morphology theo kỳ vọng lâm sàng hoặc hình máy in nếu engine chưa PASS.\n"
+SYSTEM_PROMPT += "\nQRS MORPHOLOGY AUTHORITY v13.3: signal_px phải được chuyển một lần sang canonical ECG-y (dương=hướng lên) trước detection/alignment/morphology. Visual audit cũng dùng cùng canonical coordinate. Lead REVIEW không phải verified morphology; O/J legacy không có authority. Không được chọn morphology theo kỳ vọng lâm sàng hay số máy in.\n"
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -3459,7 +3491,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.2 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.3 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3716,7 +3748,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.2 — Polarity + Phase-locked QRS Morphology Audit**")
+    st.markdown("**v13.3 — Canonical ECG Coordinate + QRS Morphology Authority**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
@@ -3724,7 +3756,7 @@ else:
     _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
     _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
     st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-    with st.expander("v13.2 visual morphology audit",expanded=True):
+    with st.expander("v13.3 canonical-coordinate visual morphology audit",expanded=True):
         for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
             _ev=(_qm.get("leads") or {}).get(_lead,{})
             _tw=_ev.get("template_wave")
@@ -3733,10 +3765,10 @@ else:
             _img=_morphology_audit_image(np.asarray(_tw,float),_win,_ev)
             if _img is not None:
                 st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
-                st.image(_img,caption=f"{_lead}: phase-locked median QRS · thick lines=QRS boundaries · top ticks=component peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
+                st.image(_img,caption=f"{_lead}: canonical ECG-y median QRS · positive=UP · thick lines=QRS boundaries · top ticks=component peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
     if _qm.get("status")=="UNRESOLVED":
-        st.info("v13.2 chưa resolve đủ lead. Phase-lock/polarity audit không được nới để ép PASS; hãy kiểm tra visual morphology audit.")
-    with st.expander("v13.2 phase-lock + polarity evidence",expanded=False):
+        st.info("v13.3 chưa resolve đủ lead. Canonical coordinate/phase-lock không được nới để ép PASS; hãy đối chiếu median QRS với lead gốc.")
+    with st.expander("v13.3 canonical-coordinate + phase-lock evidence",expanded=False):
         st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
