@@ -1528,53 +1528,80 @@ def _aligned_r_beats(signal, rxs, rr_px):
     template=np.nanmedian(stack,axis=0)
     return template,beats,pre
 
+def _stable_baseline_run(z,ad,start,direction,amp_tol,slope_tol,min_run):
+    """Walk away from R/T/P and find first persistent near-baseline low-slope run."""
+    n=len(z);x=int(start)
+    while 1<=x<n-1:
+        inds=[x+direction*k for k in range(min_run)]
+        if min(inds)<1 or max(inds)>=n-1:return None
+        ok=[abs(z[i])<=amp_tol and ad[i]<=slope_tol for i in inds]
+        if all(ok):
+            # boundary is point nearest the active complex, not far edge of stable run
+            return int(x)
+        x+=direction
+    return None
+
 def _template_landmarks_v121(template,r_index,rr_px,grid_px):
-    """Landmarks on one median beat. Conservative engineering detector."""
+    """v12.2: R-anchored bidirectional QRS boundary search + baseline-return P/T."""
     y=_tb_smooth(np.asarray(template,float),3);n=len(y);r=int(r_index)
     rr=float(rr_px);g=float(grid_px)
-    baseline=_tb_smooth(y,max(9,int(.09*rr)));z=y-baseline
+    # Baseline deliberately much broader than QRS.
+    baseline=_tb_smooth(y,max(15,int(.16*rr)));z=y-baseline
     d=np.gradient(y);ad=np.abs(d)
 
-    # QRS: derivative activity around R, expand to return toward baseline/low slope.
-    qa=max(2,int(r-.18*rr));qb=min(n-3,int(r+.18*rr))
-    if qb-qa<8:return None
-    qthr=max(float(np.percentile(ad[qa:qb],58)),.16*float(np.max(ad[qa:qb])))
-    peak=qa+int(np.argmax(ad[qa:qb]))
-    left=peak
-    while left>qa and (ad[left]>=.38*qthr or abs(z[left])>=.10*np.max(np.abs(z[qa:qb]))):left-=1
-    right=peak
-    while right<qb-1 and (ad[right]>=.38*qthr or abs(z[right])>=.10*np.max(np.abs(z[qa:qb]))):right+=1
-    q_on=int(left);q_off=int(right)
-    if not (.35*g<=q_off-q_on<=6.0*g):return None
+    # Local noise from presumed isoelectric zones, avoiding P/QRS/T centers.
+    noise_parts=[]
+    for aa,bb in [(int(r-.42*rr),int(r-.30*rr)),(int(r+.20*rr),int(r+.30*rr)),(int(r+.58*rr),int(r+.66*rr))]:
+        aa=max(1,aa);bb=min(n-1,bb)
+        if bb-aa>=3:noise_parts.extend(np.abs(z[aa:bb]).tolist())
+    amp_noise=float(np.median(noise_parts))+1e-6 if noise_parts else float(np.median(np.abs(z)))+1e-6
+    slope_noise=float(np.median(ad))+1e-6
 
-    # P peak/onset before QRS.
-    pa=max(2,int(q_on-.38*rr));pb=max(pa+6,int(q_on-.07*rr))
+    # QRS amplitude and guards.
+    qa=max(2,int(r-.16*rr));qb=min(n-3,int(r+.16*rr))
+    qamp=float(np.max(np.abs(z[qa:qb])))+1e-6
+    amp_tol=max(1.8*amp_noise,.07*qamp)
+    slope_tol=max(1.8*slope_noise,.06*float(np.max(ad[qa:qb])))
+    run=max(3,int(round(.012*rr)))
+
+    # Search from R outward; boundaries are persistent return-to-baseline locations.
+    q_on=_stable_baseline_run(z,ad,r,-1,amp_tol,slope_tol,run)
+    q_off=_stable_baseline_run(z,ad,r,+1,amp_tol,slope_tol,run)
+    if q_on is None or q_off is None:return None
+    # Hard technical window: do not allow QRS boundary search to swallow P/ST/T.
+    if r-q_on>.14*rr or q_off-r>.14*rr:return None
+    qwidth=q_off-q_on
+    if not (.35*g<=qwidth<=4.5*g):return None
+
+    # P: identify dominant pre-QRS deflection, then walk LEFT to persistent baseline.
+    pa=max(2,int(q_on-.36*rr));pb=max(pa+6,int(q_on-.06*rr))
     p_on=p_peak=None;p_conf=0.
     if pb-pa>=8:
-        seg=z[pa:pb];pk=pa+int(np.argmax(np.abs(seg)))
-        amp=abs(float(z[pk]));noise=float(np.median(np.abs(seg)))+1e-6
-        if amp>=1.45*noise:
-            pdnoise=float(np.median(ad[pa:pb]))+1e-6
-            x=pk
-            while x>pa and (abs(z[x])>.16*amp or ad[x]>1.25*pdnoise):x-=1
-            p_on=int(x);p_peak=int(pk);p_conf=min(1.,amp/(3.2*noise))
+        seg=np.abs(z[pa:pb]);pk=pa+int(np.argmax(seg));amp=float(abs(z[pk]))
+        local_noise=float(np.median(seg))+1e-6
+        if amp>=1.55*local_noise:
+            pon=_stable_baseline_run(z,ad,pk,-1,max(1.6*amp_noise,.12*amp),
+                                     max(1.6*slope_noise,.08*np.max(ad[pa:pb])),run)
+            if pon is not None and pa<=pon<pk:
+                p_on=int(pon);p_peak=int(pk);p_conf=min(1.,amp/(3.2*local_noise))
 
-    # T peak/end after QRS.
-    ta=min(n-3,int(q_off+.06*rr));tb=min(n-3,int(q_off+.58*rr))
+    # T: dominant broad post-QRS deflection; walk RIGHT to persistent baseline.
+    ta=min(n-3,int(q_off+.07*rr));tb=min(n-3,int(q_off+.58*rr))
     t_peak=t_end=None;t_conf=0.
     if tb-ta>=10:
-        pk=ta+int(np.argmax(np.abs(z[ta:tb])));amp=abs(float(z[pk]))
-        noise=float(np.median(np.abs(z[max(0,ta-int(.08*rr)):ta])))+1e-6
-        if amp>=1.8*noise:
-            tol=max(1.5*noise,.10*amp);dnoise=float(np.median(ad[ta:tb]))+1e-6
-            for x in range(pk+1,tb):
-                e=min(tb,x+max(3,int(.025*rr)))
-                if abs(z[x])<=tol and ad[x]<=2*dnoise and np.mean(np.abs(z[x:e])<=1.5*tol)>=.65:
-                    t_end=int(x);break
-            t_peak=int(pk);t_conf=min(1.,amp/(4.*noise))
+        seg=np.abs(z[ta:tb]);pk=ta+int(np.argmax(seg));amp=float(abs(z[pk]))
+        local_noise=float(np.median(seg))+1e-6
+        if amp>=1.7*local_noise:
+            tend=_stable_baseline_run(z,ad,pk,+1,max(1.8*amp_noise,.10*amp),
+                                      max(1.8*slope_noise,.08*np.max(ad[ta:tb])),run)
+            if tend is not None and pk<tend<=tb:
+                t_peak=int(pk);t_end=int(tend);t_conf=min(1.,amp/(4.*local_noise))
 
-    return {"p_on":p_on,"p_peak":p_peak,"qrs_on":q_on,"r":r,"qrs_off":q_off,
-            "t_peak":t_peak,"t_end":t_end,"p_conf":round(p_conf,3),"t_conf":round(t_conf,3)}
+    return {"p_on":p_on,"p_peak":p_peak,"qrs_on":int(q_on),"r":r,"qrs_off":int(q_off),
+            "t_peak":t_peak,"t_end":t_end,"p_conf":round(p_conf,3),"t_conf":round(t_conf,3),
+            "baseline_amp_noise":round(amp_noise,3),"baseline_slope_noise":round(slope_noise,3),
+            "qrs_amp":round(qamp,3),"boundary_method":"R_anchored_return_to_baseline"}
+
 
 def _project_template_landmarks(beats,lm,r_index):
     """Project fixed median-beat landmark offsets to each R-aligned beat."""
@@ -1590,7 +1617,7 @@ def _project_template_landmarks(beats,lm,r_index):
         out.append(row)
     return out
 
-def build_median_landmark_authority(ecg_image,rhythm_region,rr_authority,speed_mm_s):
+def build_median_landmark_authority(ecg_image,rhythm_region,rr_authority,speed_mm_s,legacy_intervals=None):
     out={"engine":"median-beat-landmark-v12.1","status":"UNRESOLVED"}
     if not rhythm_region:return out
     box=rhythm_region.get("box_pixels")
@@ -1641,7 +1668,28 @@ def build_median_landmark_authority(ecg_image,rhythm_region,rr_authority,speed_m
         qt["qtc_fridericia_ms"]=round(qts/(rrs**(1/3))*1000.,1)
         qt["rr_ms_used"]=rrms
 
-    out.update({"status":"PASS" if all(x["status"]=="PASS" for x in (q,pr,qt)) else "REVIEW",
+    # Cross-engine disagreement guard: v12.0 is not authority, but large disagreement blocks PASS.
+    legacy=legacy_intervals or {}
+    cross={}
+    for name,obj in (("qrs",q),("pr",pr),("qt",qt)):
+        new_ms=obj.get("duration_ms")
+        old_ms=(legacy.get(name) or {}).get("duration_ms")
+        if new_ms is None or old_ms is None:
+            cross[name]={"status":"NO_COMPARATOR"};continue
+        delta=abs(float(new_ms)-float(old_ms))
+        rel=delta/max(float(new_ms),float(old_ms),1.)
+        # tolerate small landmark-method differences; large absolute/relative gap blocks PASS.
+        limit_abs={"qrs":30.,"pr":35.,"qt":55.}[name]
+        bad=delta>limit_abs and rel>.18
+        cross[name]={"status":"DISAGREE" if bad else "AGREE","delta_ms":round(delta,1),"relative":round(rel,3),
+                     "legacy_ms":old_ms,"v12_2_ms":new_ms}
+        if bad:
+            obj["status"]="REVIEW"
+            obj["cross_engine_guard"]="large_disagreement_with_v12_0"
+    overall="PASS" if all(x["status"]=="PASS" for x in (q,pr,qt)) else "REVIEW" if any(x["status"] in ("PASS","REVIEW") for x in (q,pr,qt)) else "UNRESOLVED"
+
+    out.update({"status":overall,
+                "cross_engine":cross,
                 "template_qc":template_qc,"beats_aligned":len(beats),"median_template_corr":round(medcorr,3),
                 "r_template_x":ridx,"landmarks":lm,"qrs":q,"pr":pr,"qt":qt,
                 "projected_landmarks":proj,"template_wave":[round(float(v),3) for v in tpl]})
@@ -1871,8 +1919,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v12.1"
-PROMPT_VERSION = "ecg-median-beat-landmark-v12.1"
+APP_VERSION = "v12.2"
+PROMPT_VERSION = "ecg-r-anchored-landmarks-v12.2"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -1941,7 +1989,7 @@ SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐO�
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nINTERVAL AUTHORITY v12.0: QRS duration, PR, QT/QTc chỉ được dùng định lượng từ interval_authority. AI measurements/tọa độ không có authority. PASS có thể dùng như bằng chứng đo; REVIEW phải ghi cần bác sĩ kiểm tra; UNRESOLVED không được tự điền. QTc Bazett/Fridericia là phép tính từ QT+RR engine, không tự động đồng nghĩa QT dài/ngắn. Không dùng số máy in để sửa hoặc ép số engine.\n"
-SYSTEM_PROMPT += "\nMEDIAN LANDMARK AUTHORITY v12.1: median_landmark_authority là nguồn ưu tiên cho QRS/PR/QT/QTc. v12.0 beat-wise interval chỉ là regression evidence, không được ghi đè v12.1. Landmark template được tạo từ nhiều beat align theo R; PASS/REVIEW/UNRESOLVED phải được giữ nguyên khi diễn giải.\n"
+SYSTEM_PROMPT += "\nLANDMARK AUTHORITY v12.2: median_landmark_authority dùng R-anchored QRS boundaries và là authority ưu tiên. Nếu cross_engine của QRS/PR/QT = DISAGREE thì phép đo đó tối đa REVIEW dù giá trị có vẻ hợp lý. Không được chọn số v12.0 hay v12.2 theo số nào gần kỳ vọng hơn; phải giữ QC và nêu bất đồng.\n"
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -3076,8 +3124,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Median-beat Landmark Authority")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v12.1 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · R-anchored Landmark Authority + cross-engine guard")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v12.2 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -3306,7 +3354,8 @@ else:
             st.image(region["png"],width="stretch");regions.append(region)
             rr_authority=_rr_from_rhythm_region(ecg,region,_normalize_paper_speed(speed))
             interval_authority=build_interval_authority(ecg,region,rr_authority,_normalize_paper_speed(speed))
-            median_landmark_authority=build_median_landmark_authority(ecg,region,rr_authority,_normalize_paper_speed(speed))
+            median_landmark_authority=build_median_landmark_authority(
+                ecg,region,rr_authority,_normalize_paper_speed(speed),legacy_intervals=interval_authority)
     if st.checkbox("Thêm vùng cần xem kỹ",key="image_focus_"+frame_id):
         with st.expander("Vùng chi tiết bổ sung",expanded=True):
             label = st.text_input("Nhãn vùng bổ sung",value="Vùng cần xem kỹ",key="region_focus_label_"+frame_id)
@@ -3334,7 +3383,7 @@ else:
     if median_landmark_authority:
         if digitizer_evidence is not None:
             digitizer_evidence["median_landmark_authority"]=median_landmark_authority
-        st.markdown("**v12.1 — Median-beat Landmark Authority**")
+        st.markdown("**v12.2 — R-anchored Median-beat Landmark Authority**")
         _mq=median_landmark_authority.get("qrs",{});_mp=median_landmark_authority.get("pr",{});_mt=median_landmark_authority.get("qt",{})
         _mc=st.columns(10)
         _mc[0].metric("Overall",median_landmark_authority.get("status","UNRESOLVED"))
@@ -3349,9 +3398,9 @@ else:
         _mc[9].metric("Time-base",(rr_authority or {}).get("timebase_status","—"))
         _mb=median_beat_overlay_image(median_landmark_authority)
         if _mb is not None:
-            st.image(_mb,caption="MEDIAN BEAT audit — P-on · QRS-on · R · QRS-off · T-peak · T-end. Đây là landmark authority v12.1.",width="stretch")
-        with st.expander("Median-beat landmark evidence",expanded=False):
-            st.json({k:median_landmark_authority.get(k) for k in ("status","template_qc","beats_aligned","median_template_corr","landmarks","qrs","pr","qt")})
+            st.image(_mb,caption="MEDIAN BEAT v12.2 — QRS boundaries tìm từ R ra baseline; P-on/T-end dùng persistent return-to-baseline. Landmark phải đúng bằng mắt trước khi tin số.",width="stretch")
+        with st.expander("v12.2 landmark + cross-engine evidence",expanded=False):
+            st.json({k:median_landmark_authority.get(k) for k in ("status","template_qc","beats_aligned","median_template_corr","landmarks","qrs","pr","qt","cross_engine")})
     if interval_authority:
         if digitizer_evidence is not None:
             digitizer_evidence["interval_authority"]=interval_authority
