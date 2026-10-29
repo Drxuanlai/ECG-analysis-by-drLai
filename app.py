@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v13.7.1"
-PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
+APP_VERSION = "v14.0"
+PROMPT_VERSION = "ecg-ai-landmark-deterministic-measurement-v14.0"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2698,6 +2698,18 @@ MEASUREMENT AUTHORITY FIREWALL v13.7 — BẮT BUỘC:
 6) Không gọi 'ST đẳng điện' như kết luận đo nếu J/baseline/ST authority chưa PASS.
 7) Nếu thông tin ca bệnh trống, không được suy diễn triệu chứng hay clinical differential dựa trên dữ liệu không được cung cấp.
 """
+
+SYSTEM_PROMPT += """
+V14 LANDMARK-FIRST WORKFLOW — ƯU TIÊN CAO NHẤT:
+- Vai trò AI trong lượt này là NHẬN DIỆN và ĐỀ XUẤT LANDMARK trên ảnh, không phải làm thước đo cuối cùng.
+- lead_landmarks phải có đúng 12 lead. Chọn MỘT nhát đại diện rõ nhất trong vùng chi tiết của từng lead và đánh dấu bằng tọa độ phần trăm của chính region đó.
+- Các mốc có thể dùng: P-on, P-peak, P-off, QRS-on, q-peak, R-peak, S-peak, R-prime, J-point, T-peak, T-end, baseline. Không thấy rõ mốc nào thì để null; TUYỆT ĐỐI không bịa mốc để hoàn thành.
+- QRS-on là khởi đầu phức bộ QRS; J-point là tận cùng QRS/chuyển sang ST. T-peak phải nằm sau J. Không lấy T làm R/QRS.
+- baseline_point phải nằm trên đoạn TP hoặc PR thật sự đẳng điện của CÙNG lead/cycle; không đặt trên ST/T.
+- morphology_candidate chỉ là mô tả thị giác đề xuất (ví dụ R, rS, RS, QS, rSR′); code sẽ kiểm tra lại polarity/thứ tự.
+- technical_review phải đánh giá: chất lượng ảnh, chữ tốc độ/gain/test calibration nếu thấy, và dấu gợi ý mắc lộn điện cực. Nếu không đủ dữ liệu, ghi cannot_assess thay vì khẳng định.
+- Không dùng tọa độ landmark để tự tính số ms/mm/mV trong diễn giải. Measurement Core phía code sẽ tính sau.
+"""
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -2741,11 +2753,28 @@ def report_schema(region_ids):
         "limitation": text})
     hypothesis = object_schema({"possibility": text, "supporting_evidence": text,
         "opposing_or_missing": text, "verification": text})
+    landmark_quality = {"type":"string","enum":["clear","uncertain","not_visible"]}
+    lead_landmark = object_schema({
+        "lead":{"type":"string","enum":LEADS},
+        "region_id":{"type":"string","enum":region_ids},
+        "cycle_id":text,"quality":landmark_quality,
+        "p_on":point,"p_peak":point,"p_off":point,
+        "qrs_on":point,"q_peak":point,"r_peak":point,"s_peak":point,"r_prime_peak":point,
+        "j_point":point,"t_peak":point,"t_end":point,"baseline_point":point,
+        "morphology_candidate":text,"limitation":text})
+    technical_review = object_schema({
+        "image_suitability":{"type":"string","enum":["adequate","limited","not_an_ecg"]},
+        "calibration_pulse":{"type":"string","enum":["present_plausible","present_uncertain","not_visible"]},
+        "calibration_text":text,
+        "possible_lead_reversal":{"type":"string","enum":["unlikely","possible","cannot_assess"]},
+        "reversal_reason":text,"limitations":text})
     conduction_assessment = object_schema({
         "av_status":{"type":"string","enum":["normal","abnormal","uncertain"]},
         "qrs_status":{"type":"string","enum":["narrow","wide","uncertain"]},
         "pr_measurement_id":text, "qrs_measurement_id":text})
     return object_schema({"quality_summary": text,
+        "technical_review":technical_review,
+        "lead_landmarks":{"type":"array","items":lead_landmark},
         "conduction_assessment":conduction_assessment,
         "summary_measurement_ids":{"type":"array","items":text},
         "lead_features": {"type": "array", "items": feature},
@@ -2808,6 +2837,9 @@ def parse_report(raw, regions):
     leads = [f["lead"] for f in data["lead_features"]]
     if sorted(leads) != sorted(LEADS):
         raise ValueError("Bảng 12 chuyển đạo thiếu hoặc lặp nhãn.")
+    landmark_leads = [f["lead"] for f in data["lead_landmarks"]]
+    if sorted(landmark_leads) != sorted(LEADS):
+        raise ValueError("Bảng landmark 12 chuyển đạo thiếu hoặc lặp nhãn.")
     if len(data["hypotheses"]) > 3:
         raise ValueError("Quá nhiều giả thuyết.")
     return data
@@ -3418,6 +3450,183 @@ def run_with_failover(routes, regions, prompt, runtime=None, collect=None):
     return outcome,selected
 
 
+
+# ----------------- V14 AI LANDMARK -> DETERMINISTIC MEASUREMENT -----------------
+def _point_to_px(point, region):
+    if not isinstance(point, dict):
+        return None
+    try:
+        w, h = region["sent_size"]
+        x = float(point["x_pct"]) * w / 100.0
+        y = float(point["y_pct"]) * h / 100.0
+        if not (0 <= x <= w and 0 <= y <= h):
+            return None
+        return np.array([x, y], float)
+    except Exception:
+        return None
+
+
+def _region_grid_map(regions, ecg_image):
+    out = {}
+    for r in regions:
+        try:
+            out[r["id"]] = detect_local_small_grid({"box": r.get("box_pixels")}, ecg_image)
+        except Exception:
+            out[r["id"]] = {"status": "UNRESOLVED", "reason": "grid_exception"}
+    return out
+
+
+def _lead_gain(lead, known):
+    if lead in ("I", "II", "III", "aVR", "aVL", "aVF"):
+        return known.get("limb_mm_mv")
+    return known.get("chest_mm_mv")
+
+
+def _morphology_from_landmarks(lm, region):
+    base = _point_to_px(lm.get("baseline_point"), region)
+    if base is None:
+        return {"status": "UNRESOLVED", "sequence": None, "reason": "no_baseline"}
+    comps = []
+    for key, label in (("q_peak", "q"), ("r_peak", "R"), ("s_peak", "S"), ("r_prime_peak", "Rprime")):
+        p = _point_to_px(lm.get(key), region)
+        if p is None:
+            continue
+        sign = 1 if base[1] - p[1] > 0 else -1 if base[1] - p[1] < 0 else 0
+        comps.append((p[0], key, label, sign))
+    comps.sort(key=lambda z: z[0])
+    if not comps:
+        return {"status": "UNRESOLVED", "sequence": None, "reason": "no_components"}
+    seq, ok = [], True
+    for _, key, label, sign in comps:
+        good = (sign < 0) if key in ("q_peak", "s_peak") else (sign > 0)
+        ok = ok and good
+        seq.append(label)
+    return {"status": "PASS" if ok else "REVIEW", "sequence": "-".join(seq),
+            "candidate": lm.get("morphology_candidate", ""),
+            "reason": None if ok else "landmark_polarity_conflict"}
+
+
+def build_v14_measurement_authority(data, regions, ecg_image, known):
+    """AI locates landmarks; code alone converts coordinates to boxes/ms/mm/mV."""
+    if not isinstance(data, dict):
+        return {"status": "UNRESOLVED", "leads": {}, "rows": [], "reason": "no_ai_landmarks"}
+    rmap = {r["id"]: r for r in regions}
+    gmap = _region_grid_map(regions, ecg_image)
+    speed = known.get("speed_mm_s")
+    leads, rows, pass_n, review_n = {}, [], 0, 0
+
+    for lm in data.get("lead_landmarks", []):
+        lead = lm.get("lead")
+        region = rmap.get(lm.get("region_id"))
+        quality = lm.get("quality")
+        ev = {"lead": lead, "status": "UNRESOLVED", "quality": quality,
+              "region_id": lm.get("region_id"), "cycle_id": lm.get("cycle_id"),
+              "morphology": None, "measurements": {}, "grid": None}
+        if region is None or quality == "not_visible":
+            ev["reason"] = "region_or_landmark_not_visible"
+            leads[lead] = ev
+            continue
+
+        grid = gmap.get(region["id"], {})
+        ev["grid"] = grid
+        pxmm = grid.get("small_grid_px") if grid.get("status") == "PASS" else None
+        morph = _morphology_from_landmarks(lm, region)
+        ev["morphology"] = morph
+        pts = {k: _point_to_px(lm.get(k), region) for k in (
+            "p_on", "p_peak", "p_off", "qrs_on", "q_peak", "r_peak", "s_peak",
+            "r_prime_peak", "j_point", "t_peak", "t_end", "baseline_point")}
+
+        def time_measure(a, b):
+            if pts.get(a) is None or pts.get(b) is None:
+                return None
+            dx = float(pts[b][0] - pts[a][0])
+            if dx <= 0:
+                return {"status": "REVIEW", "reason": "landmark_order", "px": round(dx, 2)}
+            if not pxmm or not speed:
+                return {"status": "REVIEW", "reason": "grid_or_speed_not_pass", "px": round(dx, 2)}
+            boxes = dx / pxmm
+            return {"status": "PASS", "px": round(dx, 2), "small_boxes": round(boxes, 2),
+                    "ms": round(boxes * 1000.0 / float(speed), 1)}
+
+        def amp_measure(pkey):
+            if pts.get(pkey) is None or pts.get("baseline_point") is None:
+                return None
+            dy = float(pts["baseline_point"][1] - pts[pkey][1])
+            if not pxmm:
+                return {"status": "REVIEW", "reason": "grid_not_pass", "px": round(dy, 2)}
+            mm = dy / pxmm
+            gain = _lead_gain(lead, known)
+            out = {"status": "PASS" if gain else "REVIEW", "px": round(dy, 2), "mm": round(mm, 2)}
+            if gain:
+                out["mV"] = round(mm / float(gain), 3)
+            else:
+                out["reason"] = "gain_not_confirmed"
+            return out
+
+        for nm, a, b in (("PR", "p_on", "qrs_on"), ("QRS", "qrs_on", "j_point"), ("QT", "qrs_on", "t_end")):
+            m = time_measure(a, b)
+            if m:
+                ev["measurements"][nm] = m
+        for nm, pkey in (("R_amp", "r_peak"), ("S_amp", "s_peak"), ("T_amp", "t_peak"), ("ST_J", "j_point")):
+            m = amp_measure(pkey)
+            if m:
+                ev["measurements"][nm] = m
+
+        statuses = [m.get("status") for m in ev["measurements"].values()]
+        if quality == "clear" and morph.get("status") == "PASS" and "PASS" in statuses:
+            ev["status"] = "PASS"
+            pass_n += 1
+        elif quality != "not_visible" and (statuses or morph.get("status") != "UNRESOLVED"):
+            ev["status"] = "REVIEW"
+            review_n += 1
+        else:
+            ev["reason"] = "insufficient_landmarks"
+        leads[lead] = ev
+
+        row = {"Lead": lead, "QC": ev["status"], "AI morphology": lm.get("morphology_candidate") or "—",
+               "Code sequence": morph.get("sequence") or "—", "Grid": grid.get("status", "UNRESOLVED")}
+        for nm in ("PR", "QRS", "QT"):
+            m = ev["measurements"].get(nm)
+            row[nm + " ms"] = m.get("ms") if m else None
+        for nm in ("R_amp", "S_amp", "T_amp"):
+            m = ev["measurements"].get(nm)
+            row[nm + " mV"] = m.get("mV") if m else None
+        stj = ev["measurements"].get("ST_J")
+        row["ST@J mm"] = stj.get("mm") if stj else None
+        rows.append(row)
+
+    overall = "PASS" if pass_n >= 8 else "REVIEW" if pass_n + review_n >= 6 else "UNRESOLVED"
+    return {"engine": "v14-ai-landmark-deterministic-measurement", "status": overall,
+            "pass_count": pass_n, "review_count": review_n, "leads": leads, "rows": rows,
+            "region_grids": gmap,
+            "rules": ["AI proposes landmark identity/coordinates.",
+                      "Code converts pixels to boxes/ms/mm/mV.",
+                      "Only PASS local grid plus user-confirmed speed/gain can create quantitative authority.",
+                      "AI-written numeric values never override this table."]}
+
+
+def _annotate_v14_landmarks(region, lm):
+    img = Image.open(io.BytesIO(region["png"])).convert("RGB")
+    try:
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        specs = [("p_on", "P-on"), ("p_peak", "P"), ("qrs_on", "QRS-on"), ("q_peak", "q"),
+                 ("r_peak", "R"), ("s_peak", "S"), ("r_prime_peak", "R-prime"),
+                 ("j_point", "J"), ("t_peak", "T"), ("t_end", "T-end"), ("baseline_point", "N")]
+        for key, label in specs:
+            p = lm.get(key)
+            if not isinstance(p, dict):
+                continue
+            x = int(float(p["x_pct"]) * w / 100)
+            y = int(float(p["y_pct"]) * h / 100)
+            rr = 5
+            draw.ellipse((x-rr, y-rr, x+rr, y+rr), outline=(0, 0, 0), width=2)
+            draw.text((x+6, max(0, y-12)), label, fill=(0, 0, 0))
+    except Exception:
+        pass
+    return img
+
 # ----------------- HIỂN THỊ VÀ XUẤT ĐỐI CHIẾU -----------------
 def observation_rows(data, regions):
     labels = {r["id"]: r["label"] for r in regions}
@@ -3510,6 +3719,28 @@ def render_result(result):
         st.caption("Không hiển thị JSON dở dang như một kết luận. Có thể tải gói đối chiếu để kiểm tra.")
     else:
         st.write(data["quality_summary"])
+        _v14 = result.get("v14_measurement_authority") or {}
+        _tc = data.get("technical_review") or {}
+        st.subheader("v14 — AI Landmark → Deterministic Measurement")
+        _c = st.columns(4)
+        _c[0].metric("Measurement QC", _v14.get("status", "UNRESOLVED"))
+        _c[1].metric("PASS leads", _v14.get("pass_count", 0))
+        _c[2].metric("REVIEW leads", _v14.get("review_count", 0))
+        _c[3].metric("Ảnh", _tc.get("image_suitability", "—"))
+        st.caption(f"Calibration: {_tc.get('calibration_pulse','—')} · Lead reversal: {_tc.get('possible_lead_reversal','—')}")
+        if _tc.get("reversal_reason"):
+            st.caption("Điện cực: " + _tc.get("reversal_reason"))
+        if _v14.get("rows"):
+            st.dataframe(_v14["rows"], hide_index=True, use_container_width=True)
+        with st.expander("AI landmark overlay — đề xuất để bác sĩ kiểm tra", expanded=True):
+            _lms = {x["lead"]: x for x in data.get("lead_landmarks", [])}
+            _lead = st.selectbox("Chọn lead", LEADS, key="v14_landmark_lead_" + result["signature"][:12])
+            _lm = _lms.get(_lead)
+            if _lm:
+                _reg = next((r for r in result["regions"] if r["id"] == _lm.get("region_id")), None)
+                if _reg:
+                    st.image(_annotate_v14_landmarks(_reg, _lm), width="stretch")
+                    st.caption(f"{_lead} · {_lm.get('quality')} · AI morphology candidate: {_lm.get('morphology_candidate') or '—'} · {_lm.get('limitation') or ''}")
         st.subheader("Bảng quan sát từng nhóm")
         st.dataframe(observation_rows(data, result["regions"]), hide_index=True)
         with st.expander("Chuẩn ghi AI đề xuất — chưa xác minh"):
@@ -3839,8 +4070,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.7.1 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark Proposal → Deterministic Measurement")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.0 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4097,7 +4328,7 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    st.markdown("**v13.7.1 — QRS Identity + Schema-safe Authority Sanitizer**")
+    st.markdown("**Experimental QC — legacy waveform detector (không phải reader chính v14)**")
     _qm=qrs_morphology_authority or {}
     _qc=st.columns(4)
     _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
@@ -4105,7 +4336,7 @@ else:
     _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
     _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
     st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-    with st.expander("v13.7.1 QRS-identity + full-QRS visual audit",expanded=True):
+    with st.expander("Experimental waveform QC visual audit",expanded=False):
         for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
             _ev=(_qm.get("leads") or {}).get(_lead,{})
             _tw=_ev.get("template_wave")
@@ -4117,7 +4348,7 @@ else:
                 st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
     if _qm.get("status")=="UNRESOLVED":
         st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
-    with st.expander("v13.7.1 QRS identity + morphology evidence",expanded=False):
+    with st.expander("Experimental waveform QC evidence",expanded=False):
         st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
@@ -4218,12 +4449,14 @@ else:
             actual_thinking = selected["thinking"]
             data, checks = None, None
             sanitizer_audit = None
+            v14_measurement_authority = None
             if outcome["api_completed"]:
                 try:
                     data = parse_report(outcome["raw_response"],regions)
                     # Schema is now proven valid. Sanitize only user-visible semantic content.
                     data, sanitizer_audit = _sanitize_ai_result_v137(
                         data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
+                    v14_measurement_authority = build_v14_measurement_authority(data, regions, ecg, known)
                     checks = arithmetic_checks(data,known,age_years=age)
                     authority_report = measurement_authority_conflicts(data,rr_authority,j_st_evidence)
                     # Authority warnings are separate from arithmetic consistency:
@@ -4243,6 +4476,7 @@ else:
                 "prompt_sha256":hashlib.sha256(prompt.encode()).hexdigest(),"app_version":APP_VERSION,
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
                 "authority_sanitizer":sanitizer_audit,
+                "v14_measurement_authority":v14_measurement_authority,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
                 "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,"median_landmarks":median_landmark_authority,"qrs_morphology":qrs_morphology_authority,
                     "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
