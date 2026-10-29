@@ -1144,8 +1144,87 @@ def _phase_locked_sequence(candidates,w):
         'direct_idx':direct_idx}
     return matched,qc
 
-def _rr_from_rhythm_region(ecg_image,rhythm_region):
-    """v11.3.5 phase-locked narrow R/QRS peak detector."""
+def _snap_phase_fiducials_to_qrs(crop,y,matched,rr_guess):
+    """Snap phase-locked predictions to a reproducible dominant QRS extremum.
+    The target may be positive or negative; RR needs the same QRS phase, not necessarily a positive R.
+    """
+    if y is None or not matched:return [],{"status":"UNRESOLVED","reason":"no_phase_fiducials"}
+    yy=_tb_smooth(np.asarray(y,float),3); w=len(yy)
+    baseline=_tb_smooth(yy,max(13,int(.045*w)))
+    excursion=np.abs(yy-baseline); slope=np.abs(np.gradient(yy))
+    ex95=float(np.percentile(excursion,95))+1e-6
+    sl95=float(np.percentile(slope,95))+1e-6
+    # small search window: enough to reach the actual QRS extremum but not neighboring P/T
+    rad=max(5,int(round(.10*rr_guess)))
+    snapped=[]; offsets=[]
+    for m in matched:
+        pred=int(m["x"]); a=max(2,pred-rad); b=min(w-2,pred+rad+1)
+        if b-a<5:continue
+        candidates=[]
+        for x in range(a,b):
+            # local extremum of absolute baseline excursion
+            if excursion[x]>=excursion[x-1] and excursion[x]>=excursion[x+1]:
+                local_sl=float(np.max(slope[max(a,x-2):min(b,x+3)])/sl95)
+                ex=float(excursion[x]/ex95)
+                distance=abs(x-pred)/max(1.,rad)
+                score=.62*ex+.28*local_sl-.10*distance
+                candidates.append((score,x))
+        if not candidates:
+            x=a+int(np.argmax(excursion[a:b]))
+        else:
+            x=max(candidates,key=lambda z:z[0])[1]
+        snapped.append(int(x)); offsets.append(int(x-pred))
+    if len(snapped)<3:return snapped,{"status":"UNRESOLVED","reason":"too_few_snapped_fiducials"}
+    med=float(np.median(offsets)); mad=float(np.median(np.abs(np.asarray(offsets)-med)))
+    max_dev=float(np.max(np.abs(np.asarray(offsets)-med)))
+    # Phase consistency guard: snapping should be a small, repeatable correction.
+    status="PASS" if mad<=max(2.,.025*rr_guess) and max_dev<=max(5.,.07*rr_guess) else "REVIEW"
+    return snapped,{"status":status,"median_offset_px":round(med,2),"mad_offset_px":round(mad,2),
+                    "max_offset_deviation_px":round(max_dev,2),"search_radius_px":rad,
+                    "offsets_px":offsets}
+
+def _rhythm_horizontal_grid(crop):
+    """Conservative horizontal 1-mm spacing for Rhythm II.
+    Uses vertical red grid-line periodicity and validates a 5x major-grid harmonic.
+    """
+    f=crop.astype(float); h,w=f.shape[:2]
+    red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2]); gray=f.mean(axis=2)
+    # vertical grid lines create column peaks
+    profile=np.mean(red,axis=0)+.22*(255-np.mean(gray,axis=0))
+    positions=_profile_line_positions(profile)
+    small,support=_fundamental_spacing(positions)
+    if small is None:return {"status":"UNRESOLVED","reason":"small_grid_not_found"}
+    major,major_conf=_major_grid_spacing(profile,small)
+    ratio=(major/small) if major else None
+    major_ok=bool(ratio is not None and 4.45<=ratio<=5.55)
+    enough=(w/small)>=35
+    if support>=.68 and major_ok and enough:status="PASS"
+    elif support>=.55 and major_ok and enough:status="REVIEW"
+    else:status="UNRESOLVED"
+    return {"status":status,"small_grid_px":round(float(small),3) if status!="UNRESOLVED" else None,
+            "fine_support":round(float(support),3),"major_grid_px":round(float(major),3) if major else None,
+            "major_to_small_ratio":round(float(ratio),3) if ratio else None,
+            "major_validator":major_ok,"estimated_small_boxes":round(w/small,1),"reason":None if status!="UNRESOLVED" else "rhythm_grid_not_cross_validated"}
+
+def _convert_rr_to_time(rr_px,grid,speed_mm_s):
+    if rr_px is None:return {"status":"UNRESOLVED","reason":"no_rr_px"}
+    if not grid or grid.get("status")!="PASS" or not grid.get("small_grid_px"):
+        return {"status":"UNRESOLVED","reason":"rhythm_grid_not_PASS"}
+    if speed_mm_s not in (25,50):
+        return {"status":"UNRESOLVED","reason":"paper_speed_not_confirmed"}
+    boxes=float(rr_px)/float(grid["small_grid_px"])
+    # one 1-mm horizontal box = 1000/speed ms
+    box_ms=1000.0/float(speed_mm_s)
+    rr_ms=boxes*box_ms
+    hr=60000.0/rr_ms if rr_ms>0 else None
+    if not (250<=rr_ms<=3000):
+        return {"status":"REVIEW","reason":"rr_time_outside_engineering_range",
+                "rr_small_boxes":round(boxes,2),"rr_ms":round(rr_ms,1),"heart_rate_bpm":round(hr,1) if hr else None}
+    return {"status":"PASS","rr_small_boxes":round(boxes,2),"horizontal_box_ms":round(box_ms,1),
+            "rr_ms":round(rr_ms,1),"heart_rate_bpm":round(hr,1)}
+
+def _rr_from_rhythm_region(ecg_image,rhythm_region,speed_mm_s=None):
+    """v11.3.6: phase-lock -> snap to dominant QRS extremum -> verified rhythm grid -> RR ms/HR."""
     if not rhythm_region:return {'status':'UNRESOLVED','reason':'no_rhythm_region'}
     box=rhythm_region.get('box_pixels')
     if not box:return {'status':'UNRESOLVED','reason':'no_rhythm_box'}
@@ -1155,39 +1234,65 @@ def _rr_from_rhythm_region(ecg_image,rhythm_region):
     if y is None:return {'status':'UNRESOLVED','reason':'rhythm_centerline_fail','centerline_qc':clqc}
     cand=_r_peak_candidates(crop,y)
     matched,qc=_phase_locked_sequence(cand,crop.shape[1])
-    out={'status':qc.get('status','UNRESOLVED'),'source':'engine_phase_locked_r',
+    out={'status':qc.get('status','UNRESOLVED'),'source':'engine_phase_locked_snapped_qrs',
          'peak_candidates':len(cand),'r_accepted':qc.get('r_accepted',0),
          'rr_intervals_usable':qc.get('rr_intervals_usable',0),'missed_r_inferred':qc.get('missed_r_inferred',0),
          'rr_cv':qc.get('rr_cv'),'rr_guess_px':qc.get('rr_guess_px'),'phase_error':qc.get('phase_error'),
          'phase_coverage':qc.get('phase_coverage'),'morphology_score':qc.get('morphology_score'),
-         'candidate_x':[int(c['x']) for c in cand],'fiducials_x':[int(c['x']) for c in matched],
+         'candidate_x':[int(c['x']) for c in cand],'predicted_x':[int(c['x']) for c in matched],
          'centerline_qc':clqc,'rhythm_box':box,'rhythm_size':[crop.shape[1],crop.shape[0]],
-         'small_boxes':None,'rr_ms':None,'conversion_status':'PENDING_VERIFIED_RHYTHM_GRID'}
-    if out['status']=='UNRESOLVED':out['reason']=qc.get('reason');return out
-    xs=np.asarray(out['fiducials_x'],float); dif=np.diff(xs); rr=float(qc['rr_guess_px'])
-    direct=[i for i,d in enumerate(dif) if abs(d-rr)/rr<=.18]
-    if not direct:
-        out['status']='UNRESOLVED';out['reason']='no_direct_consecutive_pair';return out
-    k=min(direct,key=lambda i:abs(dif[i]-rr))
+         'speed_mm_s':speed_mm_s}
+    if out['status']=='UNRESOLVED':
+        out['reason']=qc.get('reason');out['fiducials_x']=out['predicted_x'];return out
+
+    snapped,snapqc=_snap_phase_fiducials_to_qrs(crop,y,matched,float(qc['rr_guess_px']))
+    out['snap_qc']=snapqc;out['fiducials_x']=snapped
+    if snapqc.get('status')=='REVIEW' and out['status']=='PASS':
+        out['status']='REVIEW'
+    if len(snapped)<3:
+        out['status']='UNRESOLVED';out['reason']='snap_failed';return out
+
+    xs=np.asarray(snapped,float); dif=np.diff(xs); rr_guess=float(qc['rr_guess_px'])
+    # Use snapped sequence itself to derive direct RR; no inferred 2x/3x interval is used as measurement.
+    med=float(np.median(dif))
+    direct=[i for i,d in enumerate(dif) if abs(d-med)/max(1.,med)<=.16]
+    if len(direct)<2:
+        out['status']='UNRESOLVED';out['reason']='insufficient_snapped_direct_rr';return out
+    rrvals=np.asarray([dif[i] for i in direct],float)
+    snapped_cv=float(np.std(rrvals)/np.mean(rrvals)) if len(rrvals)>=2 else None
+    out['snapped_rr_cv']=round(snapped_cv,3) if snapped_cv is not None else None
+    if snapped_cv is not None and snapped_cv>.14 and out['status']=='PASS':out['status']='REVIEW'
+
+    k=min(direct,key=lambda i:abs(dif[i]-np.median(rrvals)))
     out['start_x']=int(xs[k]);out['end_x']=int(xs[k+1]);out['rr_px']=round(float(dif[k]),2)
-    out['median_rr_px']=round(float(np.median([dif[i] for i in direct])),2);out['consecutive']=True
+    out['median_rr_px']=round(float(np.median(rrvals)),2);out['consecutive']=True
+
+    grid=_rhythm_horizontal_grid(crop);out['rhythm_grid']=grid
+    conv=_convert_rr_to_time(out['median_rr_px'],grid,speed_mm_s);out['conversion']=conv
+    out['conversion_status']=conv.get('status','UNRESOLVED')
+    out['small_boxes']=conv.get('rr_small_boxes');out['rr_ms']=conv.get('rr_ms');out['heart_rate_bpm']=conv.get('heart_rate_bpm')
     return out
+
 
 def rr_authority_overlay_from_region(ecg_image,rhythm_region,rr):
     if not rhythm_region:return None
     box=rhythm_region['box_pixels'];crop=ecg_image.crop(tuple(map(int,box))).convert('RGB')
     arr=np.asarray(crop).copy()
-    for x in rr.get('candidate_x',[]):
+    # short top ticks = phase predictions before snap
+    for x in rr.get('predicted_x',[]):
         xx=max(0,min(crop.width-1,int(round(x))))
-        arr[:max(4,int(.14*crop.height)),xx:xx+1]=0
+        arr[:max(4,int(.13*crop.height)),xx:xx+1]=0
+    # full thin lines = snapped QRS fiducials
     for x in rr.get('fiducials_x',[]):
         xx=max(0,min(crop.width-1,int(round(x))))
         arr[:,xx:xx+1]=0
+    # thick lines = selected consecutive pair
     for x in (rr.get('start_x'),rr.get('end_x')):
         if x is None:continue
         xx=max(0,min(crop.width-1,int(round(x))))
         arr[:,max(0,xx-2):min(crop.width,xx+3)]=0
     return Image.fromarray(arr)
+
 
 def rr_authority_overlay_from_digitizer(ecg_image,result,rr):
     item=(result or {}).get("leads",{}).get("II-rhythm",{})
@@ -1203,7 +1308,9 @@ def rr_authority_overlay_from_digitizer(ecg_image,result,rr):
     return Image.fromarray(arr)
 
 def measurement_authority_conflicts(data,rr_authority,j_st_evidence):
-    authority={"rr_ms":{"status":(rr_authority or {}).get("status","UNRESOLVED"),
+    _rr_status=(rr_authority or {}).get("status","UNRESOLVED")
+    _conv_status=(rr_authority or {}).get("conversion_status","UNRESOLVED")
+    authority={"rr_ms":{"status":"PASS" if _rr_status=="PASS" and _conv_status=="PASS" else "UNRESOLVED",
                         "value":(rr_authority or {}).get("rr_ms"),"source":"engine"}}
     for lead,e in (j_st_evidence or {}).get("leads",{}).items():
         authority[f"st_mm:{lead}"]={"status":e.get("status","UNRESOLVED"),
@@ -1258,8 +1365,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.5"
-PROMPT_VERSION = "ecg-phase-locked-r-v11.3.5"
+APP_VERSION = "v11.3.6"
+PROMPT_VERSION = "ecg-snapped-rr-ms-hr-v11.3.6"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2461,8 +2568,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · phase-locked Rhythm-II R detector")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.5 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · snapped QRS fiducials + RR→ms→HR")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.6 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2689,7 +2796,7 @@ else:
             except ValueError as exc:
                 st.error(str(exc));st.stop()
             st.image(region["png"],width="stretch");regions.append(region)
-            rr_authority=_rr_from_rhythm_region(ecg,region)
+            rr_authority=_rr_from_rhythm_region(ecg,region,speed if speed in (25,50) else None)
     if st.checkbox("Thêm vùng cần xem kỹ",key="image_focus_"+frame_id):
         with st.expander("Vùng chi tiết bổ sung",expanded=True):
             label = st.text_input("Nhãn vùng bổ sung",value="Vùng cần xem kỹ",key="region_focus_label_"+frame_id)
@@ -2714,21 +2821,22 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.5 — Measurement Authority: phase-locked R → RR**")
+    st.markdown("**v11.3.6 — Measurement Authority: snapped QRS → RR → ms → HR**")
     if rr_authority:
-        _c=st.columns(8)
+        _c=st.columns(9)
         _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
-        _c[1].metric("Peak candidates",rr_authority.get("peak_candidates",0))
-        _c[2].metric("R accepted",rr_authority.get("r_accepted",0))
-        _c[3].metric("RR usable",rr_authority.get("rr_intervals_usable",0))
-        _c[4].metric("Missed",rr_authority.get("missed_r_inferred",0))
-        _c[5].metric("Coverage",rr_authority.get("phase_coverage","—"))
-        _c[6].metric("RR px",rr_authority.get("rr_px","—"))
-        _c[7].metric("RR CV",rr_authority.get("rr_cv","—"))
+        _c[1].metric("R accepted",rr_authority.get("r_accepted",0))
+        _c[2].metric("Snap QC",(rr_authority.get("snap_qc") or {}).get("status","—"))
+        _c[3].metric("RR px",rr_authority.get("rr_px","—"))
+        _c[4].metric("RR boxes",rr_authority.get("small_boxes","—"))
+        _c[5].metric("RR ms",rr_authority.get("rr_ms","—"))
+        _c[6].metric("HR bpm",rr_authority.get("heart_rate_bpm","—"))
+        _c[7].metric("Grid",(rr_authority.get("rhythm_grid") or {}).get("status","—"))
+        _c[8].metric("RR CV",rr_authority.get("snapped_rr_cv",rr_authority.get("rr_cv","—")))
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
         _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
-            st.image(_ov,caption="RR ENGINE v11.3.4 — QRS được cluster trước khi dựng chuỗi RR. Nếu missed >25% accepted → UNRESOLVED. Hai vạch đậm chỉ được chọn từ cặp 1×RR trực tiếp.",width="stretch")
+            st.image(_ov,caption="RR ENGINE v11.3.6 — tick ngắn = phase prediction; vạch mảnh = fiducial đã snap vào dominant QRS extremum; 2 vạch đậm = cặp RR được chọn. RR→ms→HR chỉ xuất khi horizontal grid PASS.",width="stretch")
         if rr_authority.get("status")!="PASS":
             st.info("RR chưa PASS → không cho phép số/marker RR do AI trở thành bằng chứng định lượng.")
     if any(min(r["sent_size"]) < 128 for r in regions):
