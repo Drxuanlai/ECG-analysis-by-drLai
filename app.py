@@ -1019,35 +1019,175 @@ def _reconstruct_rr_v1134(clusters, crop):
     else: status="UNRESOLVED"; reason="insufficient_rr_sequence_quality"
     return accepted,{"status":status,"reason":reason,"rr_guess_px":round(rr0,2),"qrs_detected":len(accepted),"rr_intervals_usable":len(direct),"missed_qrs_inferred":int(missed),"missed_fraction":round(missfrac,3),"rr_cv":round(cv,3) if cv is not None else None,"phase_residual":round(residual,3)}
 
-def _rr_from_rhythm_region(ecg_image,rhythm_region):
-    if not rhythm_region:return {"status":"UNRESOLVED","reason":"no_rhythm_region"}
-    box=rhythm_region.get("box_pixels")
-    if not box:return {"status":"UNRESOLVED","reason":"no_rhythm_box"}
-    crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("RGB"))
-    events,_,eqc=_qrs_vertical_events(crop); clusters=_cluster_qrs_events_v1134(events,crop); accepted,qc=_reconstruct_rr_v1134(clusters,crop)
-    out={"status":qc.get("status","UNRESOLVED"),"source":"engine_qrs_cluster_rr","vertical_events":len(events),"qrs_clusters":len(clusters),"qrs_detected":qc.get("qrs_detected",0),"rr_intervals_usable":qc.get("rr_intervals_usable",0),"missed_qrs_inferred":qc.get("missed_qrs_inferred",0),"missed_fraction":qc.get("missed_fraction"),"rr_cv":qc.get("rr_cv"),"rr_guess_px":qc.get("rr_guess_px"),"phase_residual":qc.get("phase_residual"),"cluster_x":[int(c["x"]) for c in clusters],"small_boxes":None,"rr_ms":None,"conversion_status":"PENDING_VERIFIED_RHYTHM_GRID"}
-    out["fiducials_x"]=[int(c["x"]) for c in accepted]
-    if out["status"]=="UNRESOLVED": out["reason"]=qc.get("reason"); return out
-    xs=np.array(out["fiducials_x"],float); rr0=float(qc["rr_guess_px"]); dif=np.diff(xs); direct=[i for i,d in enumerate(dif) if abs(d-rr0)/rr0<=.18]
-    if not direct: out["status"]="UNRESOLVED";out["reason"]="no_direct_consecutive_pair";return out
-    k=min(direct,key=lambda i:abs(dif[i]-rr0));out["start_x"]=int(xs[k]);out["end_x"]=int(xs[k+1]);out["rr_px"]=round(float(dif[k]),2);out["median_rr_px"]=round(float(np.median([dif[i] for i in direct])),2);out["consecutive"]=True;return out
+def _rhythm_waveform_for_r(crop):
+    """Track Rhythm-II waveform conservatively for phase-locked R detection."""
+    f=crop.astype(float); h,w=f.shape[:2]
+    gray=f.mean(axis=2); red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2])
+    ink=(255-gray)-.55*np.maximum(red,0)
+    ya=int(.12*h); yb=int(.88*h); band=ink[ya:yb]
+    thr=float(np.percentile(band,80)); raw=np.full(w,np.nan,float); prev=None
+    for x in range(w):
+        inds=np.where(band[:,x]>=thr)[0]
+        if not len(inds): continue
+        ys=ya+inds; vals=band[inds,x]
+        if prev is None:
+            pick=ys[np.argmin(np.abs(ys-h*.52))]
+        else:
+            # continuity dominates, but dark steep QRS may jump rapidly
+            cost=np.abs(ys-prev)-.20*vals
+            pick=ys[int(np.argmin(cost))]
+        raw[x]=float(pick); prev=float(pick)
+    cleaned,clqc=clean_centerline_signal(raw)
+    y=_tb_interp(cleaned)
+    return y,clqc
 
+def _r_peak_candidates(crop,y):
+    """Candidate R/QRS fiducials from local prominence, narrowness, slope and vertical image evidence."""
+    h,w=crop.shape[:2]
+    if y is None:return []
+    y=_tb_smooth(y,3)
+    base=_tb_smooth(y,max(13,int(.045*w)))
+    ecg=base-y  # positive ECG deflection upward on image
+    slope=np.abs(np.gradient(y))
+    # vertical image evidence reused only as a feature, never as the sequence authority
+    events,prof,_=_qrs_vertical_events(crop)
+    prof=prof/(np.percentile(prof[prof>0],95)+1e-6) if np.any(prof>0) else prof
+    amp=np.abs(ecg); amp95=np.percentile(amp,95)+1e-6; sl95=np.percentile(slope,95)+1e-6
+    # local maxima of absolute excursion; QRS may be positive or negative
+    cand=[]; rad=max(4,int(.012*w)); broad=max(8,int(.030*w))
+    for x in range(2,w-2):
+        if amp[x] < amp[x-1] or amp[x] < amp[x+1]:continue
+        a=max(0,x-rad);b=min(w,x+rad+1);aa=max(0,x-broad);bb=min(w,x+broad+1)
+        local_amp=float(amp[x]/amp95)
+        local_slope=float(np.max(slope[a:b])/sl95)
+        vert=float(np.max(prof[a:b])) if len(prof) else 0.
+        # narrowness: central excursion relative to broad neighborhood energy
+        narrow=float(amp[x]/(np.mean(amp[aa:bb])+1e-6))
+        prominence=float(amp[x]-np.percentile(amp[aa:bb],35))
+        prom_n=prominence/amp95
+        score=.30*local_slope+.25*vert+.22*min(narrow/3.,1.5)+.23*prom_n
+        if local_slope>=.30 and (vert>=.18 or narrow>=1.45) and prom_n>=.08:
+            cand.append({'x':x,'score':float(score),'slope':local_slope,'vertical':vert,
+                         'narrowness':narrow,'prominence':prom_n})
+    # non-maximum suppression; preserve one fiducial per narrow QRS
+    cand.sort(key=lambda z:z['score'],reverse=True); kept=[]; sep=max(8,int(.020*w))
+    for c in cand:
+        if all(abs(c['x']-k['x'])>=sep for k in kept):kept.append(c)
+        if len(kept)>=35:break
+    return sorted(kept,key=lambda z:z['x'])
+
+def _phase_locked_sequence(candidates,w):
+    """Find the R phase whose peaks recur at seed+n*RR. Broad T phase loses on morphology score."""
+    if len(candidates)<5:return [],{'status':'UNRESOLVED','reason':'fewer_than_5_peak_candidates'}
+    xs=np.asarray([c['x'] for c in candidates],float)
+    # Candidate RR values from pairwise spacings; test only plausible long-strip cycles.
+    rrs=[]
+    for i in range(len(xs)):
+        for j in range(i+1,min(len(xs),i+7)):
+            d=xs[j]-xs[i]
+            for k in (1,2,3):
+                rr=d/k
+                if .045*w<=rr<=.13*w:rrs.append(rr)
+    if not rrs:return [],{'status':'UNRESOLVED','reason':'no_rr_hypothesis'}
+    # Quantize hypotheses to avoid testing hundreds of near duplicates.
+    rrs=sorted(set(round(r/2.)*2. for r in rrs))
+    best=None
+    for rr in rrs:
+        tol=max(5.,.16*rr)
+        for seed in candidates:
+            # expected positions both directions from seed
+            n0=int(np.floor((0-seed['x'])/rr))-1; n1=int(np.ceil((w-seed['x'])/rr))+1
+            matched=[]; errors=[]; used=set(); expected_count=0
+            for n in range(n0,n1+1):
+                ex=seed['x']+n*rr
+                if ex<.02*w or ex>.98*w:continue
+                expected_count+=1
+                opts=[]
+                for idx,c in enumerate(candidates):
+                    if idx in used:continue
+                    err=abs(c['x']-ex)
+                    if err<=tol:
+                        # phase error + morphology: high-score narrow peak preferred
+                        opts.append((err/tol-.22*c['score'],err,idx,c))
+                if opts:
+                    _,err,idx,c=min(opts,key=lambda z:z[0]);used.add(idx);matched.append(c);errors.append(err/rr)
+            if len(matched)<4:continue
+            matched=sorted(matched,key=lambda z:z['x'])
+            dif=np.diff([c['x'] for c in matched]); norm=dif/rr
+            direct=np.abs(norm-1)<=.18
+            missed=int(np.sum(np.maximum(np.rint(norm).astype(int)-1,0)))
+            miss_frac=missed/max(1,len(matched))
+            morph=float(np.median([c['score'] for c in matched]))
+            phase=float(np.median(errors)) if errors else 9.
+            coverage=len(matched)/max(1,expected_count)
+            score=2.5*coverage+1.3*morph-3.0*phase-1.8*miss_frac+.08*len(matched)
+            if best is None or score>best[0]:best=(score,rr,matched,direct,missed,miss_frac,phase,coverage,morph)
+    if best is None:return [],{'status':'UNRESOLVED','reason':'phase_lock_failed'}
+    _,rr,matched,direct,missed,miss_frac,phase,coverage,morph=best
+    mx=np.asarray([c['x'] for c in matched],float); dif=np.diff(mx)
+    direct_idx=[i for i,v in enumerate(direct) if v]
+    rrvals=np.asarray([dif[i] for i in direct_idx],float)
+    cv=float(np.std(rrvals)/np.mean(rrvals)) if len(rrvals)>=2 and np.mean(rrvals)>0 else None
+    # Benchmark safety: no authority if reconstruction depends on too many inferred misses.
+    if miss_frac>.20 or missed>2:
+        status='UNRESOLVED';reason='too_many_inferred_missed_r'
+    elif len(matched)>=10 and len(direct_idx)>=8 and coverage>=.78 and phase<=.10 and (cv is None or cv<=.12):
+        status='PASS';reason=None
+    elif len(matched)>=7 and len(direct_idx)>=5 and coverage>=.65 and phase<=.14 and (cv is None or cv<=.18):
+        status='REVIEW';reason=None
+    else:
+        status='UNRESOLVED';reason='phase_sequence_quality'
+    qc={'status':status,'reason':reason,'rr_guess_px':round(float(rr),2),'r_accepted':len(matched),
+        'rr_intervals_usable':len(direct_idx),'missed_r_inferred':int(missed),'missed_fraction':round(float(miss_frac),3),
+        'phase_error':round(float(phase),3),'phase_coverage':round(float(coverage),3),
+        'morphology_score':round(float(morph),3),'rr_cv':round(cv,3) if cv is not None else None,
+        'direct_idx':direct_idx}
+    return matched,qc
+
+def _rr_from_rhythm_region(ecg_image,rhythm_region):
+    """v11.3.5 phase-locked narrow R/QRS peak detector."""
+    if not rhythm_region:return {'status':'UNRESOLVED','reason':'no_rhythm_region'}
+    box=rhythm_region.get('box_pixels')
+    if not box:return {'status':'UNRESOLVED','reason':'no_rhythm_box'}
+    crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert('RGB'))
+    if crop.size==0:return {'status':'UNRESOLVED','reason':'empty_rhythm_crop'}
+    y,clqc=_rhythm_waveform_for_r(crop)
+    if y is None:return {'status':'UNRESOLVED','reason':'rhythm_centerline_fail','centerline_qc':clqc}
+    cand=_r_peak_candidates(crop,y)
+    matched,qc=_phase_locked_sequence(cand,crop.shape[1])
+    out={'status':qc.get('status','UNRESOLVED'),'source':'engine_phase_locked_r',
+         'peak_candidates':len(cand),'r_accepted':qc.get('r_accepted',0),
+         'rr_intervals_usable':qc.get('rr_intervals_usable',0),'missed_r_inferred':qc.get('missed_r_inferred',0),
+         'rr_cv':qc.get('rr_cv'),'rr_guess_px':qc.get('rr_guess_px'),'phase_error':qc.get('phase_error'),
+         'phase_coverage':qc.get('phase_coverage'),'morphology_score':qc.get('morphology_score'),
+         'candidate_x':[int(c['x']) for c in cand],'fiducials_x':[int(c['x']) for c in matched],
+         'centerline_qc':clqc,'rhythm_box':box,'rhythm_size':[crop.shape[1],crop.shape[0]],
+         'small_boxes':None,'rr_ms':None,'conversion_status':'PENDING_VERIFIED_RHYTHM_GRID'}
+    if out['status']=='UNRESOLVED':out['reason']=qc.get('reason');return out
+    xs=np.asarray(out['fiducials_x'],float); dif=np.diff(xs); rr=float(qc['rr_guess_px'])
+    direct=[i for i,d in enumerate(dif) if abs(d-rr)/rr<=.18]
+    if not direct:
+        out['status']='UNRESOLVED';out['reason']='no_direct_consecutive_pair';return out
+    k=min(direct,key=lambda i:abs(dif[i]-rr))
+    out['start_x']=int(xs[k]);out['end_x']=int(xs[k+1]);out['rr_px']=round(float(dif[k]),2)
+    out['median_rr_px']=round(float(np.median([dif[i] for i in direct])),2);out['consecutive']=True
+    return out
 
 def rr_authority_overlay_from_region(ecg_image,rhythm_region,rr):
     if not rhythm_region:return None
-    box=rhythm_region["box_pixels"];crop=ecg_image.crop(tuple(map(int,box))).convert("RGB")
+    box=rhythm_region['box_pixels'];crop=ecg_image.crop(tuple(map(int,box))).convert('RGB')
     arr=np.asarray(crop).copy()
-    # Thin markers: all accepted QRS fiducials.
-    for x in rr.get("fiducials_x",[]):
+    for x in rr.get('candidate_x',[]):
+        xx=max(0,min(crop.width-1,int(round(x))))
+        arr[:max(4,int(.14*crop.height)),xx:xx+1]=0
+    for x in rr.get('fiducials_x',[]):
         xx=max(0,min(crop.width-1,int(round(x))))
         arr[:,xx:xx+1]=0
-    # Thick markers: the directly consecutive pair selected for RR.
-    for x in (rr.get("start_x"),rr.get("end_x")):
+    for x in (rr.get('start_x'),rr.get('end_x')):
         if x is None:continue
         xx=max(0,min(crop.width-1,int(round(x))))
         arr[:,max(0,xx-2):min(crop.width,xx+3)]=0
     return Image.fromarray(arr)
-
 
 def rr_authority_overlay_from_digitizer(ecg_image,result,rr):
     item=(result or {}).get("leads",{}).get("II-rhythm",{})
@@ -1118,8 +1258,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3.4"
-PROMPT_VERSION = "ecg-qrs-cluster-rr-v11.3.4"
+APP_VERSION = "v11.3.5"
+PROMPT_VERSION = "ecg-phase-locked-r-v11.3.5"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2321,8 +2461,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · QRS clustering + RR reconstruction")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.4 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · phase-locked Rhythm-II R detector")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.5 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2574,15 +2714,15 @@ else:
     confirm_id = hashlib.sha256(json.dumps(public_regions,sort_keys=True).encode()).hexdigest()[:16]
     confirmed = st.checkbox("Tôi đã kiểm tra chiều ảnh, nhãn từng vùng và không cắt mất đường sóng cần đọc",key="confirm_"+confirm_id)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
-    st.markdown("**v11.3.4 — Measurement Authority: QRS clusters → RR**")
+    st.markdown("**v11.3.5 — Measurement Authority: phase-locked R → RR**")
     if rr_authority:
         _c=st.columns(8)
         _c[0].metric("Authority",rr_authority.get("status","UNRESOLVED"))
-        _c[1].metric("Vertical events",rr_authority.get("vertical_events",0))
-        _c[2].metric("QRS clusters",rr_authority.get("qrs_clusters",0))
-        _c[3].metric("QRS accepted",rr_authority.get("qrs_detected",0))
-        _c[4].metric("RR usable",rr_authority.get("rr_intervals_usable",0))
-        _c[5].metric("Missed",rr_authority.get("missed_qrs_inferred",0))
+        _c[1].metric("Peak candidates",rr_authority.get("peak_candidates",0))
+        _c[2].metric("R accepted",rr_authority.get("r_accepted",0))
+        _c[3].metric("RR usable",rr_authority.get("rr_intervals_usable",0))
+        _c[4].metric("Missed",rr_authority.get("missed_r_inferred",0))
+        _c[5].metric("Coverage",rr_authority.get("phase_coverage","—"))
         _c[6].metric("RR px",rr_authority.get("rr_px","—"))
         _c[7].metric("RR CV",rr_authority.get("rr_cv","—"))
         _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
