@@ -76,39 +76,76 @@ def score_ecg_labels(tsv):
     return sum(hits.values()), len(hits)
 
 
-def detect_ecg_orientation(image):
-    executable = shutil.which("tesseract")
-    if not executable:
-        return {"angle": 0, "detected": False,
-                "message": "Chưa có bộ nhận diện chiều ảnh. Thêm packages.txt rồi Reboot app; hiện có thể xoay tay."}
-    probe = image.convert("RGB")
-    probe.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-    candidates = []
-    failed = 0
-    for angle in (0, 90, 180, 270):
-        buffer = io.BytesIO()
-        rotate_quarter_turn(probe, angle).save(buffer, format="PNG")
-        try:
-            result = subprocess.run(
-                [executable, "stdin", "stdout", "--psm", "11", "-l", "eng", "tsv"],
-                input=buffer.getvalue(), capture_output=True, timeout=5, check=True,
-            )
-            score, count = score_ecg_labels(result.stdout.decode("utf-8", errors="replace"))
-            candidates.append((score, count, angle))
-        except (subprocess.SubprocessError, OSError):
-            failed += 1
-    candidates.sort(reverse=True)
-    # If a candidate could not be tested, don't silently choose among the rest.
-    if failed or len(candidates) != 4:
-        return {"angle": 0, "detected": False,
-                "message": "Nhận diện chữ chưa hoàn tất. Giữ nguyên ảnh; em có thể xoay tay bên dưới."}
-    best, second = candidates[0], candidates[1]
-    if best[0] < 6 or best[1] < 2 or best[0] - second[0] < 3:
-        return {"angle": 0, "detected": False,
-                "message": "Chưa đủ dấu hiệu để tự xác định chiều. Giữ nguyên ảnh; hãy kiểm tra và xoay tay."}
-    return {"angle": best[2], "detected": True,
-            "message": "Đã nhận diện chiều dựa trên chữ và nhãn ECG. Hãy kiểm tra ảnh trước khi phân tích."}
+def _orientation_structure_score(image):
+    """Score whether an ECG page is in landscape reading orientation.
+    Uses page geometry + horizontal waveform/grid structure; no diagnosis/OCR assumptions.
+    """
+    im=image.convert("RGB").copy()
+    im.thumbnail((1200,1200),Image.Resampling.LANCZOS)
+    arr=np.asarray(im).astype(float); h,w=arr.shape[:2]
+    gray=arr.mean(axis=2)
+    # landscape page prior, deliberately modest because phone crops may be near-square
+    aspect=np.log(max(w,1)/max(h,1))
+    # ECG waveform/grid should create more horizontally continuous ink than vertically continuous ink.
+    dark=gray<np.percentile(gray,42)
+    row_density=np.mean(dark,axis=1); col_density=np.mean(dark,axis=0)
+    row_peaks=float(np.mean(np.sort(row_density)[-max(3,h//20):]))
+    col_peaks=float(np.mean(np.sort(col_density)[-max(3,w//20):]))
+    continuity=row_peaks-col_peaks
+    # red grid anisotropy after rotation: long horizontal grid lines support correct 0/180 axis.
+    red=arr[:,:,0]-.5*(arr[:,:,1]+arr[:,:,2])
+    rmask=red>np.percentile(red,72)
+    rrow=float(np.mean(np.sort(np.mean(rmask,axis=1))[-max(3,h//25):]))
+    rcol=float(np.mean(np.sort(np.mean(rmask,axis=0))[-max(3,w//25):]))
+    return 2.2*aspect+5.0*continuity+1.5*(rrow-rcol)
 
+def detect_ecg_orientation(image):
+    """Hybrid 4-way orientation: structural axis first, OCR/lead labels for 0 vs 180."""
+    executable=shutil.which("tesseract")
+    probe=image.convert("RGB")
+    probe.thumbnail((1600,1600),Image.Resampling.LANCZOS)
+    rows=[]
+    for angle in (0,90,180,270):
+        rot=rotate_quarter_turn(probe,angle)
+        struct=float(_orientation_structure_score(rot))
+        ocr_score=0.; count=0; ocr_ok=False
+        if executable:
+            buf=io.BytesIO();rot.save(buf,format="PNG")
+            try:
+                res=subprocess.run([executable,"stdin","stdout","--psm","11","-l","eng","tsv"],
+                    input=buf.getvalue(),capture_output=True,timeout=5,check=True)
+                ocr_score,count=score_ecg_labels(res.stdout.decode("utf-8",errors="replace"))
+                ocr_ok=True
+            except (subprocess.SubprocessError,OSError):
+                pass
+        # Structure decides portrait-vs-landscape; OCR breaks 0/180 ties.
+        total=struct+0.32*ocr_score+0.18*count
+        rows.append({"angle":angle,"total":total,"structure":struct,"ocr":ocr_score,"labels":count,"ocr_ok":ocr_ok})
+    rows.sort(key=lambda x:x["total"],reverse=True)
+    best,second=rows[0],rows[1]
+    margin=best["total"]-second["total"]
+    # Compare orientation AXES separately: {0,180} versus {90,270}. This solves the
+    # common case where structure strongly identifies landscape but OCR cannot distinguish upside-down.
+    axis0=max(x["structure"] for x in rows if x["angle"] in (0,180))
+    axis90=max(x["structure"] for x in rows if x["angle"] in (90,270))
+    axis_gap=abs(axis0-axis90)
+    preferred_axis=(0,180) if axis0>axis90 else (90,270)
+    axis_rows=[x for x in rows if x["angle"] in preferred_axis]
+    axis_rows.sort(key=lambda x:x["total"],reverse=True)
+    top_axis=axis_rows[0]
+    flip_margin=axis_rows[0]["total"]-axis_rows[1]["total"]
+    # If OCR distinguishes the two flips, use it. Otherwise choose the axis representative
+    # requiring the smallest quarter-turn; user still verifies preview.
+    if flip_margin>=.8 and top_axis["labels"]>=1:
+        chosen=top_axis; method="structure+ocr"
+    else:
+        chosen=min(axis_rows,key=lambda x:min(x["angle"],360-x["angle"]))
+        method="structure_axis"
+    detected=axis_gap>=1.25
+    return {"angle":chosen["angle"] if detected else 0,"detected":bool(detected),
+            "message":("Đã nhận diện trục ECG; OCR quyết định đầu–đuôi." if method=="structure+ocr"
+                       else "Đã nhận diện trục ECG bằng cấu trúc; chưa có OCR đủ mạnh để xác nhận đầu–đuôi, hãy kiểm tra preview."),
+            "scores":rows,"margin":round(float(margin),3),"axis_gap":round(float(axis_gap),3),"method":method}
 
 
 def _tesseract_tsv(image, psm=11, timeout=8):
@@ -773,7 +810,7 @@ def build_j_st_evidence(result,ecg_image,qrs_ev,centerline_ev,recording_speed=No
     return out
 
 # ----------------- MEASUREMENT AUTHORITY ENGINE v11.3 -----------------
-def _rr_from_digitizer_rhythm(result):
+def _rr_from_digitizer_rhythm_legacy(result):
     """Use Digitizer's II-rhythm centerline when available; no AI coordinates."""
     item=(result or {}).get("leads",{}).get("II-rhythm",{})
     sig=item.get("signal_px")
@@ -812,6 +849,87 @@ def _rr_from_digitizer_rhythm(result):
             "start_x":a,"end_x":b,"rr_px":round(float(b-a),2),"median_rr_px":round(med,2),
             "rr_cv":round(cv,3),"consecutive":True,"small_boxes":None,"rr_ms":None,
             "conversion_status":"PENDING_VERIFIED_RHYTHM_GRID","centerline_qc":clqc}
+
+def _rr_from_rhythm_region(ecg_image,rhythm_region):
+    """v11.3.1: RR authority runs on the reviewed Rhythm-II ROI itself."""
+    if not rhythm_region:return {"status":"UNRESOLVED","reason":"no_rhythm_region"}
+    box=rhythm_region.get("box_pixels")
+    if not box:return {"status":"UNRESOLVED","reason":"no_rhythm_box"}
+    crop=np.asarray(ecg_image.crop(tuple(map(int,box))).convert("RGB"))
+    if crop.size==0:return {"status":"UNRESOLVED","reason":"empty_rhythm_crop"}
+    h,w=crop.shape[:2]; f=crop.astype(float)
+    gray=f.mean(axis=2); red=f[:,:,0]-.5*(f[:,:,1]+f[:,:,2])
+    # Suppress red grid and text margins. Track dark waveform within the central 72% vertically.
+    ink=(255-gray)-.45*np.maximum(red,0)
+    ya=int(.14*h);yb=int(.86*h); band=ink[ya:yb]
+    # waveform row is near a continuous horizontal baseline; use column-wise candidates then continuity.
+    thr=float(np.percentile(band,80)); raw=np.full(w,np.nan,float)
+    prev=None
+    for x in range(w):
+        inds=np.where(band[:,x]>=thr)[0]
+        if not len(inds):continue
+        ys=ya+inds
+        if prev is None:
+            # start near middle, avoiding top/bottom text
+            pick=ys[np.argmin(np.abs(ys-h*.52))]
+        else:
+            # continuity cost; still allow steep QRS jumps
+            vals=band[inds,x]
+            cost=np.abs(ys-prev)-.18*vals
+            pick=ys[int(np.argmin(cost))]
+        raw[x]=float(pick);prev=float(pick)
+    cleaned,clqc=clean_centerline_signal(raw)
+    if clqc.get("status")=="FAIL":return {"status":"UNRESOLVED","reason":"rhythm_roi_centerline_fail","centerline_qc":clqc}
+    y=_tb_interp(cleaned)
+    if y is None:return {"status":"UNRESOLVED","reason":"no_rhythm_centerline","centerline_qc":clqc}
+    y=_tb_smooth(y,3);n=len(y)
+    baseline=_tb_smooth(y,max(11,int(n*.035))); slope=np.abs(np.gradient(y)); hp=np.abs(y-baseline)
+    # QRS is steep; T is broad. Derivative dominates score.
+    score=_tb_smooth(slope,3)+.18*_tb_smooth(hp,3)
+    min_dist=max(14,int(n*.045));thr2=float(np.percentile(score,88));cand=[]
+    for pp in np.argsort(score)[::-1]:
+        pp=int(pp)
+        if score[pp]<thr2:break
+        if .025*n<pp<.975*n and all(abs(pp-q)>=min_dist for q in cand):cand.append(pp)
+        if len(cand)>=28:break
+    cand=sorted(cand)
+    if len(cand)<3:return {"status":"UNRESOLVED","reason":"fewer_than_3_qrs_candidates","candidates":cand,"centerline_qc":clqc}
+    # Find dominant RR cluster rather than requiring all candidates to be clean.
+    dif=np.diff(cand); dif=dif[dif>min_dist*.8]
+    if not len(dif):return {"status":"UNRESOLVED","reason":"no_rr_spacing","candidates":cand}
+    # mode-like robust RR estimate
+    med0=float(np.median(dif))
+    plausible=[d for d in dif if .55*med0<=d<=1.45*med0]
+    rr0=float(np.median(plausible if plausible else dif))
+    chain=[]
+    for start in cand:
+        cur=[start]
+        for p in cand:
+            if p<=cur[-1]:continue
+            d=p-cur[-1]
+            if .72*rr0<=d<=1.28*rr0:cur.append(p)
+            elif d>1.28*rr0 and d<1.8*rr0:continue
+        if len(cur)>len(chain):chain=cur
+    if len(chain)<3:return {"status":"UNRESOLVED","reason":"no_periodic_qrs_chain","candidates":cand}
+    rr=np.diff(chain);med=float(np.median(rr));cv=float(np.std(rr)/med) if len(rr)>=2 and med>0 else 1.
+    status="PASS" if len(chain)>=5 and cv<=.14 else "REVIEW" if len(chain)>=3 and cv<=.24 else "UNRESOLVED"
+    if status=="UNRESOLVED":return {"status":status,"reason":"unstable_rr_chain","fiducials_x":chain,"rr_cv":round(cv,3)}
+    k=int(np.argmin(np.abs(rr-med)));a=int(chain[k]);b=int(chain[k+1])
+    return {"status":status,"source":"engine_rhythm_roi","beats":len(chain),"fiducials_x":chain,
+            "start_x":a,"end_x":b,"rr_px":round(float(b-a),2),"median_rr_px":round(med,2),
+            "rr_cv":round(cv,3),"consecutive":True,"small_boxes":None,"rr_ms":None,
+            "conversion_status":"PENDING_VERIFIED_RHYTHM_GRID","centerline_qc":clqc,
+            "rhythm_box":box,"rhythm_size":[w,h]}
+
+def rr_authority_overlay_from_region(ecg_image,rhythm_region,rr):
+    if not rhythm_region or rr.get("status")=="UNRESOLVED":return None
+    box=rhythm_region["box_pixels"];crop=ecg_image.crop(tuple(map(int,box))).convert("RGB")
+    arr=np.asarray(crop).copy()
+    for x in (rr.get("start_x"),rr.get("end_x")):
+        if x is None:continue
+        xx=max(0,min(crop.width-1,int(round(x))))
+        arr[:,max(0,xx-2):min(crop.width,xx+3)]=0
+    return Image.fromarray(arr)
 
 def rr_authority_overlay_from_digitizer(ecg_image,result,rr):
     item=(result or {}).get("leads",{}).get("II-rhythm",{})
@@ -882,8 +1000,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.3"
-PROMPT_VERSION = "ecg-measurement-authority-v11.3"
+APP_VERSION = "v11.3.1"
+PROMPT_VERSION = "ecg-orientation-rr-hotfix-v11.3.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2085,8 +2203,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · measurement authority · engine-owned RR")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · orientation + Rhythm-II RR authority hotfix")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.3.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2161,7 +2279,9 @@ else:
                     cache = {"image_id":image_id, **detect_ecg_orientation(original)}
                 st.session_state["orientation_result"] = cache
             auto_angle = cache["angle"]
-            if not cache["detected"]:
+            if cache["detected"]:
+                st.caption(f"Auto-orientation: xoay {cache['angle']}° · {cache.get('method','?')} · axis-gap {cache.get('axis_gap','?')}. Hãy kiểm tra preview.")
+            else:
                 st.caption("Chưa tự xác định được chiều; hãy kiểm tra và xoay tay nếu cần.")
         manual = st.selectbox("Xoay thêm ngược chiều kim đồng hồ", [0,90,180,270], key="image_rot_"+image_id)
         oriented = rotate_quarter_turn(original, (auto_angle+manual)%360)
@@ -2204,8 +2324,6 @@ else:
                     _speed_for_st = speed if speed in (25,50) else None
                     j_st_evidence=build_j_st_evidence(digitizer_result,ecg,qrs_template_evidence,centerline_evidence,_speed_for_st)
                     digitizer_evidence["j_st_engine"]=j_st_evidence
-                    rr_authority=_rr_from_digitizer_rhythm(digitizer_result)
-                    digitizer_evidence["measurement_authority"]={"rr":rr_authority}
                 dq=digitizer_result.get("overall_qc",{})
                 st.write(f"QC Digitizer: **{dq.get('status','?')}** · PASS {dq.get('lead_pass',0)} · REVIEW {dq.get('lead_review',0)} · FAIL {dq.get('lead_fail',0)}")
                 cal=digitizer_result.get("calibration",{})
@@ -2215,7 +2333,7 @@ else:
                 if dq.get("status")!="PASS":
                     st.info("Digitizer chưa PASS toàn bộ. AI vẫn nhận ảnh gốc; lead REVIEW/FAIL không được coi là số đo đã xác minh.")
                 if qrs_template_evidence:
-                    st.markdown("**v11.2d — calibration-pulse exclusion + QRS consensus (chưa gọi morphology)**")
+                    st.markdown("**v11.3.1 — calibration-pulse exclusion + QRS consensus (chưa gọi morphology)**")
                     _rows=[]
                     for _lead in LEADS:
                         _lm=qrs_template_evidence.get("leads",{}).get(_lead,{})
@@ -2313,6 +2431,7 @@ else:
             except ValueError as exc:
                 st.error(str(exc));st.stop()
             st.image(region["png"],width="stretch");regions.append(region)
+            rr_authority=_rr_from_rhythm_region(ecg,region)
     if st.checkbox("Thêm vùng cần xem kỹ",key="image_focus_"+frame_id):
         with st.expander("Vùng chi tiết bổ sung",expanded=True):
             label = st.text_input("Nhãn vùng bổ sung",value="Vùng cần xem kỹ",key="region_focus_label_"+frame_id)
@@ -2344,7 +2463,8 @@ else:
         _c[1].metric("QRS beats",rr_authority.get("beats",0))
         _c[2].metric("RR px",rr_authority.get("rr_px","—"))
         _c[3].metric("RR CV",rr_authority.get("rr_cv","—"))
-        _ov=rr_authority_overlay_from_digitizer(ecg,digitizer_result,rr_authority)
+        _rhreg=next((r for r in regions if r.get("id")=="rhythm"),None)
+        _ov=rr_authority_overlay_from_region(ecg,_rhreg,rr_authority)
         if _ov is not None:
             st.image(_ov,caption="RR ENGINE — hai vạch phải đi qua hai QRS liên tiếp. Marker AI không có authority.",width="stretch")
         if rr_authority.get("status")!="PASS":
