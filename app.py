@@ -364,6 +364,32 @@ def _tb_activity_landmarks(template,pxmm):
     if b-a<max(4,.45*pxmm):return None
     return {"onset_template_x":a,"offset_template_x":b,"center_template_x":c,
             "width_small_boxes":(b-a)/pxmm,"template":sm.tolist()}
+def _two_beat_similarity(beats,template,lm):
+    if len(beats)!=2 or template is None or lm is None: return {"eligible":False}
+    waves=[np.asarray(x.get("wave",[]),dtype=float) for x in beats]
+    if any(len(x)==0 for x in waves): return {"eligible":False}
+    valid=np.isfinite(waves[0])&np.isfinite(waves[1])
+    if valid.sum()<max(20,int(.55*len(waves[0]))): return {"eligible":False,"reason":"insufficient_overlap"}
+    a,b=waves[0][valid],waves[1][valid]
+    corr=float(np.corrcoef(a,b)[0,1]) if np.std(a)>1e-6 and np.std(b)>1e-6 else 0.
+    o=int(lm["onset_template_x"]); j=int(lm["offset_template_x"])
+    pol=[]; amps=[]
+    for w in waves:
+        seg=w[max(0,o):min(len(w),j+1)]; seg=seg[np.isfinite(seg)]
+        if not len(seg): pol.append(0); amps.append(0.); continue
+        amp=float(seg[int(np.argmax(np.abs(seg)))])
+        pol.append(1 if amp>0 else -1 if amp<0 else 0); amps.append(abs(amp))
+    pm=(pol[0]==pol[1] and pol[0]!=0)
+    ar=min(amps)/max(amps) if max(amps)>1e-6 else 0.
+    qlen=max(1.,float(j-o))
+    sd=abs(float(beats[0]["shift"])-float(beats[1]["shift"]))
+    oj=max(0.,1.-sd/max(2.,qlen))
+    passed=(corr>=.88 and pm and ar>=.60 and oj>=.72)
+    score=.45*max(0.,corr)+.20*float(pm)+.20*ar+.15*oj
+    return {"eligible":True,"passed":bool(passed),"waveform_corr":round(corr,3),
+            "dominant_polarity_match":bool(pm),"amplitude_ratio":round(ar,3),
+            "oj_consistency":round(oj,3),"score":round(score,3)}
+
 def analyze_template_qrs(item,pxmm=None):
     lqc=item.get("qc",{}).get("status","FAIL"); sig=item.get("signal_px")
     if sig is None or lqc=="FAIL":return {"status":"UNRESOLVED","reason":"lead_qc_or_signal"}
@@ -389,6 +415,7 @@ def analyze_template_qrs(item,pxmm=None):
     if tpl is None:return {"status":"UNRESOLVED","reason":"fewer_than_2_beats"}
     lm=_tb_activity_landmarks(tpl,work_scale)
     if not lm:return {"status":"UNRESOLVED","reason":"template_landmark_failure"}
+    two_beat=_two_beat_similarity(beats,tpl,lm) if len(beats)==2 else None
     proj=[]
     for bt in beats:
         ox=bt["window_start"]+lm["onset_template_x"]-bt["shift"]; jx=bt["window_start"]+lm["offset_template_x"]-bt["shift"]
@@ -396,19 +423,26 @@ def analyze_template_qrs(item,pxmm=None):
     if len(proj)<2:return {"status":"UNRESOLVED","reason":"projection_failure"}
     widths=np.array([p["width_px"] for p in proj]); med=float(np.median(widths)); mad=float(np.median(np.abs(widths-med)))
     cons=float(np.mean(np.abs(widths-med)<=max(3.0,2.5*mad)))
-    conf=cons*min(1.,len(proj)/3)*(1. if lqc=="PASS" else .75)*(1. if clqc.get("status")=="PASS" else .65)
-    # Pixel-width plausibility relative to RR; no physical-grid assumption here.
-    ratio=med/max(1.0,rrpx)
-    ok=.025<=ratio<=.22 and conf>=.5; rep=min(proj,key=lambda p:abs(p["width_px"]-med))
-    return {"status":("PASS" if ok and lqc=="PASS" and conf>=.65 else "REVIEW" if ok else "UNRESOLVED"),
+    base_conf=cons*min(1.,len(proj)/3)*(1. if lqc=="PASS" else .75)*(1. if clqc.get("status")=="PASS" else .65)
+    ratio=med/max(1.0,rrpx); plausible=.025<=ratio<=.22
+    if len(proj)==2 and two_beat and two_beat.get("passed"):
+        conf=min(.64,max(base_conf,.55+.09*two_beat.get("score",0.)))
+        ok=plausible; final_status="REVIEW" if ok else "UNRESOLVED"; consensus_mode="two_beat_similarity"
+    else:
+        conf=base_conf; ok=plausible and conf>=.5
+        final_status=("PASS" if ok and lqc=="PASS" and conf>=.65 else "REVIEW" if ok else "UNRESOLVED")
+        consensus_mode="multi_beat" if len(proj)>=3 else "two_beat_rejected"
+    rep=min(proj,key=lambda p:abs(p["width_px"]-med))
+    return {"status":final_status,
             "source_lead_qc":lqc,"beats_projected":len(proj),"confidence":round(conf,3),
             "qrs_width_px":round(med,1) if ok else None,"qrs_to_rr_ratio":round(ratio,3) if ok else None,
             "qrs_width_small_boxes":None,"representative":rep if ok else None,
             "template_landmarks":{k:v for k,v in lm.items() if k!="template"},"template_wave":lm["template"],
-            "centerline_qc":clqc,"reason":None if ok else "low_consistency_or_width"}
+            "centerline_qc":clqc,"consensus_mode":consensus_mode,"two_beat_similarity":two_beat,
+            "reason":None if ok else ("two_beat_similarity_failed" if len(proj)==2 else "low_consistency_or_width")}
 def build_template_qrs_evidence(result):
     cal=result.get("calibration",{}) if result else {}; px=cal.get("px_per_mm")
-    out={"engine":"aligned-median-qrs-v11.1c","status":"UNRESOLVED","px_per_small_box":px,"grid_status":cal.get("status"),"leads":{},
+    out={"engine":"aligned-median-qrs-v11.2c","status":"UNRESOLVED","px_per_small_box":px,"grid_status":cal.get("status"),"leads":{},
          "rules":["No morphology naming.","O=onset candidate; J=QRS offset/J candidate.","Small-box width is withheld until local 1-mm grid is verified.","UNRESOLVED must not be completed by AI."]}
     if not result or cal.get("status")!="PASS" or not px:return out
     for lead,item in result.get("leads",{}).items():
@@ -688,8 +722,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v11.2b"
-PROMPT_VERSION = "ecg-calibrated-grid-jst-v11.2b"
+APP_VERSION = "v11.2c"
+PROMPT_VERSION = "ecg-two-beat-consensus-v11.2c"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -758,7 +792,7 @@ SYSTEM_PROMPT += "\nQUY TẮC v9.1 (ƯU TIÊN NẾU CÓ KHÁC BIỆT VỚI ĐO�
 SYSTEM_PROMPT += "\nKhông lặp số có đơn vị ms/bpm/mm/mV trong quality_summary, các trường mô tả observations và lead_features. Chữ chuẩn ghi chỉ ghi trong speed_evidence/gain_evidence; số đo chỉ ghi trong measurements.\n"
 SYSTEM_PROMPT += "\nDIGITIZER v10: bằng chứng digitizer chỉ bổ sung cho ảnh gốc. Không dùng lead QC=FAIL để suy luận định lượng; QC=REVIEW phải đối chiếu ảnh. Chỉ dùng px→ms/mV khi grid_calibration có giá trị tương ứng và recording standard được phép. gain_by_lead rỗng nghĩa tuyệt đối không suy mV từ pulse. OCR label anchors/recording_text là bằng chứng máy đọc, có thể sai; nếu mâu thuẫn ảnh thì nêu cần xác minh. Không biến confidence kỹ thuật thành xác suất chẩn đoán.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
-SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.1c: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
+SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2c: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
 SYSTEM_PROMPT += "\nV10.2: Nếu st_small_boxes khác 0 thì st_measurement_id bắt buộc phải trỏ tới một measurement st_mm có landmarks; nếu không đủ mốc, đặt st_small_boxes=null và detail_st=uncertain thay vì đoán số. Nếu tuổi/triệu chứng/bệnh sử/sinh hiệu chưa được cung cấp, không được kết luận urgency=non_urgent chỉ từ ECG; dùng indeterminate/needs_clinical_context theo giá trị schema phù hợp. Chuẩn ghi đọc trực tiếp từ chữ in trên ảnh có thể dùng source=image_text khi evidence chứa đúng số và đơn vị; không gọi đó là user-confirmed.\n"
 
 
@@ -1890,8 +1924,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 28/10/2026 · calibration-validated grid + J/ST")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v11.2b thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · two-beat consensus + calibrated grid/J-ST")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v11.2c thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -2018,7 +2052,7 @@ else:
                 if dq.get("status")!="PASS":
                     st.info("Digitizer chưa PASS toàn bộ. AI vẫn nhận ảnh gốc; lead REVIEW/FAIL không được coi là số đo đã xác minh.")
                 if qrs_template_evidence:
-                    st.markdown("**v11.1c — centerline QC + aligned median-beat QRS (chưa gọi morphology)**")
+                    st.markdown("**v11.2c — centerline QC + two-beat/multi-beat QRS consensus (chưa gọi morphology)**")
                     _rows=[]
                     for _lead in LEADS:
                         _lm=qrs_template_evidence.get("leads",{}).get(_lead,{})
@@ -2027,7 +2061,9 @@ else:
                                       "support":_cl.get("support"),"fragments":_cl.get("fragment_count"),
                                       "Landmark":_lm.get("status","UNRESOLVED"),"QRS px":_lm.get("qrs_width_px"),
                                       "QRS/RR":_lm.get("qrs_to_rr_ratio"),"Ô nhỏ":_lm.get("qrs_width_small_boxes"),
-                                      "beats":_lm.get("beats_projected",0),"confidence":_lm.get("confidence"),"reason":_lm.get("reason","") or ""})
+                                      "beats":_lm.get("beats_projected",0),"mode":_lm.get("consensus_mode",""),
+                                      "2-beat sim":(_lm.get("two_beat_similarity") or {}).get("score"),
+                                      "confidence":_lm.get("confidence"),"reason":_lm.get("reason","") or ""})
                     st.dataframe(_rows,use_container_width=True,hide_index=True)
                     with st.expander("Overlay centerline cleanup + O/J — kiểm tra bằng mắt",expanded=False):
                         st.caption("Hai vạch là O=onset và J=QRS offset candidate. Đường centerline số hóa được chồng lên ảnh; chưa gán Q/R/S/R′.")
