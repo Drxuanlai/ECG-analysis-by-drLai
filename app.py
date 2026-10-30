@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.2"
-PROMPT_VERSION = "ecg-ai-landmark-transport-rollback-v14.2"
+APP_VERSION = "v14.3"
+PROMPT_VERSION = "ecg-landmark-only-sequential-v14.3"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2700,6 +2700,17 @@ MEASUREMENT AUTHORITY FIREWALL v13.7 — BẮT BUỘC:
 """
 
 SYSTEM_PROMPT += """
+V14.3 LANDMARK-ONLY PASS — ƯU TIÊN CAO NHẤT:
+Lượt AI này CHỈ nhận diện landmark. Không chẩn đoán, differential, khuyến nghị, interval ms,
+biên độ mV/mm, ST elevation/depression hay T cao nhọn.
+Chỉ trả JSON gồm technical_review và lead_landmarks.
+lead_landmarks cố gắng đủ I, II, III, aVR, aVL, aVF, V1-V6; landmark không chắc = null.
+Mỗi landmark = {"x_pct":0..100,"y_pct":0..100} theo đúng ảnh region_id.
+Mỗi lead dùng các key: lead, region_id, cycle_id, quality, p_on, p_peak, p_off, qrs_on,
+q_peak, r_peak, s_peak, r_prime_peak, j_point, t_peak, t_end, baseline_point,
+morphology_candidate, limitation.
+Lead không đọc được: quality="not_visible", các landmark=null.
+
 V14.1 JSON CONTRACT:
 - Trả về MỘT JSON object duy nhất, không Markdown, không code fence.
 - Phải giữ đầy đủ các key mà ứng dụng yêu cầu: quality_summary, technical_review, lead_landmarks, conduction_assessment, summary_measurement_ids, lead_features, hypotheses, observations, measurements, rhythm, conduction, repolarization, impression, verification_needed, urgency.
@@ -2817,6 +2828,20 @@ def validate_schema(value, schema, path="report"):
         for i, item in enumerate(value):
             validate_schema(item, schema["items"], f"{path}[{i}]")
 
+
+def parse_json_object(raw):
+    if len(raw)>250000:
+        raise ValueError("JSON quá dài.")
+    def unique_object(pairs):
+        obj={}
+        for key,value in pairs:
+            if key in obj: raise ValueError("JSON có trường bị lặp.")
+            obj[key]=value
+        return obj
+    value=json.loads(raw,object_pairs_hook=unique_object)
+    if not isinstance(value,dict):
+        raise ValueError("JSON landmark phải là object.")
+    return value
 
 def parse_report(raw, regions):
     if len(raw) > 250000:
@@ -3413,72 +3438,36 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
         "first_text_seconds":round(first,2) if first is not None else None}
 
 
-def run_with_failover(routes, regions, prompt, runtime=None, collect=None):
-    runtime = api_runtime() if runtime is None else runtime
-    collect = collect_response if collect is None else collect
-    started = time.monotonic()
-    attempts, calls, visited, visited_keys = [], 0, set(), set()
-    selected = routes[0]
-    outcome = {"raw_response":"","api_completed":False,"error":"Các nguồn đang nghỉ hoặc bận. Xem lịch sử nguồn API.",
-        "error_meta":None,"total_seconds":0,"first_text_seconds":None}
+def _retryable_route_error(exc):
+    t=str(exc).lower()
+    if any(x in t for x in ("api_key_invalid","api key not valid","permission_denied","model not found","not_found","unsupported")): return False
+    return any(x in t for x in ("429","quota","503","504","500","502","unavailable","deadline","timeout","temporar","overload","rate limit"))
+
+def run_with_failover(routes, regions, prompt):
+    history=[]; max_attempts_per_route=3
     for route in routes:
-        if calls >= MAX_ROUTE_ATTEMPTS or time.monotonic()-started >= FAILOVER_BUDGET_SECONDS:
-            break
-        bucket, now = quota_bucket(route), time.time()
-        if bucket in visited or route["key_id"] in visited_keys:
-            attempts.append({"Nguồn":route["name"],"Model":route["model"],"Trạng thái":"Bỏ qua: cùng project/model đã xét"})
+        if route.get("cooldown_until",0)>time.time():
+            history.append({"name":route["name"],"model":route["model"],"status":"Bỏ qua: cooldown","attempt":None,"seconds":None})
             continue
-        visited.add(bucket)
-        visited_keys.add(route["key_id"])
-        with runtime["lock"]:
-            # Bounded state: expired entries don't survive indefinitely.
-            for field in ("cooldowns","inflight","invalid_keys"):
-                for key, expiry in list(runtime[field].items()):
-                    if expiry <= now: del runtime[field][key]
-            expiry = max(runtime["cooldowns"].get(bucket,0),runtime["invalid_keys"].get(route["key_id"],0))
-            busy = runtime["inflight"].get(bucket,0) > now
-            if expiry <= now and not busy:
-                runtime["inflight"][bucket] = now+FAILOVER_BUDGET_SECONDS+REQUEST_TIMEOUT_SECONDS+30
-        if expiry > now or busy:
-            label = "Bỏ qua: nguồn đang xử lý yêu cầu khác" if busy else "Bỏ qua: nguồn đang trong thời gian nghỉ"
-            attempts.append({"Nguồn":route["name"],"Model":route["model"],"Trạng thái":label})
-            continue
-        selected, calls = route, calls+1
-        st.caption(f"Đang dùng {route['name']} · {route['model']} · lần gọi {calls}/{MAX_ROUTE_ATTEMPTS}")
-        try:
-            generator = analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"]) if route["provider"] == "Google Gemini" else analyze_openai(route["key"],route["model"],regions,prompt)
-            remaining = max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-started))
-            outcome = collect(generator,route["provider"],min(STREAM_BUDGET_SECONDS,remaining))
-        finally:
-            with runtime["lock"]:
-                runtime["inflight"].pop(bucket,None)
-        meta = outcome.get("error_meta") or {}
-        attempts.append({"Nguồn":route["name"],"Model":route["model"],"Trạng thái":"Hoàn tất" if outcome["api_completed"] else meta.get("message","Không hoàn tất"),
-            "HTTP":meta.get("http_status",""),"Giây":outcome["total_seconds"]})
-        if outcome["api_completed"]:
-            break
-        kind = meta.get("kind")
-        now = time.time()
-        with runtime["lock"]:
-            if kind == "daily_quota":
-                until = now+meta["retry_seconds"]+2 if meta.get("retry_seconds") else next_daily_reset(now) if route["provider"] == "Google Gemini" else now+86400
-                runtime["cooldowns"][bucket] = until
-            elif kind in ("rate_limit","unavailable","billing_quota"):
-                delay = max(meta.get("retry_seconds",0),86400 if kind == "billing_quota" else 60)
-                runtime["cooldowns"][bucket] = now+delay
-            elif kind == "auth":
-                runtime["invalid_keys"][route["key_id"]] = now+300
-        # A timeout may already have consumed quota. Never multiply it automatically.
-        # A partial response or invalid completed JSON also NEVER triggers failover.
-        if outcome["raw_response"] or kind not in ("daily_quota","rate_limit","unavailable","billing_quota","auth"):
-            break
-    outcome["attempts"] = attempts
-    outcome["api_calls"] = calls
-    outcome["total_seconds"] = round(time.monotonic()-started,2)
-    return outcome,selected
+        for attempt in range(1,max_attempts_per_route+1):
+            st.caption(f"Đang dùng {route['name']} · {route['model']} · lần {attempt}/{max_attempts_per_route}")
+            t0=time.monotonic()
+            try:
+                generator=analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"])
+                remaining=max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-t0))
+                outcome=collect_response(generator,route["provider"],min(STREAM_TIMEOUT_SECONDS,remaining))
+                history.append({"name":route["name"],"model":route["model"],"status":"Hoàn tất","attempt":attempt,"seconds":round(time.monotonic()-t0,2)})
+                outcome["route_history"]=history
+                outcome["request_summary"]={"route":route["name"],"attempt":attempt,"images":len(regions),"parallel":False}
+                return outcome,route
+            except Exception as exc:
+                retryable=_retryable_route_error(exc)
+                history.append({"name":route["name"],"model":route["model"],"status":"Lỗi tạm thời" if retryable else "Lỗi cố định","attempt":attempt,"seconds":round(time.monotonic()-t0,2),"detail":str(exc)[:400]})
+                if not retryable: break
+                if attempt<max_attempts_per_route: time.sleep(min(2**(attempt-1),4))
+    raise RuntimeError("Tất cả nguồn API đều thất bại: "+json.dumps(history,ensure_ascii=False))
 
 
-# ----------------- HIỂN THỊ VÀ XUẤT ĐỐI CHIẾU -----------------
 def _point_to_px(point, region):
     if not isinstance(point, dict):
         return None
@@ -3553,6 +3542,39 @@ def _morphology_from_landmarks(lm, region):
             "candidate": lm.get("morphology_candidate", ""),
             "reason": None if ok else "landmark_polarity_conflict"}
 
+
+V14_LEADS = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+V14_LANDMARK_KEYS = ["p_on","p_peak","p_off","qrs_on","q_peak","r_peak","s_peak","r_prime_peak","j_point","t_peak","t_end","baseline_point"]
+
+def normalize_v14_landmark_response(data, regions):
+    if not isinstance(data,dict): data={}
+    issues=[]; raw=data.get("lead_landmarks")
+    if not isinstance(raw,list): raw=[]; issues.append("lead_landmarks_missing")
+    region_ids={r.get("id") for r in regions}; bylead={}
+    for item in raw:
+        if not isinstance(item,dict): continue
+        lead=str(item.get("lead","")).strip()
+        if lead not in V14_LEADS or lead in bylead: continue
+        x=dict(item); x["lead"]=lead
+        if x.get("region_id") not in region_ids:
+            x["quality"]="not_visible"; issues.append(lead+":invalid_region")
+        if x.get("quality") not in ("clear","review","not_visible"): x["quality"]="review"
+        for k in V14_LANDMARK_KEYS:
+            p=x.get(k)
+            try:
+                xp=float(p["x_pct"]); yp=float(p["y_pct"])
+                if not (0<=xp<=100 and 0<=yp<=100): raise ValueError
+                x[k]={"x_pct":xp,"y_pct":yp}
+            except Exception: x[k]=None
+        bylead[lead]=x
+    for lead in V14_LEADS:
+        if lead not in bylead:
+            z={"lead":lead,"region_id":None,"cycle_id":None,"quality":"not_visible","morphology_candidate":None,"limitation":"AI did not return this lead"}
+            for k in V14_LANDMARK_KEYS: z[k]=None
+            bylead[lead]=z; issues.append(lead+":missing")
+    tech=data.get("technical_review")
+    if not isinstance(tech,dict): tech={"image_readable":None,"calibration_visible":None,"lead_reversal_suspicion":"cannot_assess","notes":"not returned"}
+    return {"technical_review":tech,"lead_landmarks":[bylead[x] for x in V14_LEADS]},issues
 
 def build_v14_measurement_authority(data, regions, ecg_image, known):
     """v14.1: AI identifies landmarks; deterministic code measures them in the sent-image coordinate system."""
@@ -4136,7 +4158,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.2 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4523,7 +4545,9 @@ else:
             v14_measurement_authority = None
             if outcome["api_completed"]:
                 try:
-                    data = parse_report(outcome["raw_response"],regions)
+                    raw_data = parse_json_object(outcome["raw_response"])
+                    data, landmark_parse_issues = normalize_v14_landmark_response(raw_data, regions)
+                    checks = {"landmark_parse_issues": landmark_parse_issues}
                     # Schema is now proven valid. Sanitize only user-visible semantic content.
                     data, sanitizer_audit = _sanitize_ai_result_v137(
                         data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
