@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.3.2"
-PROMPT_VERSION = "ecg-landmark-only-sequential-diagnostics-v14.3.2"
+APP_VERSION = "v14.3.3"
+PROMPT_VERSION = "ecg-landmark-only-outcome-aware-v14.3.3"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3446,7 +3446,7 @@ class APIRoutesFailed(RuntimeError):
 def _safe_route_history(history):
     safe=[]
     for h in history or []:
-        x={k:v for k,v in h.items() if k in ("name","model","status","attempt","seconds","detail")}
+        x={k:v for k,v in h.items() if k in ("name","model","status","attempt","seconds","http","detail")}
         d=str(x.get("detail",""))
         d=re.sub(r'AIza[0-9A-Za-z_-]{15,}', '[REDACTED_API_KEY]', d)
         d=re.sub(r'AQ\.[0-9A-Za-z_-]{15,}', '[REDACTED_AUTH_KEY]', d)
@@ -3465,12 +3465,45 @@ def _retryable_route_error(exc):
     return any(x in t for x in ("429","quota","503","504","500","502","unavailable",
                                 "deadline exceeded","timed out","temporar","overload","rate limit"))
 
+def _outcome_error_text(outcome):
+    if not isinstance(outcome,dict):
+        return "invalid_outcome"
+    for key in ("error","error_message","message","detail"):
+        value=outcome.get(key)
+        if value:
+            return str(value)
+    # collect_response may keep the original exception/status under diagnostics.
+    for key in ("diagnostics","api_error","failure"):
+        value=outcome.get(key)
+        if value:
+            return str(value)
+    return "api_completed_false_without_error_detail"
+
+def _outcome_http_code(outcome):
+    if not isinstance(outcome,dict):
+        return None
+    for key in ("http_code","status_code","code"):
+        value=outcome.get(key)
+        if value is not None:
+            try:return int(value)
+            except Exception:pass
+    text=_outcome_error_text(outcome)
+    import re as _re
+    m=_re.search(r'\b(400|401|403|404|408|409|429|500|502|503|504)\b',text)
+    return int(m.group(1)) if m else None
+
 def run_with_failover(routes, regions, prompt):
-    history=[]; max_attempts_per_route=3
+    """v14.3.3: sequential and outcome-aware. Success means api_completed=True, nothing else."""
+    history=[]
+    max_attempts_per_route=3
+
     for route in routes:
         if route.get("cooldown_until",0)>time.time():
-            history.append({"name":route["name"],"model":route["model"],"status":"Bỏ qua: cooldown","attempt":None,"seconds":None})
+            history.append({"name":route["name"],"model":route["model"],
+                            "status":"Bỏ qua: cooldown","attempt":None,"seconds":None,
+                            "http":None,"detail":""})
             continue
+
         for attempt in range(1,max_attempts_per_route+1):
             st.caption(f"Đang dùng {route['name']} · {route['model']} · lần {attempt}/{max_attempts_per_route}")
             t0=time.monotonic()
@@ -3478,20 +3511,49 @@ def run_with_failover(routes, regions, prompt):
                 generator=analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"])
                 remaining=max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-t0))
                 outcome=collect_response(generator,route["provider"],remaining)
-                history.append({"name":route["name"],"model":route["model"],"status":"Hoàn tất","attempt":attempt,"seconds":round(time.monotonic()-t0,2)})
-                outcome["route_history"]=history
-                outcome["request_summary"]={"route":route["name"],"attempt":attempt,"images":len(regions),"parallel":False}
-                return outcome,route
+                sec=round(time.monotonic()-t0,2)
+
+                # CRITICAL: collect_response can return a failed outcome without raising.
+                if isinstance(outcome,dict) and outcome.get("api_completed") is True:
+                    history.append({"name":route["name"],"model":route["model"],
+                                    "status":"Hoàn tất","attempt":attempt,"seconds":sec,
+                                    "http":_outcome_http_code(outcome),"detail":""})
+                    outcome["route_history"]=_safe_route_history(history)
+                    outcome["request_summary"]={"route":route["name"],"attempt":attempt,
+                                                "images":len(regions),"parallel":False}
+                    return outcome,route
+
+                detail=_outcome_error_text(outcome)
+                code=_outcome_http_code(outcome)
+                # Classify the FAILED OUTCOME, not only exceptions.
+                pseudo_exc=RuntimeError(detail)
+                retryable=_retryable_route_error(pseudo_exc)
+                history.append({"name":route["name"],"model":route["model"],
+                                "status":"Lỗi tạm thời" if retryable else "Lỗi cố định",
+                                "attempt":attempt,"seconds":sec,"http":code,
+                                "detail":detail[:700]})
+                if not retryable:
+                    break
+                if attempt<max_attempts_per_route:
+                    time.sleep(min(2**(attempt-1),4))
+
             except Exception as exc:
-                local_bug=isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError))
+                local_bug=isinstance(exc,(NameError,UnboundLocalError,AttributeError,
+                                          TypeError,KeyError,ImportError))
+                sec=round(time.monotonic()-t0,2)
                 retryable=_retryable_route_error(exc)
                 history.append({"name":route["name"],"model":route["model"],
-                                "status":"Lỗi code local — dừng ngay" if local_bug else ("Lỗi tạm thời" if retryable else "Lỗi cố định"),
-                                "attempt":attempt,"seconds":round(time.monotonic()-t0,2),"detail":str(exc)[:400]})
+                                "status":"Lỗi code local — dừng ngay" if local_bug else
+                                         ("Lỗi tạm thời" if retryable else "Lỗi cố định"),
+                                "attempt":attempt,"seconds":sec,"http":None,
+                                "detail":str(exc)[:700]})
                 if local_bug:
                     raise RuntimeError("Lỗi code local; không retry/chuyển API: "+str(exc)) from exc
-                if not retryable: break
-                if attempt<max_attempts_per_route: time.sleep(min(2**(attempt-1),4))
+                if not retryable:
+                    break
+                if attempt<max_attempts_per_route:
+                    time.sleep(min(2**(attempt-1),4))
+
     raise APIRoutesFailed(_safe_route_history(history))
 
 
@@ -4185,7 +4247,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.2 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.3 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
