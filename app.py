@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v15.1-clean-signal"
+APP_VERSION = "v15.2-multilead-geometry-consensus"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3783,6 +3783,171 @@ def build_single_lead_regions(ecg, selected_groups, enhance=False):
     return out
 
 
+
+
+def _v152_group_row_centers(group_region):
+    """Estimate three ECG row centres inside a selected 3-lead group.
+    Searches independently inside each expected third, so labels/calibration cannot swap rows.
+    Returns centres in group-image pixel coordinates plus confidence metadata.
+    """
+    import numpy as np
+    img=_region_pil_image(group_region).convert("RGB")
+    a=np.asarray(img,dtype=float); H,W,_=a.shape
+    r,g,b=a[:,:,0],a[:,:,1],a[:,:,2]
+    gray=.299*r+.587*g+.114*b
+    chroma=np.maximum.reduce([r,g,b])-np.minimum.reduce([r,g,b])
+    red=r-(g+b)/2.0
+    ink=np.clip((185-gray)/100.0,0,1)
+    neutral=np.clip(1.0-chroma/85.0,0,1)
+    red_pen=np.clip((45-red)/45.0,0,1)
+    score=ink*(0.65+0.35*neutral)*red_pen
+    score[gray>190]=0
+    # Ignore left label zone and right calibration zone for row localisation.
+    xa=int(.08*W); xb=max(xa+1,int(.78*W))
+    core=score[:,xa:xb]
+    occ=(core>0.18).mean(axis=1)
+    mean=np.mean(core,axis=1)
+    # Text rows are broad/dense; ECG trace is sparse but persistent.
+    metric=.72*occ+.28*mean
+    k=max(5,int(.035*H)); k += (k%2==0)
+    metric=np.convolve(metric,np.ones(k)/k,mode='same')
+    centers=[]; conf=[]
+    for i in range(3):
+        a0=int(H*(i/3.0+.06)); b0=int(H*((i+1)/3.0-.06))
+        if b0<=a0: a0=int(H*i/3); b0=int(H*(i+1)/3)
+        ys=np.arange(a0,b0)
+        expected=H*(i+.5)/3.0
+        prior=np.exp(-0.5*((ys-expected)/max(8,.13*H))**2)
+        vals=metric[ys]*(0.72+0.28*prior)
+        j=int(np.argmax(vals)); y=int(ys[j])
+        centers.append(y)
+        local=np.median(metric[ys]) if len(ys) else 0
+        conf.append(float(metric[y]/max(1e-6,local+1e-6)))
+    # Enforce increasing centres; fallback to thirds if pathological.
+    if not (centers[0]<centers[1]<centers[2]):
+        centers=[int(H*(i+.5)/3) for i in range(3)]
+    return centers,{"row_center_confidence":[round(x,3) for x in conf],"group_height":H,"group_width":W}
+
+
+def build_single_lead_regions_v152(ecg, selected_groups, enhance=False):
+    """Geometry-first 3-row isolation. No overlap across row mid-boundaries."""
+    lead_map={"group_1":["I","II","III"],"group_2":["aVR","aVL","aVF"],
+              "group_3":["V1","V2","V3"],"group_4":["V4","V5","V6"]}
+    out=[]
+    for g in selected_groups:
+        leads=lead_map.get(g.get("id"))
+        if not leads: continue
+        centers,meta=_v152_group_row_centers(g)
+        gh=int(meta["group_height"])
+        # Boundaries halfway between detected row centres. Outer bounds stay inside group.
+        bounds=[0,int(round((centers[0]+centers[1])/2)),int(round((centers[1]+centers[2])/2)),gh-1]
+        gx=tuple(map(float,g["horizontal_percent"])); gy0,gy1=map(float,g["vertical_percent"]); gspan=gy1-gy0
+        for i,lead in enumerate(leads):
+            # Small inward guard removes neighbouring-row tails; never crosses midpoint.
+            lo=bounds[i]; hi=bounds[i+1]
+            guard=max(1,int(.018*gh))
+            if i>0: lo+=guard
+            if i<2: hi-=guard
+            a=gy0+gspan*(lo/max(1,gh-1)); b=gy0+gspan*(hi/max(1,gh-1))
+            r=make_region(ecg,"lead_"+lead,"Single lead "+lead,gx,_clip_pct_pair((a,b)),enhance)
+            r["lead"]=lead;r["source_group"]=g["id"];r["row_index"]=i
+            r["v152_geometry"]={"group_centers_px":centers,"group_bounds_px":bounds,
+                                "row_center_confidence":meta["row_center_confidence"],
+                                "source_group_height":gh}
+            out.append(r)
+    return out
+
+
+def _v152_cluster_consensus(norm_candidates, tolerance=.035):
+    """Cluster normalized QRS times from multiple leads; require evidence from >=2 leads."""
+    import numpy as np
+    pts=[]
+    for lead,vals in norm_candidates.items():
+        for v in vals: pts.append((float(v),lead))
+    pts.sort(); clusters=[]
+    for v,lead in pts:
+        best=None
+        for c in clusters:
+            if abs(v-c["center"])<=tolerance:
+                best=c;break
+        if best is None:
+            clusters.append({"values":[v],"leads":{lead},"center":v})
+        else:
+            best["values"].append(v);best["leads"].add(lead)
+            best["center"]=float(np.median(best["values"]))
+    good=[c for c in clusters if len(c["leads"])>=2]
+    return [float(np.median(c["values"])) for c in good]
+
+
+def _v152_project_consensus_to_lead(res, consensus_norm):
+    """Project group timing consensus to one lead and refine to strongest local deflection."""
+    import numpy as np
+    xs=np.asarray(res.get("x") or [],dtype=int); z=np.asarray(res.get("signal") or [],dtype=float)
+    if len(xs)<5 or len(z)!=len(xs): return []
+    W=int(res.get("width") or (xs[-1]+1)); bx=int(xs[0])
+    exclusions=res.get("calibration_exclusion_x") or []
+    def excluded_abs(x): return any(a<=x<=b for a,b in exclusions)
+    out=[]; rad=max(7,int(.028*len(z)))
+    for t in consensus_norm:
+        target=int(round(t*(W-1)))
+        # target is crop-local; z index corresponds x-bx.
+        ci=max(0,min(len(z)-1,target))
+        lo=max(0,ci-rad);hi=min(len(z),ci+rad+1)
+        valid=[k for k in range(lo,hi) if not excluded_abs(int(xs[k]))]
+        if not valid: continue
+        # QRS has high amplitude AND slope; this avoids choosing broad T peaks.
+        dz=np.abs(np.gradient(z))
+        scale=max(1.0,float(np.percentile(np.abs(z),90)))
+        score={k:abs(z[k])/scale+1.25*dz[k]/max(1.0,float(np.percentile(dz,90))) for k in valid}
+        k=max(valid,key=lambda q:score[q])
+        out.append(int(xs[k]))
+    # Deduplicate projections that collapse to same complex.
+    sep=max(12,int(.06*len(z))); final=[]
+    for x in sorted(out):
+        if not final or x-final[-1]>=sep: final.append(x)
+        elif abs(z[min(len(z)-1,max(0,x-bx))])>abs(z[min(len(z)-1,max(0,final[-1]-bx))]): final[-1]=x
+    return final
+
+
+def v152_apply_multilead_consensus(single_leads, results):
+    """Use simultaneous 3-lead groups as timing authority, then refine locally per lead."""
+    groups={"group_1":["I","II","III"],"group_2":["aVR","aVL","aVF"],
+            "group_3":["V1","V2","V3"],"group_4":["V4","V5","V6"]}
+    by={r.get("lead"):r for r in results}
+    for gid,leads in groups.items():
+        norm={}
+        for lead in leads:
+            r=by.get(lead)
+            if not r: continue
+            W=max(1,int(r.get("width") or 1)); bx=(r.get("x") or [0])[0]
+            vals=[]
+            # raw candidates carry more sensitivity; consensus supplies specificity.
+            for xa in r.get("qrs_candidates_raw_x") or []:
+                vals.append((float(xa)-float(bx))/max(1,W-1))
+            norm[lead]=[v for v in vals if .04<=v<=.96]
+        cons=_v152_cluster_consensus(norm,tolerance=.038)
+        # If only two consensus beats survive, estimate missing periodic beat from median RR only when supported by raw evidence.
+        for lead in leads:
+            r=by.get(lead)
+            if not r: continue
+            projected=_v152_project_consensus_to_lead(r,cons)
+            r["qrs_candidates_preconsensus_x"]=list(r.get("qrs_candidates_x") or [])
+            r["qrs_candidates_x"]=projected
+            r["group_consensus_norm"]=[round(v,5) for v in cons]
+            r["consensus_group"]=gid
+            r["consensus_support_leads"]={k:len(v) for k,v in norm.items()}
+            if len(projected)>=2:
+                ds=np.diff(projected).astype(float)
+                r["rr_px"]=round(float(np.median(ds)),2)
+                r["rr_cv"]=round(float(np.std(ds)/max(1,np.mean(ds))),3) if len(ds)>1 else 0.0
+            else:
+                r["rr_px"]=None;r["rr_cv"]=None
+            geom_ok=r.get("support",0)>=.55 and r.get("continuity",0)>=.90
+            rr_ok=len(projected)>=2 and (r.get("rr_cv") is None or r.get("rr_cv")<=.20)
+            r["status"]="PASS" if geom_ok and rr_ok else "REVIEW"
+    return results
+
+
 def _v151_find_corridor(score, gray):
     """Find the horizontal lead band nearest the ROI centre; avoids adjacent-row capture."""
     import numpy as np
@@ -4012,7 +4177,7 @@ def v15_waveform_overlay(region,res):
     for x in res.get('qrs_candidates_x') or []:
         d.line((x,0,x,img.height-1),fill=(255,90,0,255),width=2)
     d.rectangle((0,0,min(img.width-1,560),30),fill=(255,255,255,235))
-    d.text((6,6),f"v15.1 {res.get('lead')} | {res.get('status')} | support {res.get('support')} | QRS {len(res.get('qrs_candidates_x') or [])} | RRcv {res.get('rr_cv')}",fill=(0,0,0,255))
+    d.text((6,6),f"v15.2 {res.get('lead')} | {res.get('status')} | support {res.get('support')} | QRS {len(res.get('qrs_candidates_x') or [])} | RRcv {res.get('rr_cv')}",fill=(0,0,0,255))
     return img
 
 def v15_contact_sheet(single_leads,results):
@@ -5461,7 +5626,7 @@ else:
                 _sel=dict(_sel);_sel["id"]=_g["id"];_sel["label"]=_g.get("label",_g["id"])
                 _selected_groups.append(_sel)
 
-        _single_leads=build_single_lead_regions(ecg,_selected_groups,enhance)
+        _single_leads=build_single_lead_regions_v152(ecg,_selected_groups,enhance)
         # Landmark pass needs overview + 12 isolated leads. Rhythm/focus remain local evidence,
         # not extra multimodal payload, to control token/image cost.
         _overview=next((r for r in regions if r.get("id")=="overview"),None)
@@ -5475,23 +5640,24 @@ else:
                         st.image(_r["png"],caption=_r["lead"],width="stretch")
 
         # v15.0 Waveform Lab: independent of Gemini landmark coordinates.
-        st.markdown("### v15.1 — Clean Signal Foundation")
-        st.caption("Kiểm chứng kiến trúc mới: ảnh single-lead → trace 1-D → QRS candidates. Không dùng P/Q/R/S/J/T do Gemini đề xuất.")
+        st.markdown("### v15.2 — Multi-lead Geometry + QRS Consensus")
+        st.caption("Geometry-first: group 3 lead → tách 3 hàng không chồng → digitize 1-D → QRS raw → consensus timing giữa các lead đồng thời → refine lại trên từng waveform. Không dùng landmark Gemini.")
         _v15_results=[]
         for _r in _single_leads:
             try:
                 _v15_results.append(v15_extract_waveform(_r))
             except Exception as _exc:
                 _v15_results.append({"lead":_r.get("lead"),"status":"ERROR","error":str(_exc)[:300],"qrs_candidates_x":[]})
+        _v15_results=v152_apply_multilead_consensus(_single_leads,_v15_results)
         _v15_by={x.get("lead"):x for x in _v15_results}
         _v15_lead=st.selectbox("Lead kiểm tra waveform",[r["lead"] for r in _single_leads],key="v15_waveform_lead_"+frame_id)
         _v15_reg=next(r for r in _single_leads if r["lead"]==_v15_lead)
         _v15_res=_v15_by[_v15_lead]
         if _v15_res.get("status")!="ERROR":
-            st.image(v15_waveform_overlay(_v15_reg,_v15_res),caption="Xanh = waveform; cam đậm = QRS sau RR-filter; cam nhạt = candidate thô; xanh lá = lead corridor; đỏ nhạt = vùng loại calibration/edge. Chưa phải landmark PQRST.",width="stretch")
+            st.image(v15_waveform_overlay(_v15_reg,_v15_res),caption="Xanh = waveform; cam đậm = QRS sau multi-lead consensus; cam nhạt = candidate thô; xanh lá = lead corridor; đỏ nhạt = calibration/edge exclusion. Chưa phải landmark PQRST.",width="stretch")
         else:
             st.error(_v15_res.get("error"))
-        st.dataframe([{k:v for k,v in x.items() if k in ("lead","status","support","continuity","qrs_candidates_raw_x","qrs_candidates_x","rr_px","rr_cv","corridor_y","calibration_exclusion_x","error")} for x in _v15_results],hide_index=True,width="stretch")
+        st.dataframe([{k:v for k,v in x.items() if k in ("lead","status","support","continuity","qrs_candidates_raw_x","qrs_candidates_preconsensus_x","qrs_candidates_x","group_consensus_norm","rr_px","rr_cv","corridor_y","calibration_exclusion_x","error")} for x in _v15_results],hide_index=True,width="stretch")
         try:
             _v15_sheet=v15_contact_sheet(_single_leads,_v15_results)
             _v15_buf=io.BytesIO(); _v15_sheet.save(_v15_buf,format="PNG") if _v15_sheet is not None else None
@@ -5501,11 +5667,11 @@ else:
         _v15_json=json.dumps(_v15_results,ensure_ascii=False,indent=2).encode("utf-8")
         _a,_b=st.columns(2)
         with _a:
-            if _v15_png: st.download_button("Tải v15.1 Clean Signal PNG",_v15_png,"ecg_v15_1_clean_signal_validation.png","image/png",key="v15_png_"+frame_id,width="stretch")
+            if _v15_png: st.download_button("Tải v15.2 Multi-lead Validation PNG",_v15_png,"ecg_v15_2_multilead_validation.png","image/png",key="v15_png_"+frame_id,width="stretch")
         with _b:
-            st.download_button("Tải v15.1 Clean Signal JSON",_v15_json,"ecg_v15_1_clean_signal_validation.json","application/json",key="v15_json_"+frame_id,width="stretch")
+            st.download_button("Tải v15.2 Multi-lead Validation JSON",_v15_json,"ecg_v15_2_multilead_validation.json","application/json",key="v15_json_"+frame_id,width="stretch")
         _pass=sum(1 for x in _v15_results if x.get("status")=="PASS")
-        st.info(f"v15.0 waveform QC: PASS {_pass}/12. Chưa dùng kết quả này để chẩn đoán; mục tiêu hiện tại chỉ là xác minh trace/QRS trên ảnh.")
+        st.info(f"v15.2 multi-lead QC: PASS {_pass}/12. Chưa dùng để chẩn đoán. Mục tiêu: 12 waveform đúng hàng + QRS timing nhất quán giữa các lead đồng thời.")
 
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     context = {"age":age,"sex":sex,"history":history.strip() or None,"user_confirmed_calibration":known}
