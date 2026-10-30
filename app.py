@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.9-v13base"
+APP_VERSION = "v14.10-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -4089,13 +4089,89 @@ def _morphology_components(morph):
         elif ch in "sS": out.append("s_peak")
     return out
 
+
+def _normalized_morphology(morph):
+    return str(morph or "").replace("′","'").replace("’","'").replace(" ","").strip()
+
+def _refine_qrs_apex(region, pt, component):
+    """Refine an already-correct QRS component to the true local apex.
+    Image y decreases upward: R/R' -> minimum y; Q/S/QS -> maximum y.
+    """
+    import numpy as np
+    if not isinstance(pt,dict): return pt,{"status":"REVIEW","reason":"missing_seed"}
+    x=_pt_x(pt); y=_pt_y(pt)
+    if x is None:return pt,{"status":"REVIEW","reason":"missing_seed_x"}
+    tr=_local_dark_trace(region,x,y,1.15,18.0)
+    ty=tr.get("trace_y")
+    if ty is None:return pt,{"status":"REVIEW","reason":tr.get("reason"),"confidence":tr.get("confidence",0.0)}
+    ty=np.asarray(ty,dtype=float); W=tr["width"]; H=tr["height"]
+    gx=np.arange(len(ty))+tr["x0"]
+    seed=x/100.0*(W-1)
+    # Do not jump to a neighboring complex: apex search is intentionally tight.
+    dist=np.abs(gx-seed)
+    keep=dist<=max(3.0,0.010*W)
+    if not np.any(keep): keep=np.ones(len(ty),dtype=bool)
+    inds=np.where(keep)[0]
+    if component in ("r_peak","r_prime_peak"):
+        k=int(inds[np.argmin(ty[inds])])
+    else:
+        k=int(inds[np.argmax(ty[inds])])
+    out={"x_pct":round(100.0*float(gx[k])/max(1,W-1),3),
+         "y_pct":round(100.0*float(ty[k])/max(1,H-1),3)}
+    return out,{"status":tr.get("status"),"confidence":tr.get("confidence"),
+                "reason":tr.get("reason"),"apex_refined":True}
+
+def _v1410_expected_qrs(item):
+    """Return expected QRS components with a clinically safer QS special case."""
+    m=_normalized_morphology(item.get("morphology_candidate"))
+    if m.upper()=="QS":
+        # QS is one wholly negative complex, not independent Q and S peaks.
+        return ["s_peak"],"QS_SINGLE_NEGATIVE"
+    return _morphology_components(m),"STANDARD"
+
+def _full_landmark_overlay_png(result, data):
+    """Create one 12-lead audit contact sheet from the exact sent single-lead regions."""
+    from PIL import Image,ImageDraw
+    import io
+    bylead={x.get("lead"):x for x in (data.get("lead_landmarks") or []) if isinstance(x,dict)}
+    byid={r.get("id"):r for r in (result.get("regions") or [])}
+    cards=[]
+    for lead in V14_LEADS:
+        lm=bylead.get(lead); region=byid.get((lm or {}).get("region_id"))
+        if lm is None or region is None: continue
+        im=_annotate_v14_landmarks(region,lm).convert("RGB")
+        # header area
+        header=42
+        card=Image.new("RGB",(im.width,im.height+header),"white")
+        card.paste(im,(0,header))
+        d=ImageDraw.Draw(card)
+        q=lm.get("snap_centerline_qc","?"); conf=lm.get("snap_centerline_confidence")
+        bq=(lm.get("qrs_boundary_qc") or {}).get("status","?")
+        snr=(lm.get("local_signal_qc") or {}).get("snr")
+        d.text((8,5),f"{lead} | Snap {q} | conf {conf} | QRS-bound {bq} | SNR {snr}",fill="black")
+        cards.append(card)
+    if not cards:return b""
+    target_w=900
+    scaled=[]
+    for im in cards:
+        h=max(1,round(im.height*target_w/im.width))
+        scaled.append(im.resize((target_w,h)))
+    gap=12; total_h=sum(x.height for x in scaled)+gap*(len(scaled)-1)
+    sheet=Image.new("RGB",(target_w,total_h),"white")
+    y=0
+    for im in scaled:
+        sheet.paste(im,(0,y)); y+=im.height+gap
+    buf=io.BytesIO(); sheet.save(buf,format="PNG",optimize=True)
+    return buf.getvalue()
+
+
 def _snap_qrs_morphology_aware(item,region):
     """Snap QRS extrema with morphology and temporal-order constraints."""
     raw={k:item.get(k) for k in V14_LANDMARK_KEYS}
     morph=item.get("morphology_candidate")
-    expected=_morphology_components(morph)
+    expected,morph_mode=_v1410_expected_qrs(item)
     result={k:None for k in ("q_peak","r_peak","s_peak","r_prime_peak")}
-    details={}
+    details={"_morphology_mode":morph_mode}
     # If morphology unavailable, use only components explicitly proposed by AI.
     if not expected:
         expected=[k for k in ("q_peak","r_peak","s_peak","r_prime_peak") if raw.get(k) is not None]
@@ -4103,6 +4179,8 @@ def _snap_qrs_morphology_aware(item,region):
     last_x=-1e9
     for k in expected:
         rp=raw.get(k)
+        if morph_mode=="QS_SINGLE_NEGATIVE" and k=="s_peak" and rp is None:
+            rp=raw.get("q_peak") or raw.get("s_peak")
         if rp is None:
             details[k]={"status":"REVIEW","confidence":0.0,"reason":"morphology_expected_but_ai_missing"}
             continue
@@ -4110,6 +4188,7 @@ def _snap_qrs_morphology_aware(item,region):
         if pt is None:
             details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":tr.get("reason")}
             continue
+        pt,apex_qc=_refine_qrs_apex(region,pt,k)
         x=_pt_x(pt)
         # Enforce temporal order; if local snap jumps backward, keep raw x neighborhood but REVIEW.
         if x is not None and x <= last_x:
@@ -4117,7 +4196,9 @@ def _snap_qrs_morphology_aware(item,region):
             continue
         result[k]=pt
         last_x=x if x is not None else last_x
-        details[k]={"status":tr.get("status"),"confidence":tr.get("confidence"),"reason":tr.get("reason")}
+        details[k]={"status":apex_qc.get("status") or tr.get("status"),
+                    "confidence":apex_qc.get("confidence",tr.get("confidence")),
+                    "reason":apex_qc.get("reason") or tr.get("reason"),"apex_refined":True}
 
     # Components not expected by morphology must remain null.
     return result,details,expected
@@ -4211,7 +4292,7 @@ def morphology_boundary_snr_snap(item,region):
         x["quality"]="review"
         x.setdefault("snap_issues",[]).append("QRS_BOUNDARY_ORDER_REJECTED")
 
-    x["snap_method"]="morphology_boundary_snr_v14_9"
+    x["snap_method"]="qrs_apex_negative_boundary_v14_10"
     # Overall snap PASS now requires boundary + SNR + local trace.
     local_ok=x.get("snap_centerline_qc")=="PASS"
     boundary_ok=x.get("qrs_boundary_qc",{}).get("status")=="PASS"
@@ -4226,7 +4307,7 @@ def morphology_boundary_snr_snap_all(data,regions):
         region=byid.get(item.get("region_id"))
         if region is None:
             z=dict(item);z["quality"]="review";z["snap_applied"]=False
-            z["snap_method"]="morphology_boundary_snr_v14_9";z["snap_issues"]=["region_missing"]
+            z["snap_method"]="qrs_apex_negative_boundary_v14_10";z["snap_issues"]=["region_missing"]
             out.append(z);issues.append(item.get("lead","?")+":region_missing");continue
         z=morphology_boundary_snr_snap(item,region)
         cyc=validate_landmark_cycle(z)
@@ -4448,7 +4529,7 @@ def render_result(result):
         with st.expander("Lịch sử chọn nguồn API của lượt này"):
             st.dataframe(result.get("attempts",[]), hide_index=True, width="stretch")
 
-        st.info("v14.9: Local trace giữ nguyên; QRS được snap theo morphology/polarity, QRS-on/J tìm từ biên QRS về baseline, và low-SNR gate từ chối P/T không đủ chắc.")
+        st.info("v14.10: Giữ nguyên P/T local-trace của v14.9; QRS thêm apex refinement, QS/aVR được xử lý như một complex âm đơn, và QRS-on/J tiếp tục bị gate theo thứ tự hình học.")
         tech=data.get("technical_review") or {}
         with st.expander("Technical review từ AI", expanded=False):
             st.json(tech)
@@ -4494,13 +4575,32 @@ def render_result(result):
                     annotated=_annotate_v14_landmarks(region,lm)
                     st.image(annotated,width="stretch")
                     if lm.get("snap_applied") is True:
-                        st.caption(f"Overlay v14.9 · Snap QC: {lm.get('snap_centerline_qc')} · local conf: {lm.get('snap_centerline_confidence')} · QRS boundary: {(lm.get('qrs_boundary_qc') or {}).get('status')} · local SNR: {(lm.get('local_signal_qc') or {}).get('snr')}. Raw AI proposal được giữ trong JSON.")
+                        st.caption(f"Overlay v14.10 · Snap QC: {lm.get('snap_centerline_qc')} · local conf: {lm.get('snap_centerline_confidence')} · QRS boundary: {(lm.get('qrs_boundary_qc') or {}).get('status')} · local SNR: {(lm.get('local_signal_qc') or {}).get('snr')}. Raw AI proposal được giữ trong JSON.")
                     else:
                         st.error("RAW AI LANDMARK — waveform snapping CHƯA chạy thành công cho lead này. Không coi overlay là measurement evidence.")
                 except Exception as exc:
                     st.warning("Không vẽ được overlay: "+str(exc))
             else:
                 st.warning(f"{lead}: không có region_id hợp lệ để vẽ overlay.")
+
+        st.subheader("Bộ test chuẩn — tải 2 file")
+        _json_bytes=json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8")
+        try:
+            _overlay_bytes=_full_landmark_overlay_png(result,data)
+        except Exception as _exc:
+            _overlay_bytes=b""
+            st.warning("Không dựng được full overlay export: "+str(_exc))
+        _c1,_c2=st.columns(2)
+        with _c1:
+            if _overlay_bytes:
+                st.download_button("Tải Full landmark overlay PNG",_overlay_bytes,
+                    "ecg_full_landmark_overlay_v14_10.png","image/png",
+                    key="v1410_full_overlay_"+result["signature"][:16],width="stretch")
+        with _c2:
+            st.download_button("Tải Normalized landmark JSON",_json_bytes,
+                "ecg_normalized_landmarks_v14_10.json","application/json",
+                key="v1410_json_"+result["signature"][:16],width="stretch")
+        st.caption("Lượt test sau chỉ cần gửi 2 file này để audit landmark; PDF chỉ cần khi cần rà ROI/Digitizer/API toàn pipeline.")
 
         # Raw normalized landmark JSON is useful during this validation phase.
         with st.expander("Normalized landmark JSON", expanded=False):
@@ -4847,8 +4947,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · Morphology-aware QRS + Boundary/SNR Gates")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.9-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · QRS Apex Refinement + Negative-QRS Handling")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.10-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
