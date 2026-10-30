@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.10-v13base"
+APP_VERSION = "v14.11-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -4093,24 +4093,31 @@ def _morphology_components(morph):
 def _normalized_morphology(morph):
     return str(morph or "").replace("′","'").replace("’","'").replace(" ","").strip()
 
-def _refine_qrs_apex(region, pt, component):
-    """Refine an already-correct QRS component to the true local apex.
-    Image y decreases upward: R/R' -> minimum y; Q/S/QS -> maximum y.
+def _refine_qrs_apex(region, pt, component, x_left_pct=None, x_right_pct=None):
+    """v14.11 order-preserving apex refinement.
+    Search the true local extremum but never cross the temporal corridor supplied
+    by neighboring semantic QRS components. This prevents a correct R apex from
+    being discarded merely because an unconstrained refinement crossed Q/S.
     """
     import numpy as np
     if not isinstance(pt,dict): return pt,{"status":"REVIEW","reason":"missing_seed"}
     x=_pt_x(pt); y=_pt_y(pt)
     if x is None:return pt,{"status":"REVIEW","reason":"missing_seed_x"}
-    tr=_local_dark_trace(region,x,y,1.15,18.0)
+    tr=_local_dark_trace(region,x,y,1.9,22.0)
     ty=tr.get("trace_y")
     if ty is None:return pt,{"status":"REVIEW","reason":tr.get("reason"),"confidence":tr.get("confidence",0.0)}
     ty=np.asarray(ty,dtype=float); W=tr["width"]; H=tr["height"]
     gx=np.arange(len(ty))+tr["x0"]
     seed=x/100.0*(W-1)
-    # Do not jump to a neighboring complex: apex search is intentionally tight.
-    dist=np.abs(gx-seed)
-    keep=dist<=max(3.0,0.010*W)
-    if not np.any(keep): keep=np.ones(len(ty),dtype=bool)
+    # Wider than v14.10, but bounded by neighboring component midpoints.
+    left=seed-max(4.0,0.018*W); right=seed+max(4.0,0.018*W)
+    if x_left_pct is not None:
+        left=max(left,float(x_left_pct)/100.0*(W-1))
+    if x_right_pct is not None:
+        right=min(right,float(x_right_pct)/100.0*(W-1))
+    keep=(gx>=left)&(gx<=right)
+    if not np.any(keep):
+        return pt,{"status":"REVIEW","reason":"empty_order_corridor","confidence":tr.get("confidence",0.0)}
     inds=np.where(keep)[0]
     if component in ("r_peak","r_prime_peak"):
         k=int(inds[np.argmin(ty[inds])])
@@ -4119,7 +4126,33 @@ def _refine_qrs_apex(region, pt, component):
     out={"x_pct":round(100.0*float(gx[k])/max(1,W-1),3),
          "y_pct":round(100.0*float(ty[k])/max(1,H-1),3)}
     return out,{"status":tr.get("status"),"confidence":tr.get("confidence"),
-                "reason":tr.get("reason"),"apex_refined":True}
+                "reason":tr.get("reason"),"apex_refined":True,
+                "order_corridor_pct":[round(100.0*left/max(1,W-1),3),round(100.0*right/max(1,W-1),3)]}
+
+def _snap_qs_dominant_negative(item,region):
+    """Dedicated QS detector: one dominant negative deflection inside the AI QRS corridor.
+    It does not require a raw S proposal and does not split QS into Q+S.
+    """
+    import numpy as np
+    raw_on=item.get("qrs_on"); raw_j=item.get("j_point")
+    seeds=[p for p in (item.get("q_peak"),item.get("s_peak"),raw_on,raw_j) if isinstance(p,dict)]
+    xs=[_pt_x(p) for p in seeds if _pt_x(p) is not None]
+    ys=[_pt_y(p) for p in seeds if _pt_y(p) is not None]
+    if not xs:return None,{"status":"REVIEW","reason":"qs_no_seed","confidence":0.0}
+    center=sum(xs)/len(xs); yhint=sum(ys)/len(ys) if ys else None
+    half=max(3.2,(max(xs)-min(xs))/2.0+2.2) if len(xs)>1 else 4.0
+    tr=_local_dark_trace(region,center,yhint,half,30.0)
+    ty=tr.get("trace_y")
+    if ty is None:return None,{"status":"REVIEW","reason":tr.get("reason"),"confidence":tr.get("confidence",0.0)}
+    ty=np.asarray(ty,dtype=float); W=tr["width"]; H=tr["height"]; gx=np.arange(len(ty))+tr["x0"]
+    # Negative ECG deflection is downward on image => maximum image y.
+    # Restrict to the central QRS corridor, excluding patch edges/baseline drift.
+    lo=(min(xs)-1.5)/100.0*(W-1); hi=(max(xs)+1.5)/100.0*(W-1)
+    keep=(gx>=lo)&(gx<=hi)
+    if not np.any(keep):keep=np.ones(len(ty),dtype=bool)
+    inds=np.where(keep)[0]; k=int(inds[np.argmax(ty[inds])])
+    pt={"x_pct":round(100.0*float(gx[k])/max(1,W-1),3),"y_pct":round(100.0*float(ty[k])/max(1,H-1),3)}
+    return pt,{"status":tr.get("status"),"confidence":tr.get("confidence"),"reason":tr.get("reason"),"qs_dominant_negative":True}
 
 def _v1410_expected_qrs(item):
     """Return expected QRS components with a clinically safer QS special case."""
@@ -4166,41 +4199,56 @@ def _full_landmark_overlay_png(result, data):
 
 
 def _snap_qrs_morphology_aware(item,region):
-    """Snap QRS extrema with morphology and temporal-order constraints."""
+    """v14.11: morphology-aware QRS with order-preserving apex corridors."""
     raw={k:item.get(k) for k in V14_LANDMARK_KEYS}
-    morph=item.get("morphology_candidate")
     expected,morph_mode=_v1410_expected_qrs(item)
     result={k:None for k in ("q_peak","r_peak","s_peak","r_prime_peak")}
     details={"_morphology_mode":morph_mode}
-    # If morphology unavailable, use only components explicitly proposed by AI.
+    if morph_mode=="QS_SINGLE_NEGATIVE":
+        pt,qc=_snap_qs_dominant_negative(item,region)
+        result["s_peak"]=pt
+        details["s_peak"]=qc
+        return result,details,["s_peak"]
     if not expected:
         expected=[k for k in ("q_peak","r_peak","s_peak","r_prime_peak") if raw.get(k) is not None]
 
-    last_x=-1e9
+    # Build semantic x order from raw AI. Neighbor midpoints define safe refinement corridors.
+    seeds=[]
     for k in expected:
-        rp=raw.get(k)
-        if morph_mode=="QS_SINGLE_NEGATIVE" and k=="s_peak" and rp is None:
-            rp=raw.get("q_peak") or raw.get("s_peak")
-        if rp is None:
-            details[k]={"status":"REVIEW","confidence":0.0,"reason":"morphology_expected_but_ai_missing"}
-            continue
+        rp=raw.get(k); xx=_pt_x(rp)
+        if rp is not None and xx is not None: seeds.append((k,rp,xx))
+        else: details[k]={"status":"REVIEW","confidence":0.0,"reason":"morphology_expected_but_ai_missing"}
+    seeds.sort(key=lambda z:z[2])
+    refined=[]
+    for i,(k,rp,xx) in enumerate(seeds):
         pt,tr=_local_snap_point(region,rp,k)
         if pt is None:
-            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":tr.get("reason")}
-            continue
-        pt,apex_qc=_refine_qrs_apex(region,pt,k)
-        x=_pt_x(pt)
-        # Enforce temporal order; if local snap jumps backward, keep raw x neighborhood but REVIEW.
-        if x is not None and x <= last_x:
-            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"qrs_component_order_conflict"}
-            continue
-        result[k]=pt
-        last_x=x if x is not None else last_x
-        details[k]={"status":apex_qc.get("status") or tr.get("status"),
-                    "confidence":apex_qc.get("confidence",tr.get("confidence")),
-                    "reason":apex_qc.get("reason") or tr.get("reason"),"apex_refined":True}
+            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":tr.get("reason")};continue
+        left=None;right=None
+        if i>0:left=(seeds[i-1][2]+xx)/2.0
+        if i+1<len(seeds):right=(xx+seeds[i+1][2])/2.0
+        pt,aq=_refine_qrs_apex(region,pt,k,left,right)
+        refined.append((k,pt,xx,aq,tr))
 
-    # Components not expected by morphology must remain null.
+    # Preserve semantic component identity; reject only if final order is truly impossible.
+    last=-1e9
+    for k,pt,rawx,aq,tr in refined:
+        xx=_pt_x(pt)
+        if xx is None or xx<=last:
+            # Fall back to the raw semantic seed rather than deleting a plausible component.
+            rp=raw.get(k)
+            fallback,_=_local_snap_point(region,rp,k) if rp is not None else (None,{})
+            fx=_pt_x(fallback)
+            if fallback is not None and fx is not None and fx>last:
+                result[k]=fallback; last=fx
+                details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"apex_order_fallback_to_local_seed","apex_refined":False}
+            else:
+                details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"qrs_component_order_conflict"}
+            continue
+        result[k]=pt; last=xx
+        details[k]={"status":aq.get("status") or tr.get("status"),"confidence":aq.get("confidence",tr.get("confidence")),
+                    "reason":aq.get("reason") or tr.get("reason"),"apex_refined":True,
+                    "order_corridor_pct":aq.get("order_corridor_pct")}
     return result,details,expected
 
 def _snap_qrs_boundaries_from_components(item,region,qrs_components):
@@ -4292,7 +4340,7 @@ def morphology_boundary_snr_snap(item,region):
         x["quality"]="review"
         x.setdefault("snap_issues",[]).append("QRS_BOUNDARY_ORDER_REJECTED")
 
-    x["snap_method"]="qrs_apex_negative_boundary_v14_10"
+    x["snap_method"]="order_preserving_qrs_qs_v14_11"
     # Overall snap PASS now requires boundary + SNR + local trace.
     local_ok=x.get("snap_centerline_qc")=="PASS"
     boundary_ok=x.get("qrs_boundary_qc",{}).get("status")=="PASS"
@@ -4307,7 +4355,7 @@ def morphology_boundary_snr_snap_all(data,regions):
         region=byid.get(item.get("region_id"))
         if region is None:
             z=dict(item);z["quality"]="review";z["snap_applied"]=False
-            z["snap_method"]="qrs_apex_negative_boundary_v14_10";z["snap_issues"]=["region_missing"]
+            z["snap_method"]="order_preserving_qrs_qs_v14_11";z["snap_issues"]=["region_missing"]
             out.append(z);issues.append(item.get("lead","?")+":region_missing");continue
         z=morphology_boundary_snr_snap(item,region)
         cyc=validate_landmark_cycle(z)
@@ -4947,7 +4995,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · QRS Apex Refinement + Negative-QRS Handling")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · Order-Preserving QRS Apex + QS Negative Detector")
 st.caption("Nếu không thấy dòng PHIÊN BẢN v14.10-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
