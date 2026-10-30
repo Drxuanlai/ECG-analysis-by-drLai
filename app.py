@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.5.1-v13base"
+APP_VERSION = "v14.6-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -2628,7 +2628,22 @@ PARAMETERS = {"rr_ms": "RR (ms)", "hr_bpm": "Tần số (bpm)", "pr_ms": "PR (ms
               "qrs_ms": "QRS (ms)", "qt_ms": "QT (ms)", "qtc_ms": "QTc (ms)",
               "voltage_mv": "Điện thế (mV)", "st_mm": "ST (mm)"}
 SOURCES = {"image_text": "Chữ chuẩn ghi trên ảnh", "user": "Người dùng cung cấp", "unknown": "Chưa xác định"}
-SYSTEM_PROMPT = """\nV14 LANDMARK-ONLY — ƯU TIÊN CAO NHẤT:
+SYSTEM_PROMPT = """\nV14.6 SINGLE-LEAD + BEAT-LOCK — ƯU TIÊN TUYỆT ĐỐI:
+Các ảnh lead_I ... lead_V6 là ảnh RIÊNG BIỆT, mỗi ảnh chỉ chứa MỘT chuyển đạo.
+Dùng label/id để biết lead. Không suy luận vị trí hàng trong ảnh nhóm.
+
+Với MỖI lead:
+1. Chọn MỘT beat trung tâm rõ nhất; tránh mép ảnh, chữ nhãn và xung calibration.
+2. Khóa QRS trước: qrs_on → Q/R/S/R' nếu thật sự có → j_point.
+3. Chỉ tìm P ngay trước qrs_on của CHÍNH beat đó.
+4. Chỉ tìm T ngay sau j_point của CHÍNH beat đó.
+5. Tất cả landmark phải thuộc cùng một cardiac cycle.
+6. Nếu lead biên độ thấp/nhiễu/không chắc (đặc biệt aVL, aVR, V1) dùng quality="review" hoặc "not_visible"; landmark không chắc = null.
+7. Không điền landmark chỉ để đủ trường.
+8. Không lấy P/T của beat kế bên.
+9. x_pct/y_pct tính theo chính ảnh single-lead tương ứng.
+
+V14 LANDMARK-ONLY — ƯU TIÊN CAO NHẤT:
 Lượt này chỉ nhận diện landmark ECG, không chẩn đoán.
 Chỉ trả JSON object gồm technical_review và lead_landmarks.
 lead_landmarks cố gắng đủ I,II,III,aVR,aVL,aVF,V1-V6.
@@ -3664,6 +3679,12 @@ def normalize_v14_landmark_response(data, regions):
                 if not (0<=xp<=100 and 0<=yp<=100): raise ValueError
                 x[k]={"x_pct":xp,"y_pct":yp}
             except Exception: x[k]=None
+        cycle_issues=validate_landmark_cycle(x)
+        x["cycle_qc"]="PASS" if not cycle_issues else "REVIEW"
+        x["cycle_issues"]=cycle_issues
+        if cycle_issues:
+            x["quality"]="review"
+            issues.extend([lead+":"+q for q in cycle_issues])
         bylead[lead]=x
     for lead in V14_LEADS:
         if lead not in bylead:
@@ -3681,6 +3702,89 @@ def parse_v14_landmark_json(raw, regions):
     if len(raw)>250000: raise ValueError("JSON landmark quá dài.")
     data=json.loads(raw)
     return normalize_v14_landmark_response(data,regions)
+
+
+
+def _clip_pct_pair(pair):
+    a,b=map(float,pair)
+    a=max(0.0,min(100.0,a)); b=max(0.0,min(100.0,b))
+    if b<=a: b=min(100.0,a+0.1)
+    return (round(a,2),round(b,2))
+
+def _roi_candidate_ranges(region):
+    """Four deterministic candidate crops around the doctor-adjusted group ROI."""
+    x=list(map(float,region.get("horizontal_percent",[0,100])))
+    y=list(map(float,region.get("vertical_percent",[0,100])))
+    xw=max(0.1,x[1]-x[0]); yh=max(0.1,y[1]-y[0])
+    return [
+        ("A","Standard",_clip_pct_pair(x),_clip_pct_pair(y)),
+        ("B","Wider",_clip_pct_pair((x[0]-0.06*xw,x[1]+0.06*xw)),_clip_pct_pair(y)),
+        ("C","Taller",_clip_pct_pair(x),_clip_pct_pair((y[0]-0.06*yh,y[1]+0.06*yh))),
+        ("D","Wide + Tall",_clip_pct_pair((x[0]-0.05*xw,x[1]+0.05*xw)),
+                           _clip_pct_pair((y[0]-0.05*yh,y[1]+0.05*yh))),
+    ]
+
+def build_roi_candidate_regions(ecg, group_region, enhance=False):
+    out=[]
+    for key,label,x,y in _roi_candidate_ranges(group_region):
+        r=make_region(ecg,group_region["id"]+"_cand_"+key,
+                      group_region.get("label",group_region["id"])+" · "+key,x,y,enhance)
+        r["candidate_key"]=key;r["candidate_label"]=label
+        r["group_id"]=group_region["id"]
+        out.append(r)
+    return out
+
+def build_single_lead_regions(ecg, selected_groups, enhance=False):
+    """Split 4 selected group ROIs into 12 source-coordinate single-lead strips."""
+    lead_map={
+        "group_1":["I","II","III"],
+        "group_2":["aVR","aVL","aVF"],
+        "group_3":["V1","V2","V3"],
+        "group_4":["V4","V5","V6"],
+    }
+    out=[]
+    for g in selected_groups:
+        leads=lead_map.get(g.get("id"))
+        if not leads: continue
+        x=tuple(map(float,g["horizontal_percent"]))
+        y0,y1=map(float,g["vertical_percent"]); h=y1-y0
+        # Slight vertical overlap protects tall R/S and baseline at row borders.
+        overlap=0.035*h
+        for i,lead in enumerate(leads):
+            a=y0+h*i/3.0-overlap
+            b=y0+h*(i+1)/3.0+overlap
+            yy=_clip_pct_pair((a,b))
+            r=make_region(ecg,"lead_"+lead,"Single lead "+lead,x,yy,enhance)
+            r["lead"]=lead
+            r["source_group"]=g["id"]
+            r["row_index"]=i
+            out.append(r)
+    return out
+
+def validate_landmark_cycle(item):
+    """Beat-locked temporal QC; prevents mixing P/QRS/T from different beats."""
+    issues=[]
+    def xp(k):
+        p=item.get(k)
+        try:return float(p["x_pct"]) if isinstance(p,dict) else None
+        except Exception:return None
+    seq=[("p_on",xp("p_on")),("p_off",xp("p_off")),("qrs_on",xp("qrs_on")),
+         ("j_point",xp("j_point")),("t_peak",xp("t_peak")),("t_end",xp("t_end"))]
+    prev=None
+    for name,val in seq:
+        if val is None: continue
+        if prev is not None and val<=prev: issues.append("order:"+name)
+        prev=val
+    q0,j=xp("qrs_on"),xp("j_point")
+    if q0 is not None and j is not None and q0<j:
+        for k in ("q_peak","r_peak","s_peak","r_prime_peak"):
+            v=xp(k)
+            if v is not None and not (q0-1.0<=v<=j+1.0):
+                issues.append(k+":outside_qrs")
+    pon,te=xp("p_on"),xp("t_end")
+    if pon is not None and te is not None and te-pon>55:
+        issues.append("cycle_too_wide")
+    return issues
 
 
 def observation_rows(data, regions):
@@ -4157,8 +4261,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · AI Landmark-only → Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.5.1-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · ROI Candidates → 12 Single-lead → Beat-locked Landmark")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.6-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4258,6 +4362,40 @@ else:
     frame_id = hashlib.sha256(json.dumps([image_id, auto_angle,manual,whole_box]).encode()).hexdigest()[:12]
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
+    # v14.6: local candidate chooser for the four 3-lead groups.
+    _group_regions=[r for r in regions if r.get("id") in ("group_1","group_2","group_3","group_4")]
+    if len(_group_regions)==4:
+        st.markdown("### v14.6 — Chọn ROI candidate cho 4 nhóm")
+        st.caption("Mỗi nhóm có 4 crop local. Mặc định A = ROI bác sĩ vừa chỉnh. Chọn B/C/D chỉ khi thumbnail giữ sóng tốt hơn. Bước này không gọi API.")
+        _selected_groups=[]
+        for _g in _group_regions:
+            _cands=build_roi_candidate_regions(ecg,_g,enhance)
+            with st.expander(f"{_g.get('label',_g['id'])} · chọn 1/4",expanded=False):
+                _cols=st.columns(4)
+                for _i,_c in enumerate(_cands):
+                    with _cols[_i]:
+                        st.image(_c["png"],caption=f"{_c['candidate_key']} · {_c['candidate_label']}",width="stretch")
+                _keys=[c["candidate_key"] for c in _cands]
+                _choice=st.radio("Candidate",_keys,index=0,horizontal=True,
+                                 key="v146_roi_candidate_"+frame_id+"_"+_g["id"])
+                _sel=next(c for c in _cands if c["candidate_key"]==_choice)
+                # Normalize selected candidate back to canonical group id for downstream bookkeeping.
+                _sel=dict(_sel);_sel["id"]=_g["id"];_sel["label"]=_g.get("label",_g["id"])
+                _selected_groups.append(_sel)
+
+        _single_leads=build_single_lead_regions(ecg,_selected_groups,enhance)
+        # Landmark pass needs overview + 12 isolated leads. Rhythm/focus remain local evidence,
+        # not extra multimodal payload, to control token/image cost.
+        _overview=next((r for r in regions if r.get("id")=="overview"),None)
+        regions=([_overview] if _overview else [])+_single_leads
+        st.caption(f"AI input v14.6: {len(_single_leads)} single-lead strips + 1 overview · 1 request/API route.")
+        with st.expander("Preview 12 single-lead strips",expanded=False):
+            for _i in range(0,len(_single_leads),3):
+                _cc=st.columns(3)
+                for _j,_r in enumerate(_single_leads[_i:_i+3]):
+                    with _cc[_j]:
+                        st.image(_r["png"],caption=_r["lead"],width="stretch")
+
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     digitizer_result=None; digitizer_evidence=None; rr_authority=None; interval_authority=None; median_landmark_authority=None; qrs_morphology_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
@@ -4437,7 +4575,7 @@ else:
         st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
     with st.expander("v13.7.1 QRS identity + morphology evidence",expanded=False):
         st.json(_qm)
-    st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
+    st.caption(f"v14.6 gửi {len(regions)} ảnh trong một request tới một API route. Failover chỉ dùng khi route hiện tại lỗi.")
     if median_landmark_authority:
         if digitizer_evidence is not None:
             digitizer_evidence["median_landmark_authority"]=median_landmark_authority
