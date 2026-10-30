@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.7-v13base"
+APP_VERSION = "v14.7.1-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3709,8 +3709,19 @@ def normalize_v14_landmark_response(data, regions):
     return {"technical_review":tech,"lead_landmarks":[bylead[x] for x in V14_LEADS]},issues
 
 def parse_v14_landmark_json(raw, regions):
+    if not isinstance(raw,str): raise ValueError("JSON landmark không phải text.")
     if len(raw)>250000: raise ValueError("JSON landmark quá dài.")
-    data=json.loads(raw)
+    text=raw.strip()
+    if text.startswith("```"):
+        text=re.sub(r"^```(?:json)?\\s*","",text,flags=re.I)
+        text=re.sub(r"\\s*```$","",text)
+    try:
+        data=json.loads(text)
+    except json.JSONDecodeError:
+        # Conservative recovery: first complete-looking JSON object only.
+        a=text.find("{"); b=text.rfind("}")
+        if a<0 or b<=a: raise ValueError("Không tìm thấy JSON object.")
+        data=json.loads(text[a:b+1])
     return normalize_v14_landmark_response(data,regions)
 
 
@@ -4037,6 +4048,10 @@ def render_result(result):
         if issues:
             with st.expander("Landmark parser issues", expanded=False):
                 st.write(issues)
+        _stage_errors=(result.get("arithmetic") or {}).get("stage_errors") or []
+        if _stage_errors:
+            with st.expander("v14.7 Stage diagnostics", expanded=True):
+                st.dataframe(_stage_errors,hide_index=True,width="stretch")
 
         # Visual audit: choose lead and draw the exact AI proposal on the source region.
         bylead={x.get("lead"):x for x in data.get("lead_landmarks",[]) if isinstance(x,dict)}
@@ -4403,7 +4418,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · AI-guided Waveform Snapping → Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.7-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.7.1-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4817,22 +4832,40 @@ else:
             v14_measurement_authority = None
             sanitizer_audit = None
             if outcome["api_completed"]:
+                landmark_parse_issues=[]; snap_issues=[]; stage_errors=[]
+                # Stage 1 — parse/normalize. Only this stage may invalidate AI JSON.
                 try:
                     data, landmark_parse_issues = parse_v14_landmark_json(outcome["raw_response"],regions)
-                    data, snap_issues = snap_all_landmarks(data,regions)
-                    checks = {"landmark_parse_issues": landmark_parse_issues,
-                              "waveform_snap_issues": snap_issues}
-                    v14_measurement_authority = build_v14_measurement_authority(
-                        data, regions, ecg,
-                        {"speed_mm_s":speed,"limb_gain_mm_mv":limb,"chest_gain_mm_mv":chest}
-                    )
-                    # v14 landmark-only pass: do NOT run legacy v13 report sanitizer/arithmetic.
-                    # Quantitative authority comes only from deterministic landmark measurement below.
-                    sanitizer_audit = {"status":"NOT_APPLICABLE_LANDMARK_ONLY"}
-                    checks = {"landmark_parse_issues": landmark_parse_issues}
-                except (ValueError,TypeError,KeyError) as exc:
-                    outcome["error"] = "API đã trả dữ liệu nhưng cấu trúc không hợp lệ hoặc thiếu vùng quan sát. Chưa có báo cáo hoàn chỉnh; không tự gửi lại."
+                except Exception as exc:
+                    stage_errors.append({"stage":"parse","type":type(exc).__name__,"detail":str(exc)[:500]})
+                    outcome["error"] = "API đã trả dữ liệu nhưng JSON landmark không parse được. Xem Stage diagnostics."
                     data = None
+
+                # Stage 2 — waveform snapping. Failure must NOT discard valid AI landmarks.
+                if data is not None:
+                    try:
+                        snapped_data, snap_issues = snap_all_landmarks(data,regions)
+                        data = snapped_data
+                    except Exception as exc:
+                        stage_errors.append({"stage":"waveform_snap","type":type(exc).__name__,"detail":str(exc)[:500]})
+                        snap_issues=["snap_exception:"+type(exc).__name__]
+
+                # Stage 3 — deterministic measurement. Failure must NOT discard landmarks/overlay.
+                if data is not None:
+                    try:
+                        v14_measurement_authority = build_v14_measurement_authority(
+                            data, regions, ecg,
+                            {"speed_mm_s":speed,"limb_gain_mm_mv":limb,"chest_gain_mm_mv":chest}
+                        )
+                    except Exception as exc:
+                        stage_errors.append({"stage":"measurement","type":type(exc).__name__,"detail":str(exc)[:500]})
+                        v14_measurement_authority={"status":"REVIEW","pass_count":0,"review_count":0,
+                            "rows":[],"reason":"measurement_exception:"+type(exc).__name__}
+
+                sanitizer_audit = {"status":"NOT_APPLICABLE_LANDMARK_ONLY"}
+                checks = {"landmark_parse_issues": landmark_parse_issues,
+                          "waveform_snap_issues": snap_issues,
+                          "stage_errors": stage_errors}
             record = {**outcome,"data":data,"arithmetic":checks,"schema_valid":data is not None,
                 "provider":actual_provider,"model":actual_model,"thinking":actual_thinking,"signature":signature,
                 "time_utc":datetime.now(timezone.utc).isoformat(),"regions":regions,"prompt":prompt,
