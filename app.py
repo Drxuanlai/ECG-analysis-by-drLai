@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.6.1-v13base"
+APP_VERSION = "v14.7-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -2628,7 +2628,17 @@ PARAMETERS = {"rr_ms": "RR (ms)", "hr_bpm": "Tần số (bpm)", "pr_ms": "PR (ms
               "qrs_ms": "QRS (ms)", "qt_ms": "QT (ms)", "qtc_ms": "QTc (ms)",
               "voltage_mv": "Điện thế (mV)", "st_mm": "ST (mm)"}
 SOURCES = {"image_text": "Chữ chuẩn ghi trên ảnh", "user": "Người dùng cung cấp", "unknown": "Chưa xác định"}
-SYSTEM_PROMPT = """\nV14.6 SINGLE-LEAD + BEAT-LOCK — ƯU TIÊN TUYỆT ĐỐI:
+SYSTEM_PROMPT = """\nV14.7 AI-GUIDED LANDMARKS — ƯU TIÊN TUYỆT ĐỐI:
+Bạn KHÔNG phải measurement authority. Chỉ xác định NGỮ NGHĨA và vị trí X GẦN ĐÚNG của P/QRS/T trên từng ảnh single-lead.
+Python sẽ snap landmark xuống centerline waveform thật trước khi đo.
+1) Chọn một beat trung tâm rõ nhất, tránh mép ảnh, nhãn và calibration pulse.
+2) Khóa QRS trước; P phải thuộc ngay trước QRS đó, T phải thuộc ngay sau J của beat đó.
+3) x_pct quan trọng hơn y_pct; y_pct chỉ là gợi ý.
+4) Component không chắc tồn tại thì trả null.
+5) Lead khó/low voltage/nhiễu: quality="review" hoặc "not_visible", không cố điền.
+6) Không lấy P/T của beat kế bên.
+
+V14.6 SINGLE-LEAD + BEAT-LOCK — ƯU TIÊN TUYỆT ĐỐI:
 Các ảnh lead_I ... lead_V6 là ảnh RIÊNG BIỆT, mỗi ảnh chỉ chứa MỘT chuyển đạo.
 Dùng label/id để biết lead. Không suy luận vị trí hàng trong ảnh nhóm.
 
@@ -3787,6 +3797,129 @@ def validate_landmark_cycle(item):
     return issues
 
 
+
+def _lead_waveform_from_region(region):
+    import numpy as np
+    a=np.asarray(region["image"].convert("L"),dtype=float)
+    H,W=a.shape
+    x0=max(0,int(0.015*W)); x1=min(W,int(0.985*W))
+    a2=a[:,x0:x1]
+    ink=np.clip(205.0-a2,0,None)
+    y=np.full(a2.shape[1],np.nan,dtype=float)
+    good_conf=[]
+    for j in range(a2.shape[1]):
+        w=ink[:,j]
+        if np.nanmax(w)<18: continue
+        thr=max(18.0,float(np.nanpercentile(w,88)))
+        yy=np.where(w>=thr)[0]
+        ww=w[yy]
+        if yy.size==0: continue
+        order=np.argsort(yy); yy=yy[order]; ww=ww[order]
+        c=np.cumsum(ww); k=np.searchsorted(c,c[-1]/2.0)
+        y[j]=float(yy[min(k,len(yy)-1)])
+        good_conf.append(1.0)
+    good=np.isfinite(y)
+    if good.sum()<max(20,int(0.2*len(y))):
+        return {"status":"REVIEW","reason":"insufficient_centerline","x0":x0,"y":y,"confidence":0.0,"width":W,"height":H}
+    idx=np.arange(len(y))
+    y=np.interp(idx,idx[good],y[good])
+    out=y.copy()
+    k=5
+    for j in range(len(y)):
+        lo=max(0,j-k); hi=min(len(y),j+k+1)
+        out[j]=float(np.median(y[lo:hi]))
+    jumps=np.abs(np.diff(out))
+    continuity=float(np.mean(jumps<max(3.0,0.02*H))) if len(jumps) else 0.0
+    coverage=float(good.mean())
+    score=0.55*coverage+0.45*continuity
+    return {"status":"PASS" if score>=0.72 else "REVIEW",
+            "reason":None if score>=0.72 else "low_centerline_confidence",
+            "x0":x0,"y":out,"confidence":round(score,3),"width":W,"height":H}
+
+def _snap_extremum(wave,x_pct,mode="abs",radius_pct=3.0):
+    import numpy as np
+    if x_pct is None or wave.get("y") is None:return None
+    y=wave["y"]; n=len(y)
+    xc=float(x_pct)/100.0*(n-1)
+    rad=max(2,int(radius_pct/100.0*n))
+    a=max(0,int(round(xc))-rad); b=min(n,int(round(xc))+rad+1)
+    if b-a<3:return None
+    seg=y[a:b]; baseline=float(np.median(seg))
+    if mode=="up": k=int(np.argmin(seg))
+    elif mode=="down": k=int(np.argmax(seg))
+    else: k=int(np.argmax(np.abs(seg-baseline)))
+    x=a+k
+    return {"x_idx":x,"y":float(y[x]),"x_pct":100.0*x/max(1,n-1)}
+
+def _snap_boundary(wave,x_pct,radius_pct=3.0):
+    import numpy as np
+    if x_pct is None or wave.get("y") is None:return None
+    y=np.asarray(wave["y"],dtype=float); n=len(y)
+    xc=int(round(float(x_pct)/100.0*(n-1)))
+    rad=max(3,int(radius_pct/100.0*n))
+    a=max(2,xc-rad); b=min(n-2,xc+rad)
+    if b<=a:return None
+    d=np.abs(np.gradient(y))
+    xs=np.arange(a,b+1)
+    score=d[xs]-0.18*np.abs(xs-xc)
+    k=int(xs[int(np.argmax(score))])
+    return {"x_idx":k,"y":float(y[k]),"x_pct":100.0*k/max(1,n-1)}
+
+def snap_landmarks_to_waveform(item,region):
+    wave=_lead_waveform_from_region(region)
+    snapped=dict(item)
+    snapped["snap_centerline_qc"]=wave.get("status")
+    snapped["snap_centerline_confidence"]=wave.get("confidence")
+    snapped["snap_issues"]=[]
+    if wave.get("status")=="REVIEW":
+        snapped["quality"]="review"
+        snapped["snap_issues"].append(wave.get("reason") or "centerline_review")
+    H=region["image"].size[1]
+    def ai_x(k):
+        p=item.get(k)
+        try:return float(p["x_pct"]) if isinstance(p,dict) else None
+        except Exception:return None
+    def pack(res):
+        if res is None:return None
+        return {"x_pct":round(float(res["x_pct"]),3),
+                "y_pct":round(100.0*float(res["y"])/max(1,H-1),3)}
+    snapped["p_peak"]=pack(_snap_extremum(wave,ai_x("p_peak"),"abs",2.4))
+    snapped["t_peak"]=pack(_snap_extremum(wave,ai_x("t_peak"),"abs",3.0))
+    for k,mode in (("q_peak","down"),("r_peak","up"),("s_peak","down"),("r_prime_peak","up")):
+        snapped[k]=pack(_snap_extremum(wave,ai_x(k),mode,1.8)) if item.get(k) is not None else None
+    for k,rad in (("qrs_on",2.5),("j_point",2.8),("p_on",2.5),("p_off",2.5),("t_end",3.5)):
+        snapped[k]=pack(_snap_boundary(wave,ai_x(k),rad))
+    bx=ai_x("baseline_point")
+    if bx is not None and wave.get("y") is not None:
+        n=len(wave["y"]); xi=max(0,min(n-1,int(round(bx/100.0*(n-1)))))
+        snapped["baseline_point"]={"x_pct":round(100.0*xi/max(1,n-1),3),
+                                   "y_pct":round(100.0*float(wave["y"][xi])/max(1,H-1),3)}
+    else:
+        snapped["baseline_point"]=None
+    snapped["ai_landmarks_raw"]={k:item.get(k) for k in V14_LANDMARK_KEYS}
+    snapped["snap_applied"]=True
+    return snapped
+
+def snap_all_landmarks(data,regions):
+    byid={r.get("id"):r for r in regions}
+    out=[]; issues=[]
+    for item in data.get("lead_landmarks",[]):
+        region=byid.get(item.get("region_id"))
+        if region is None:
+            x=dict(item); x["quality"]="review"; x["snap_applied"]=False
+            x["snap_issues"]=["region_missing_for_snap"]; out.append(x)
+            issues.append(item.get("lead","?")+":region_missing_for_snap"); continue
+        x=snap_landmarks_to_waveform(item,region)
+        cyc=validate_landmark_cycle(x)
+        x["cycle_qc"]="PASS" if not cyc else "REVIEW"
+        x["cycle_issues"]=cyc
+        if cyc:
+            x["quality"]="review"; issues.extend([item.get("lead","?")+":"+q for q in cyc])
+        out.append(x)
+    z=dict(data); z["lead_landmarks"]=out
+    return z,issues
+
+
 def observation_rows(data, regions):
     labels = {r["id"]: r["label"] for r in regions}
     return [{"Vùng": labels[o["region_id"]], "Nhãn AI đọc": ", ".join(o["visible_leads"]),
@@ -3877,7 +4010,7 @@ def render_result(result):
         with st.expander("Lịch sử chọn nguồn API của lượt này"):
             st.dataframe(result.get("attempts",[]), hide_index=True, width="stretch")
 
-        st.info("v14 Landmark-only: AI chỉ đề xuất vị trí sóng; số đo bên dưới do code tính từ landmark + lưới/chuẩn ghi.")
+        st.info("v14.7: AI chỉ đề xuất ngữ nghĩa + vị trí x gần đúng. Python snap điểm xuống centerline waveform thật rồi Measurement Core mới tính số đo.")
         tech=data.get("technical_review") or {}
         with st.expander("Technical review từ AI", expanded=False):
             st.json(tech)
@@ -3888,7 +4021,15 @@ def render_result(result):
                    f"REVIEW {auth.get('review_count',0)}")
         rows=auth.get("rows") or []
         if rows:
-            st.dataframe(rows, hide_index=True, width="stretch")
+            _lm_by_lead={x.get("lead"):x for x in (data.get("lead_landmarks") or []) if isinstance(x,dict)}
+            _rows=[]
+            for _r in rows:
+                _x=dict(_r)
+                _lm=_lm_by_lead.get(_x.get("Lead") or _x.get("lead"),{})
+                _x["Snap QC"]=_lm.get("snap_centerline_qc")
+                _x["Snap conf"]=_lm.get("snap_centerline_confidence")
+                _rows.append(_x)
+            st.dataframe(_rows, hide_index=True, width="stretch")
         else:
             st.warning("Chưa tạo được bảng measurement từ landmark.")
 
@@ -3910,7 +4051,7 @@ def render_result(result):
                 try:
                     annotated=_annotate_v14_landmarks(region,lm)
                     st.image(annotated,width="stretch")
-                    st.caption("Overlay chỉ là AI proposal. Measurement Core mới quyết định số đo có PASS/REVIEW hay không.")
+                    st.caption("Overlay hiển thị landmark SAU waveform snapping. Raw AI proposal vẫn được giữ trong JSON để đối chiếu.")
                 except Exception as exc:
                     st.warning("Không vẽ được overlay: "+str(exc))
             else:
@@ -4261,8 +4402,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · ROI Candidates → 12 Single-lead → Beat-locked Landmark")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.6.1-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · AI-guided Waveform Snapping → Deterministic Measurement")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.7-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4678,7 +4819,9 @@ else:
             if outcome["api_completed"]:
                 try:
                     data, landmark_parse_issues = parse_v14_landmark_json(outcome["raw_response"],regions)
-                    checks = {"landmark_parse_issues": landmark_parse_issues}
+                    data, snap_issues = snap_all_landmarks(data,regions)
+                    checks = {"landmark_parse_issues": landmark_parse_issues,
+                              "waveform_snap_issues": snap_issues}
                     v14_measurement_authority = build_v14_measurement_authority(
                         data, regions, ecg,
                         {"speed_mm_s":speed,"limb_gain_mm_mv":limb,"chest_gain_mm_mv":chest}
