@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v15.0-waveform-lab"
+APP_VERSION = "v15.1-clean-signal"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3783,102 +3783,236 @@ def build_single_lead_regions(ecg, selected_groups, enhance=False):
     return out
 
 
+def _v151_find_corridor(score, gray):
+    """Find the horizontal lead band nearest the ROI centre; avoids adjacent-row capture."""
+    import numpy as np
+    h,w=score.shape
+    # Prefer rows with sustained neutral-dark support, but penalize text-dense rows.
+    row_support=np.mean(score>0.16,axis=1)
+    row_mean=np.mean(score,axis=1)
+    # Smooth vertically so a waveform band wins over single text rows.
+    k=max(5,int(round(.06*h))); k += (k%2==0)
+    ker=np.ones(k)/k
+    band=np.convolve(0.65*row_support+0.35*row_mean,ker,mode='same')
+    center=(h-1)/2.0
+    # Search only central 70%; single-lead ROI is expected around centre.
+    lo=int(.15*h); hi=max(lo+1,int(.85*h))
+    ys=np.arange(lo,hi)
+    if len(ys)==0:return 0,h-1,int(round(center))
+    # Modest centre prior prevents capture of neighbouring lead in overlap region.
+    prior=1.0-0.28*np.abs(ys-center)/max(1,.35*h)
+    y0=int(ys[np.argmax(band[ys]*prior)])
+    half=max(18,int(.28*h))
+    return max(0,y0-half),min(h-1,y0+half),y0
+
+
+def _v151_calibration_mask(score, gray, corridor):
+    """Detect calibration/edge structures and return x-ranges to exclude from QRS detection."""
+    import numpy as np
+    h,w=score.shape; ya,yb,_=corridor
+    sub=score[ya:yb+1]
+    # Strong vertical strokes: many supported pixels in same column.
+    col_occ=np.mean(sub>0.18,axis=0)
+    strong=col_occ>0.34
+    # Calibration pulses are usually near outer 28% and occur in clustered strong columns.
+    edge=(np.arange(w)<.28*w)|(np.arange(w)>.72*w)
+    idx=np.where(strong & edge)[0]
+    ranges=[]
+    if len(idx):
+        a=idx[0]; prev=idx[0]
+        for x in idx[1:]:
+            if x-prev>max(3,int(.012*w)):
+                ranges.append((a,prev)); a=x
+            prev=x
+        ranges.append((a,prev))
+    # Expand clustered vertical structures so QRS candidates cannot sit on pulse flanks.
+    pad=max(8,int(.025*w)); out=[]
+    for a,b in ranges:
+        if b-a+1>=1:
+            out.append((max(0,a-pad),min(w-1,b+pad)))
+    # Always exclude tiny extreme edges where lead labels or crop borders dominate.
+    edgepad=max(10,int(.035*w))
+    out.extend([(0,edgepad),(w-1-edgepad,w-1)])
+    # Merge.
+    out=sorted(out); merged=[]
+    for a,b in out:
+        if not merged or a>merged[-1][1]+1: merged.append([a,b])
+        else: merged[-1][1]=max(merged[-1][1],b)
+    return [(int(a),int(b)) for a,b in merged]
+
+
+def _v151_in_ranges(x,ranges):
+    return any(a<=x<=b for a,b in ranges)
+
+
+def _v151_rr_filter(cands, strengths, width):
+    """Select a maximally RR-consistent subset without assuming heart rate."""
+    import numpy as np
+    c=sorted(set(int(x) for x in cands))
+    if len(c)<=2:return c,None
+    # Candidate RR spacings from pairwise neighbouring gaps, ignore implausibly tiny gaps.
+    gaps=np.diff(c).astype(float)
+    gaps=gaps[gaps>=max(25,.07*width)]
+    if len(gaps)==0:return c,None
+    # Use median of central gaps; extras from calibration often create short terminal gap.
+    rr=float(np.median(gaps))
+    tol=max(14,.24*rr)
+    best=[]; bestscore=-1e9
+    # Try each candidate as an anchor and build periodic chain in both directions.
+    strength={int(x):float(strengths.get(int(x),1.0)) for x in c}
+    for anchor in c:
+        chain=[anchor]
+        # forward
+        target=anchor+rr
+        while target<=c[-1]+tol:
+            opts=[x for x in c if x>chain[-1] and abs(x-target)<=tol]
+            if not opts: break
+            x=max(opts,key=lambda z: strength.get(z,1.0)-.02*abs(z-target))
+            chain.append(x); target=x+rr
+        # backward
+        target=anchor-rr
+        while target>=c[0]-tol:
+            opts=[x for x in c if x<chain[0] and abs(x-target)<=tol]
+            if not opts: break
+            x=max(opts,key=lambda z: strength.get(z,1.0)-.02*abs(z-target))
+            chain.insert(0,x); target=x-rr
+        if len(chain)>=2:
+            ds=np.diff(chain); cv=float(np.std(ds)/max(1,np.mean(ds))) if len(ds)>1 else 0.0
+            score=3.0*len(chain)-4.0*cv+0.05*sum(strength.get(x,1.0) for x in chain)
+            if score>bestscore: bestscore=score; best=chain
+    if len(best)>=2:
+        rr2=float(np.median(np.diff(best))) if len(best)>1 else rr
+        return best,rr2
+    return c,rr
+
+
 def v15_extract_waveform(region):
-    """Signal-only digitization. No AI landmark coordinates are consumed."""
+    """v15.1 signal-only digitization with lead-band isolation, calibration masking and RR filtering."""
     import numpy as np
     img=_region_pil_image(region).convert("RGB")
     a=np.asarray(img,dtype=float); H,W,_=a.shape
-    # Safe border: labels/calibration at extreme edges must not seed the path.
-    bx=max(2,int(0.02*W)); by=max(2,int(0.05*H))
+    bx=max(2,int(0.015*W)); by=max(2,int(0.035*H))
     crop=a[by:H-by,bx:W-bx]; h,w,_=crop.shape
     r,g,b=crop[:,:,0],crop[:,:,1],crop[:,:,2]
     gray=.299*r+.587*g+.114*b
     chroma=np.maximum.reduce([r,g,b])-np.minimum.reduce([r,g,b])
     red=r-(g+b)/2.0
-    # Neutral dark ink likelihood. Strongly suppress pink/red grid.
     ink=np.clip((185-gray)/100.0,0,1)
     neutral=np.clip(1.0-chroma/85.0,0,1)
     red_pen=np.clip((45-red)/45.0,0,1)
     score=ink*(0.65+0.35*neutral)*red_pen
     score[gray>190]=0
-    # Remove likely text/calibration contamination near top/bottom by row occupancy.
+
+    # Text-dense rows get suppressed before corridor detection.
     occ=(score>0.28).mean(axis=1)
-    row_pen=np.ones(h)
-    row_pen[occ>0.38]=0.25
+    row_pen=np.ones(h); row_pen[occ>0.38]=0.22
     score*=row_pen[:,None]
 
-    # DP continuous path across x. State is y; reward dark ink, penalize vertical jumps.
+    ya,yb,ycenter=_v151_find_corridor(score,gray)
+    # Hard corridor mask prevents V2/V3 (or any lead) from jumping into adjacent rows.
+    corridor_mask=np.zeros_like(score); corridor_mask[ya:yb+1]=1.0
+    score*=corridor_mask
+
+    cal_ranges=_v151_calibration_mask(score,gray,(ya,yb,ycenter))
+    # Suppress calibration/text edge structures in the path cost too, but not to zero so trace can bridge.
+    for xa,xb in cal_ranges:
+        score[:,xa:xb+1]*=.12
+
     INF=1e9
     cost=np.full((h,w),INF,dtype=np.float32)
     parent=np.zeros((h,w),dtype=np.int16)
-    center=h/2.0
-    cost[:,0]=1.2*np.abs(np.arange(h)-center)/max(8,h*.35)-3.2*score[:,0]
-    maxjump=max(4,int(.09*h))
     yy=np.arange(h)
+    init=np.abs(yy-ycenter)/max(8,.24*h)
+    valid=(yy>=ya)&(yy<=yb)
+    cost[valid,0]=1.1*init[valid]-3.5*score[valid,0]
+    maxjump=max(4,int(.07*h))
     for x in range(1,w):
         prev=cost[:,x-1]
-        for y in range(h):
-            lo=max(0,y-maxjump); hi=min(h,y+maxjump+1)
-            cand=prev[lo:hi]+0.16*np.abs(np.arange(lo,hi)-y)
+        for y in range(ya,yb+1):
+            lo=max(ya,y-maxjump); hi=min(yb+1,y+maxjump+1)
+            cand=prev[lo:hi]+0.18*np.abs(np.arange(lo,hi)-y)
             k=int(np.argmin(cand)); py=lo+k
-            cost[y,x]=cand[k]-3.2*score[y,x]
+            # Weak centre prior stabilizes low-voltage leads like aVL.
+            center_pen=.012*abs(y-ycenter)
+            cost[y,x]=cand[k]-3.5*score[y,x]+center_pen
             parent[y,x]=py
-    y=int(np.argmin(cost[:,-1])); trace=np.zeros(w,dtype=float)
+    y=ya+int(np.argmin(cost[ya:yb+1,-1])); trace=np.zeros(w,dtype=float)
     for x in range(w-1,-1,-1):
         trace[x]=y+by
         if x:y=int(parent[y,x])
-    # Robust median smoothing.
+
     sm=trace.copy()
     for x in range(w):
         lo=max(0,x-2); hi=min(w,x+3); sm[x]=float(np.median(trace[lo:hi]))
     xfull=np.arange(w)+bx
-    # Baseline: median trace; signal positive upward.
     baseline=float(np.median(sm)); sig=baseline-sm
-    # Remove slow drift with broad moving median approximation.
     win=max(15,int(.06*w)); drift=np.zeros(w)
     for x in range(w):
         lo=max(0,x-win); hi=min(w,x+win+1); drift[x]=float(np.median(sig[lo:hi]))
     z=sig-drift
     dz=np.gradient(z); energy=np.abs(dz)
-    # QRS candidates from local energy + amplitude, with refractory distance.
     ewin=max(3,int(.012*w)); env=np.convolve(energy,np.ones(ewin)/ewin,mode='same')
-    thr=float(np.median(env)+2.8*np.median(np.abs(env-np.median(env))))
+    mad=float(np.median(np.abs(env-np.median(env))))
+    thr=float(np.median(env)+2.8*mad)
     cand=[]
     for x in range(2,w-2):
+        if _v151_in_ranges(x,cal_ranges): continue
         if env[x]>=thr and env[x]>=env[x-1] and env[x]>=env[x+1]: cand.append(x)
-    refractory=max(18,int(.12*w))
+    refractory=max(18,int(.10*w))
     chosen=[]
     for x in sorted(cand,key=lambda q:env[q],reverse=True):
         if all(abs(x-k)>=refractory for k in chosen): chosen.append(x)
     chosen=sorted(chosen)
-    # Refine each energy center to strongest absolute deflection locally.
-    qrs=[]; rad=max(6,int(.025*w))
+
+    # Refine to strongest deflection, but do not cross calibration/exclusion ranges.
+    raw_qrs=[]; strengths={}; rad=max(6,int(.022*w))
     for c in chosen:
         lo=max(0,c-rad); hi=min(w,c+rad+1)
-        k=lo+int(np.argmax(np.abs(z[lo:hi])))
-        qrs.append(int(k))
-    # QC metrics independent of clinical labels.
+        valid_idx=[k for k in range(lo,hi) if not _v151_in_ranges(k,cal_ranges)]
+        if not valid_idx: continue
+        k=max(valid_idx,key=lambda q:abs(z[q]))
+        raw_qrs.append(int(k)); strengths[int(k)]=float(abs(z[k])+2.0*env[k])
+    raw_qrs=sorted(set(raw_qrs))
+    qrs,rr_px=_v151_rr_filter(raw_qrs,strengths,w)
+
     dark_support=[]
     for x,yv in enumerate(sm.astype(int)):
         cy=yv-by
-        if 0<=cy<h: dark_support.append(float(score[cy,x]))
+        if 0<=cy<h and not _v151_in_ranges(x,cal_ranges): dark_support.append(float(score[cy,x]))
     support=float(np.mean(np.array(dark_support)>0.16)) if dark_support else 0.0
     jumps=np.abs(np.diff(sm)); continuity=float(np.mean(jumps<=max(3,.04*h))) if len(jumps) else 0
-    qc='PASS' if support>=.62 and continuity>=.92 and len(qrs)>=2 else 'REVIEW'
+    # QRS RR consistency metric.
+    rr_cv=None
+    if len(qrs)>=3:
+        ds=np.diff(qrs).astype(float); rr_cv=float(np.std(ds)/max(1,np.mean(ds)))
+    qc='PASS' if support>=.60 and continuity>=.92 and len(qrs)>=2 and (rr_cv is None or rr_cv<=.22) else 'REVIEW'
     return {'lead':region.get('lead'),'status':qc,'support':round(support,3),'continuity':round(continuity,3),
-            'x':xfull.tolist(),'trace_y':sm.tolist(),'signal':z.tolist(),'qrs_candidates_x':[int(xfull[k]) for k in qrs],
-            'threshold':round(thr,4),'width':W,'height':H}
+            'x':xfull.tolist(),'trace_y':sm.tolist(),'signal':z.tolist(),
+            'qrs_candidates_raw_x':[int(xfull[k]) for k in raw_qrs],
+            'qrs_candidates_x':[int(xfull[k]) for k in qrs],
+            'rr_px':None if rr_px is None else round(float(rr_px),2),
+            'rr_cv':None if rr_cv is None else round(float(rr_cv),3),
+            'threshold':round(thr,4),'width':W,'height':H,
+            'corridor_y':[int(ya+by),int(yb+by)],'corridor_center_y':int(ycenter+by),
+            'calibration_exclusion_x':[[int(a+bx),int(b+bx)] for a,b in cal_ranges]}
 
 def v15_waveform_overlay(region,res):
     from PIL import ImageDraw
-    img=_region_pil_image(region).copy(); d=ImageDraw.Draw(img)
+    img=_region_pil_image(region).copy(); d=ImageDraw.Draw(img,'RGBA')
+    cor=res.get('corridor_y') or []
+    if len(cor)==2:
+        d.rectangle((0,int(cor[0]),img.width-1,int(cor[1])),fill=(20,180,80,18),outline=(20,150,70,110),width=1)
+    for a,b in res.get('calibration_exclusion_x') or []:
+        d.rectangle((int(a),0,int(b),img.height-1),fill=(220,30,30,18),outline=(220,30,30,90),width=1)
     xs=res.get('x') or []; ys=res.get('trace_y') or []
     if len(xs)>1:
-        d.line([(int(x),int(y)) for x,y in zip(xs,ys)],fill=(0,110,255),width=2)
+        d.line([(int(x),int(y)) for x,y in zip(xs,ys)],fill=(0,110,255,255),width=2)
+    for x in res.get('qrs_candidates_raw_x') or []:
+        d.line((x,0,x,img.height-1),fill=(255,170,0,100),width=1)
     for x in res.get('qrs_candidates_x') or []:
-        d.line((x,0,x,img.height-1),fill=(255,90,0),width=2)
-    d.rectangle((0,0,min(img.width-1,390),28),fill=(255,255,255))
-    d.text((6,6),f"v15 trace {res.get('lead')} | {res.get('status')} | support {res.get('support')} | QRS {len(res.get('qrs_candidates_x') or [])}",fill=(0,0,0))
+        d.line((x,0,x,img.height-1),fill=(255,90,0,255),width=2)
+    d.rectangle((0,0,min(img.width-1,560),30),fill=(255,255,255,235))
+    d.text((6,6),f"v15.1 {res.get('lead')} | {res.get('status')} | support {res.get('support')} | QRS {len(res.get('qrs_candidates_x') or [])} | RRcv {res.get('rr_cv')}",fill=(0,0,0,255))
     return img
 
 def v15_contact_sheet(single_leads,results):
@@ -5341,7 +5475,7 @@ else:
                         st.image(_r["png"],caption=_r["lead"],width="stretch")
 
         # v15.0 Waveform Lab: independent of Gemini landmark coordinates.
-        st.markdown("### v15.0 — Waveform Lab (signal-only)")
+        st.markdown("### v15.1 — Clean Signal Foundation")
         st.caption("Kiểm chứng kiến trúc mới: ảnh single-lead → trace 1-D → QRS candidates. Không dùng P/Q/R/S/J/T do Gemini đề xuất.")
         _v15_results=[]
         for _r in _single_leads:
@@ -5354,10 +5488,10 @@ else:
         _v15_reg=next(r for r in _single_leads if r["lead"]==_v15_lead)
         _v15_res=_v15_by[_v15_lead]
         if _v15_res.get("status")!="ERROR":
-            st.image(v15_waveform_overlay(_v15_reg,_v15_res),caption="Xanh = trace digitized; cam = QRS candidate. Đây là bằng chứng CV độc lập, chưa phải landmark PQRST.",width="stretch")
+            st.image(v15_waveform_overlay(_v15_reg,_v15_res),caption="Xanh = waveform; cam đậm = QRS sau RR-filter; cam nhạt = candidate thô; xanh lá = lead corridor; đỏ nhạt = vùng loại calibration/edge. Chưa phải landmark PQRST.",width="stretch")
         else:
             st.error(_v15_res.get("error"))
-        st.dataframe([{k:v for k,v in x.items() if k in ("lead","status","support","continuity","qrs_candidates_x","error")} for x in _v15_results],hide_index=True,width="stretch")
+        st.dataframe([{k:v for k,v in x.items() if k in ("lead","status","support","continuity","qrs_candidates_raw_x","qrs_candidates_x","rr_px","rr_cv","corridor_y","calibration_exclusion_x","error")} for x in _v15_results],hide_index=True,width="stretch")
         try:
             _v15_sheet=v15_contact_sheet(_single_leads,_v15_results)
             _v15_buf=io.BytesIO(); _v15_sheet.save(_v15_buf,format="PNG") if _v15_sheet is not None else None
@@ -5367,9 +5501,9 @@ else:
         _v15_json=json.dumps(_v15_results,ensure_ascii=False,indent=2).encode("utf-8")
         _a,_b=st.columns(2)
         with _a:
-            if _v15_png: st.download_button("Tải v15 Waveform Validation PNG",_v15_png,"ecg_v15_waveform_validation.png","image/png",key="v15_png_"+frame_id,width="stretch")
+            if _v15_png: st.download_button("Tải v15.1 Clean Signal PNG",_v15_png,"ecg_v15_1_clean_signal_validation.png","image/png",key="v15_png_"+frame_id,width="stretch")
         with _b:
-            st.download_button("Tải v15 Waveform JSON",_v15_json,"ecg_v15_waveform_validation.json","application/json",key="v15_json_"+frame_id,width="stretch")
+            st.download_button("Tải v15.1 Clean Signal JSON",_v15_json,"ecg_v15_1_clean_signal_validation.json","application/json",key="v15_json_"+frame_id,width="stretch")
         _pass=sum(1 for x in _v15_results if x.get("status")=="PASS")
         st.info(f"v15.0 waveform QC: PASS {_pass}/12. Chưa dùng kết quả này để chẩn đoán; mục tiêu hiện tại chỉ là xác minh trace/QRS trên ảnh.")
 
