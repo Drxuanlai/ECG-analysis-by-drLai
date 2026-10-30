@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.7.1-v13base"
+APP_VERSION = "v14.7.2-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3809,9 +3809,22 @@ def validate_landmark_cycle(item):
 
 
 
+def _region_pil_image(region):
+    """Return PIL image for a region whether runtime kept `image` or only serialized `png`."""
+    from PIL import Image
+    import io
+    img=region.get("image") if isinstance(region,dict) else None
+    if img is not None:
+        return img.convert("RGB")
+    raw=region.get("png") if isinstance(region,dict) else None
+    if raw:
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    raise KeyError("region has neither image nor png")
+
 def _lead_waveform_from_region(region):
     import numpy as np
-    a=np.asarray(region["image"].convert("L"),dtype=float)
+    img=_region_pil_image(region)
+    a=np.asarray(img.convert("L"),dtype=float)
     H,W=a.shape
     x0=max(0,int(0.015*W)); x1=min(W,int(0.985*W))
     a2=a[:,x0:x1]
@@ -3885,7 +3898,7 @@ def snap_landmarks_to_waveform(item,region):
     if wave.get("status")=="REVIEW":
         snapped["quality"]="review"
         snapped["snap_issues"].append(wave.get("reason") or "centerline_review")
-    H=region["image"].size[1]
+    H=_region_pil_image(region).size[1]
     def ai_x(k):
         p=item.get(k)
         try:return float(p["x_pct"]) if isinstance(p,dict) else None
@@ -4066,7 +4079,10 @@ def render_result(result):
                 try:
                     annotated=_annotate_v14_landmarks(region,lm)
                     st.image(annotated,width="stretch")
-                    st.caption("Overlay hiển thị landmark SAU waveform snapping. Raw AI proposal vẫn được giữ trong JSON để đối chiếu.")
+                    if lm.get("snap_applied") is True:
+                        st.caption(f"Overlay SAU waveform snapping · Centerline QC: {lm.get('snap_centerline_qc')} · confidence: {lm.get('snap_centerline_confidence')}. Raw AI proposal được giữ trong JSON.")
+                    else:
+                        st.error("RAW AI LANDMARK — waveform snapping CHƯA chạy thành công cho lead này. Không coi overlay là measurement evidence.")
                 except Exception as exc:
                     st.warning("Không vẽ được overlay: "+str(exc))
             else:
@@ -4418,7 +4434,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · AI-guided Waveform Snapping → Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.7.1-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.7.2-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
