@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.5-v13base"
+APP_VERSION = "v14.5.1-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3763,6 +3763,60 @@ def audit_zip(result):
 
 def render_result(result):
     st.subheader("Kết quả quan sát")
+    data = result.get("data")
+
+    # v14 landmark-only UI: never send this data through the legacy v13 report renderer.
+    if isinstance(data,dict) and isinstance(data.get("lead_landmarks"),list):
+        st.caption(f"{result['app_version']} · {result['provider']} · {result['model']} · "
+                   f"{result['total_seconds']:.1f} giây · {len(result['regions'])} ảnh/lần gọi · "
+                   f"{result.get('api_calls',1)} lần gọi")
+        with st.expander("Lịch sử chọn nguồn API của lượt này"):
+            st.dataframe(result.get("attempts",[]), hide_index=True, width="stretch")
+
+        st.info("v14 Landmark-only: AI chỉ đề xuất vị trí sóng; số đo bên dưới do code tính từ landmark + lưới/chuẩn ghi.")
+        tech=data.get("technical_review") or {}
+        with st.expander("Technical review từ AI", expanded=False):
+            st.json(tech)
+
+        auth=result.get("v14_measurement_authority") or {}
+        st.subheader("v14 — AI Landmark → Deterministic Measurement")
+        st.caption(f"Authority: {auth.get('status','UNRESOLVED')} · PASS {auth.get('pass_count',0)} · "
+                   f"REVIEW {auth.get('review_count',0)}")
+        rows=auth.get("rows") or []
+        if rows:
+            st.dataframe(rows, hide_index=True, width="stretch")
+        else:
+            st.warning("Chưa tạo được bảng measurement từ landmark.")
+
+        issues=(result.get("arithmetic") or {}).get("landmark_parse_issues") or []
+        if issues:
+            with st.expander("Landmark parser issues", expanded=False):
+                st.write(issues)
+
+        # Visual audit: choose lead and draw the exact AI proposal on the source region.
+        bylead={x.get("lead"):x for x in data.get("lead_landmarks",[]) if isinstance(x,dict)}
+        available=[x for x in V14_LEADS if x in bylead]
+        if available:
+            st.subheader("AI landmark overlay — kiểm tra bằng mắt")
+            lead=st.selectbox("Chọn chuyển đạo",available,key="v14_landmark_lead_"+result["signature"][:16])
+            lm=bylead[lead]
+            rid=lm.get("region_id")
+            region=next((r for r in result["regions"] if r.get("id")==rid),None)
+            if region is not None:
+                try:
+                    annotated=_annotate_v14_landmarks(region,lm)
+                    st.image(annotated,width="stretch")
+                    st.caption("Overlay chỉ là AI proposal. Measurement Core mới quyết định số đo có PASS/REVIEW hay không.")
+                except Exception as exc:
+                    st.warning("Không vẽ được overlay: "+str(exc))
+            else:
+                st.warning(f"{lead}: không có region_id hợp lệ để vẽ overlay.")
+
+        # Raw normalized landmark JSON is useful during this validation phase.
+        with st.expander("Normalized landmark JSON", expanded=False):
+            st.json(data)
+        return
+
     st.caption(f"{result['app_version']} · {result['provider']} · {result['model']} · {result['total_seconds']:.1f} giây · {len(result['regions'])} ảnh/lần gọi · {result.get('api_calls', 1)} lần gọi")
     with st.expander("Lịch sử chọn nguồn API của lượt này"):
         st.dataframe(result.get("attempts", []), hide_index=True)
@@ -4103,8 +4157,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v13.7.1 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · AI Landmark-only → Deterministic Measurement")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.5.1-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4488,22 +4542,13 @@ else:
                     data, landmark_parse_issues = parse_v14_landmark_json(outcome["raw_response"],regions)
                     checks = {"landmark_parse_issues": landmark_parse_issues}
                     v14_measurement_authority = build_v14_measurement_authority(
-                        data, regions, ecg_image,
-                        {"speed_mm_s":speed,"limb_gain_mm_mv":limb_gain,"chest_gain_mm_mv":chest_gain}
+                        data, regions, ecg,
+                        {"speed_mm_s":speed,"limb_gain_mm_mv":limb,"chest_gain_mm_mv":chest}
                     )
-                    # Schema is now proven valid. Sanitize only user-visible semantic content.
-                    data, sanitizer_audit = _sanitize_ai_result_v137(
-                        data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
-                    checks = arithmetic_checks(data,known,age_years=age)
-                    authority_report = measurement_authority_conflicts(data,rr_authority,j_st_evidence)
-                    # Authority warnings are separate from arithmetic consistency:
-                    # an AI proposal may be internally consistent yet still have no measurement authority.
-                    for _cf in authority_report.get("conflicts",[]):
-                        checks["checks"].append({"status":"warning",
-                            "message":f"{_cf.get('measurement_id')}: AI proposal bị BLOCK — engine authority chưa PASS; không dùng tọa độ/số AI làm bằng chứng định lượng.",
-                            "measurement_ids":[_cf.get("measurement_id")],"category":"measurement_authority"})
-                    if authority_report.get("conflicts"):
-                        checks["has_blocking_warning"]=True
+                    # v14 landmark-only pass: do NOT run legacy v13 report sanitizer/arithmetic.
+                    # Quantitative authority comes only from deterministic landmark measurement below.
+                    sanitizer_audit = {"status":"NOT_APPLICABLE_LANDMARK_ONLY"}
+                    checks = {"landmark_parse_issues": landmark_parse_issues}
                 except (ValueError,TypeError,KeyError) as exc:
                     outcome["error"] = "API đã trả dữ liệu nhưng cấu trúc không hợp lệ hoặc thiếu vùng quan sát. Chưa có báo cáo hoàn chỉnh; không tự gửi lại."
                     data = None
@@ -4514,8 +4559,10 @@ else:
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
                 "authority_sanitizer":sanitizer_audit,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
-                "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,"median_landmarks":median_landmark_authority,"qrs_morphology":qrs_morphology_authority,
-                    "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
+                "v14_measurement_authority":v14_measurement_authority,
+                "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,
+                    "median_landmarks":median_landmark_authority,"qrs_morphology":qrs_morphology_authority,
+                    "conflicts": None},
                 "requested_provider":provider,"requested_model":model,
                 "image_settings":{"original_size":list(original.size),"oriented_size":list(oriented.size),
                     "auto_rotation_ccw":auto_angle,"manual_rotation_ccw":manual,"ecg_box_in_oriented_image":list(whole_box),
