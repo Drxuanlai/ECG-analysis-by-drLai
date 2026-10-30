@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.7.2-v13base"
+APP_VERSION = "v14.8-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3889,6 +3889,231 @@ def _snap_boundary(wave,x_pct,radius_pct=3.0):
     k=int(xs[int(np.argmax(score))])
     return {"x_idx":k,"y":float(y[k]),"x_pct":100.0*k/max(1,n-1)}
 
+
+def _local_dark_trace(region, x_pct, y_hint_pct=None, half_width_pct=3.2, half_height_pct=18.0):
+    """Extract a local dark continuous trace around an AI semantic landmark.
+    Unlike v14.7, this never builds a global centerline for the whole strip.
+    """
+    import numpy as np
+    img=_region_pil_image(region).convert("RGB")
+    a=np.asarray(img,dtype=float)
+    H,W,_=a.shape
+    if x_pct is None:
+        return {"status":"REVIEW","reason":"missing_x","confidence":0.0}
+
+    xc=float(x_pct)/100.0*(W-1)
+    hw=max(8,int(half_width_pct/100.0*W))
+    x0=max(0,int(round(xc))-hw); x1=min(W,int(round(xc))+hw+1)
+
+    if y_hint_pct is None:
+        yc=H/2.0
+        hh=max(12,int(0.34*H))
+    else:
+        yc=float(y_hint_pct)/100.0*(H-1)
+        hh=max(12,int(half_height_pct/100.0*H))
+    y0=max(0,int(round(yc))-hh); y1=min(H,int(round(yc))+hh+1)
+    patch=a[y0:y1,x0:x1]
+    if patch.size==0:
+        return {"status":"REVIEW","reason":"empty_patch","confidence":0.0}
+
+    # ECG ink is neutral/dark. Red/pink grid has a stronger red channel.
+    r,g,b=patch[:,:,0],patch[:,:,1],patch[:,:,2]
+    gray=(0.299*r+0.587*g+0.114*b)
+    chroma=np.maximum.reduce([r,g,b])-np.minimum.reduce([r,g,b])
+    red_excess=r-(g+b)/2.0
+
+    # Strong dark neutral pixels; suppress pink/red grid and pale paper.
+    ink=(gray<155) & (chroma<72) & (red_excess<38)
+    # Also admit very dark pixels regardless of mild color cast.
+    ink |= (gray<105)
+
+    ph,pw=ink.shape
+    ys=np.full(pw,np.nan,dtype=float)
+    column_strength=np.zeros(pw,dtype=float)
+
+    # Dynamic programming path: dark pixel reward + continuity penalty.
+    candidates=[]
+    for j in range(pw):
+        yy=np.where(ink[:,j])[0]
+        if yy.size:
+            candidates.append(yy)
+        else:
+            candidates.append(np.array([],dtype=int))
+
+    # Seed near AI y if available, otherwise center of patch.
+    seed=(yc-y0) if y_hint_pct is not None else ph/2.0
+    prev_cost=None; prev_y=None
+    back=[]
+    for j,yy in enumerate(candidates):
+        if yy.size==0:
+            back.append(None); prev_cost=None; prev_y=None
+            continue
+        darkness=(170.0-gray[yy,j])/70.0
+        if prev_cost is None:
+            cost=1.2*np.abs(yy-seed)/max(4.0,ph*0.25)-darkness
+            parent=np.full(len(yy),-1,dtype=int)
+        else:
+            trans=np.abs(yy[:,None]-prev_y[None,:])/max(2.0,ph*0.045)
+            M=trans+prev_cost[None,:]
+            parent=np.argmin(M,axis=1)
+            cost=M[np.arange(len(yy)),parent]-darkness
+        back.append((yy,parent,cost))
+        prev_y=yy; prev_cost=cost
+
+    # Reconstruct from best available final column, then fill gaps locally.
+    valid_cols=[j for j,v in enumerate(back) if v is not None]
+    if len(valid_cols)<max(5,int(0.35*pw)):
+        return {"status":"REVIEW","reason":"insufficient_local_ink","confidence":0.0,
+                "box":(x0,y0,x1,y1)}
+    jend=valid_cols[-1]
+    yy,parent,cost=back[jend]
+    k=int(np.argmin(cost))
+    for j in range(jend,-1,-1):
+        rec=back[j]
+        if rec is None: continue
+        yy,parent,cost=rec
+        k=min(k,len(yy)-1)
+        ys[j]=float(yy[k]+y0)
+        pk=int(parent[k]) if parent is not None and len(parent)>k else -1
+        if pk>=0:k=pk
+
+    good=np.isfinite(ys)
+    if good.sum()<5:
+        return {"status":"REVIEW","reason":"trace_reconstruction_failed","confidence":0.0,
+                "box":(x0,y0,x1,y1)}
+    idx=np.arange(pw)
+    ys=np.interp(idx,idx[good],ys[good])
+
+    # Robust local smoothing only.
+    sm=ys.copy()
+    for j in range(pw):
+        lo=max(0,j-2); hi=min(pw,j+3)
+        sm[j]=float(np.median(ys[lo:hi]))
+
+    jumps=np.abs(np.diff(sm))
+    continuity=float(np.mean(jumps<max(3.0,0.04*ph))) if len(jumps) else 0.0
+    coverage=float(good.mean())
+    # Reward path close to semantic y hint, but do not require exact AI y.
+    if y_hint_pct is not None:
+        center_dist=float(np.median(np.abs(sm-(yc))))/max(1.0,hh)
+        semantic=max(0.0,1.0-center_dist)
+    else:
+        semantic=0.6
+    confidence=0.45*coverage+0.40*continuity+0.15*semantic
+    return {"status":"PASS" if confidence>=0.70 else "REVIEW",
+            "reason":None if confidence>=0.70 else "low_local_trace_confidence",
+            "confidence":round(float(confidence),3),
+            "x0":x0,"y0":y0,"x1":x1,"y1":y1,"trace_y":sm,
+            "width":W,"height":H}
+
+def _local_snap_point(region, point, kind):
+    """Snap one AI point to a local trace. Returns final source-image percentages."""
+    import numpy as np
+    if not isinstance(point,dict): return None,{"status":"REVIEW","reason":"missing_point","confidence":0.0}
+    try:
+        x=float(point["x_pct"]); y=float(point.get("y_pct")) if point.get("y_pct") is not None else None
+    except Exception:
+        return None,{"status":"REVIEW","reason":"invalid_point","confidence":0.0}
+
+    # Boundary landmarks need a wider horizontal context; peaks tighter.
+    if kind in ("p_on","p_off","qrs_on","j_point","t_end"):
+        hw=2.7; hh=16.0
+    elif kind in ("q_peak","r_peak","s_peak","r_prime_peak"):
+        hw=1.8; hh=22.0
+    else:
+        hw=2.5; hh=16.0
+
+    tr=_local_dark_trace(region,x,y,hw,hh)
+    if tr.get("trace_y") is None:
+        return None,tr
+    ty=np.asarray(tr["trace_y"],dtype=float)
+    pw=len(ty); W=tr["width"]; H=tr["height"]
+    xs=np.arange(pw)+tr["x0"]
+    xc=x/100.0*(W-1)
+    local_center=int(np.argmin(np.abs(xs-xc)))
+
+    if kind in ("q_peak","r_peak","s_peak","r_prime_peak","p_peak","t_peak"):
+        # Use local baseline from patch edges; choose strongest deflection near AI x.
+        edge=np.r_[ty[:max(2,pw//6)],ty[-max(2,pw//6):]]
+        base=float(np.median(edge))
+        dev=np.abs(ty-base)
+        # penalize distance from semantic x to avoid jumping to adjacent beat/grid.
+        score=dev-0.18*np.abs(np.arange(pw)-local_center)
+        k=int(np.argmax(score))
+    else:
+        # Boundary: local slope transition nearest AI x.
+        d=np.abs(np.gradient(ty))
+        score=d-0.22*np.abs(np.arange(pw)-local_center)
+        k=int(np.argmax(score))
+
+    xx=float(xs[k]); yy=float(ty[k])
+    snapped={"x_pct":round(100.0*xx/max(1,W-1),3),
+             "y_pct":round(100.0*yy/max(1,H-1),3)}
+    return snapped,tr
+
+def local_snap_landmarks(item,region):
+    """v14.8 final landmark snapping: each point gets its own local trace patch."""
+    snapped=dict(item)
+    raw={k:item.get(k) for k in V14_LANDMARK_KEYS}
+    snapped["ai_landmarks_raw"]=raw
+    snapped["snap_method"]="local_trace_v14_8"
+    snapped["snap_applied"]=True
+    details={}
+    confs=[]
+
+    for k in V14_LANDMARK_KEYS:
+        if k=="baseline_point":
+            # baseline is auxiliary; still snap locally as a low-curvature point.
+            pt,tr=_local_snap_point(region,item.get(k),"p_on")
+        else:
+            pt,tr=_local_snap_point(region,item.get(k),k)
+        snapped[k]=pt
+        details[k]={"status":tr.get("status"),"confidence":tr.get("confidence"),
+                    "reason":tr.get("reason")}
+        if tr.get("confidence") is not None:
+            confs.append(float(tr["confidence"]))
+
+    # Morphology components that AI said do not exist must stay null.
+    for k in ("q_peak","r_peak","s_peak","r_prime_peak"):
+        if raw.get(k) is None: snapped[k]=None
+
+    pass_count=sum(1 for d in details.values() if d.get("status")=="PASS")
+    required=[k for k in ("p_on","p_peak","p_off","qrs_on","j_point","t_peak","t_end") if raw.get(k) is not None]
+    required_pass=sum(1 for k in required if details.get(k,{}).get("status")=="PASS")
+    req_ratio=required_pass/max(1,len(required))
+    mean_conf=sum(confs)/max(1,len(confs))
+    snapped["snap_centerline_qc"]="PASS" if req_ratio>=0.75 and mean_conf>=0.70 else "REVIEW"
+    snapped["snap_centerline_confidence"]=round(mean_conf,3)
+    snapped["snap_local_required_pass_ratio"]=round(req_ratio,3)
+    snapped["snap_details"]=details
+    snapped["snap_issues"]=[k+":"+str(v.get("reason")) for k,v in details.items()
+                            if v.get("status")!="PASS" and raw.get(k) is not None]
+    if snapped["snap_centerline_qc"]!="PASS":
+        snapped["quality"]="review"
+    return snapped
+
+def local_snap_all_landmarks(data,regions):
+    byid={r.get("id"):r for r in regions}
+    out=[]; issues=[]
+    for item in data.get("lead_landmarks",[]):
+        region=byid.get(item.get("region_id"))
+        if region is None:
+            x=dict(item);x["quality"]="review";x["snap_applied"]=False
+            x["snap_method"]="local_trace_v14_8";x["snap_issues"]=["region_missing"]
+            out.append(x);issues.append(item.get("lead","?")+":region_missing");continue
+        x=local_snap_landmarks(item,region)
+        cyc=validate_landmark_cycle(x)
+        x["cycle_qc"]="PASS" if not cyc else "REVIEW"
+        x["cycle_issues"]=cyc
+        if cyc:
+            x["quality"]="review"
+            issues.extend([item.get("lead","?")+":"+q for q in cyc])
+        issues.extend([item.get("lead","?")+":"+q for q in x.get("snap_issues",[])])
+        out.append(x)
+    z=dict(data);z["lead_landmarks"]=out
+    return z,issues
+
+
 def snap_landmarks_to_waveform(item,region):
     wave=_lead_waveform_from_region(region)
     snapped=dict(item)
@@ -4034,7 +4259,7 @@ def render_result(result):
         with st.expander("Lịch sử chọn nguồn API của lượt này"):
             st.dataframe(result.get("attempts",[]), hide_index=True, width="stretch")
 
-        st.info("v14.7: AI chỉ đề xuất ngữ nghĩa + vị trí x gần đúng. Python snap điểm xuống centerline waveform thật rồi Measurement Core mới tính số đo.")
+        st.info("v14.8: AI chỉ semantic-localize landmark. Python dựng trace cục bộ quanh từng landmark, snap điểm vào nét ECG thật rồi Measurement Core mới tính số đo.")
         tech=data.get("technical_review") or {}
         with st.expander("Technical review từ AI", expanded=False):
             st.json(tech)
@@ -4080,7 +4305,7 @@ def render_result(result):
                     annotated=_annotate_v14_landmarks(region,lm)
                     st.image(annotated,width="stretch")
                     if lm.get("snap_applied") is True:
-                        st.caption(f"Overlay SAU waveform snapping · Centerline QC: {lm.get('snap_centerline_qc')} · confidence: {lm.get('snap_centerline_confidence')}. Raw AI proposal được giữ trong JSON.")
+                        st.caption(f"Overlay SAU local-trace snapping · Snap QC: {lm.get('snap_centerline_qc')} · confidence: {lm.get('snap_centerline_confidence')} · required-pass: {lm.get('snap_local_required_pass_ratio')}. Raw AI proposal được giữ trong JSON.")
                     else:
                         st.error("RAW AI LANDMARK — waveform snapping CHƯA chạy thành công cho lead này. Không coi overlay là measurement evidence.")
                 except Exception as exc:
@@ -4433,8 +4658,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · AI-guided Waveform Snapping → Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.7.2-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · Local Trace Snapping → Deterministic Measurement")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.8-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4860,7 +5085,7 @@ else:
                 # Stage 2 — waveform snapping. Failure must NOT discard valid AI landmarks.
                 if data is not None:
                     try:
-                        snapped_data, snap_issues = snap_all_landmarks(data,regions)
+                        snapped_data, snap_issues = local_snap_all_landmarks(data,regions)
                         data = snapped_data
                     except Exception as exc:
                         stage_errors.append({"stage":"waveform_snap","type":type(exc).__name__,"detail":str(exc)[:500]})
