@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.4.1"
-PROMPT_VERSION = "ecg-landmark-stable-sequential-v14.4.1"
+APP_VERSION = "v14.4.2"
+PROMPT_VERSION = "ecg-landmark-secrets-loader-v14.4.2"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3304,8 +3304,52 @@ def friendly_api_error(error):
 
 
 # ----------------- NGUỒN API VÀ HẠN MỨC -----------------
+def get_ecg_api_routes_secret():
+    """Read [[ECG_API_ROUTES]] robustly from Streamlit Secrets.
+    Streamlit may expose nested TOML arrays as proxy/list-like objects rather than plain list.
+    """
+    raw=None
+    # Direct access first: do not route this nested structure through scalar-oriented helpers.
+    try:
+        if "ECG_API_ROUTES" in st.secrets:
+            raw=st.secrets["ECG_API_ROUTES"]
+    except Exception:
+        raw=None
+    if raw is None:
+        try:
+            raw=get_secret("ECG_API_ROUTES", None)
+        except Exception:
+            raw=None
+    if raw is None:
+        return []
+
+    # Normalize list/tuple or Streamlit/TOML proxy iterable into plain list[dict].
+    if isinstance(raw,(list,tuple)):
+        items=list(raw)
+    else:
+        try:
+            items=list(raw)
+        except Exception:
+            return []
+
+    out=[]
+    for item in items:
+        try:
+            if isinstance(item,dict):
+                d=dict(item)
+            elif hasattr(item,"to_dict"):
+                d=dict(item.to_dict())
+            elif hasattr(item,"items"):
+                d=dict(item.items())
+            else:
+                continue
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
 def configured_routes(primary_provider, primary_model, thinking, manual_key=""):
-    configured = get_secret("ECG_API_ROUTES", [])
+    configured = get_ecg_api_routes_secret()
     routes = []
     if configured:
         if not isinstance(configured, (list, tuple)) or len(configured) > 12:
@@ -4255,7 +4299,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.4.1 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.4.2 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4282,6 +4326,12 @@ with st.sidebar:
             manual_key = st.text_input("API key chính", type="password", key="manual_key_v9")
         try:
             routes = configured_routes(provider, model, thinking, manual_key)
+            # v14.4.2 loader diagnostic: names/count only, never keys.
+            _secret_routes = get_ecg_api_routes_secret()
+            st.caption(f"Secrets ECG_API_ROUTES: {len(_secret_routes)} · Loaded routes: {len(routes)}")
+            if _secret_routes:
+                st.caption("Secrets routes: " + " → ".join(str(x.get("name","(không tên)")) for x in _secret_routes))
+
             if not allow_other_provider:
                 routes = [r for r in routes if r["provider"] == provider]
             # v14.4.1: never silently truncate configured backup routes.
