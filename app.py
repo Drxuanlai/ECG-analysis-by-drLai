@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.4.2"
-PROMPT_VERSION = "ecg-landmark-secrets-loader-v14.4.2"
+APP_VERSION = "v14.5-v13base"
+PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -2628,7 +2628,17 @@ PARAMETERS = {"rr_ms": "RR (ms)", "hr_bpm": "Tần số (bpm)", "pr_ms": "PR (ms
               "qrs_ms": "QRS (ms)", "qt_ms": "QT (ms)", "qtc_ms": "QTc (ms)",
               "voltage_mv": "Điện thế (mV)", "st_mm": "ST (mm)"}
 SOURCES = {"image_text": "Chữ chuẩn ghi trên ảnh", "user": "Người dùng cung cấp", "unknown": "Chưa xác định"}
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = """\nV14 LANDMARK-ONLY — ƯU TIÊN CAO NHẤT:
+Lượt này chỉ nhận diện landmark ECG, không chẩn đoán.
+Chỉ trả JSON object gồm technical_review và lead_landmarks.
+lead_landmarks cố gắng đủ I,II,III,aVR,aVL,aVF,V1-V6.
+Mỗi lead: lead, region_id, cycle_id, quality(clear|review|not_visible), p_on, p_peak, p_off,
+qrs_on, q_peak, r_peak, s_peak, r_prime_peak, j_point, t_peak, t_end, baseline_point,
+morphology_candidate, limitation.
+Mỗi landmark là {"x_pct":0..100,"y_pct":0..100} theo đúng ảnh region_id; không chắc thì null.
+Không tự ghi ms, mV, ST elevation/depression, T cao nhọn, diagnosis, differential hay recommendation.
+
+
 Bạn hỗ trợ bác sĩ quan sát ECG từ một ảnh toàn cảnh và các vùng cắt của CHÍNH BẢN GHI ĐÓ.
 Không phải các lần ghi khác nhau. Không tính các vùng chồng lặp thành nhiều nhát tim.
 Chỉ trả JSON theo schema, tiếng Việt, ngắn gọn; không trình bày suy luận nội bộ.
@@ -2698,36 +2708,6 @@ MEASUREMENT AUTHORITY FIREWALL v13.7 — BẮT BUỘC:
 6) Không gọi 'ST đẳng điện' như kết luận đo nếu J/baseline/ST authority chưa PASS.
 7) Nếu thông tin ca bệnh trống, không được suy diễn triệu chứng hay clinical differential dựa trên dữ liệu không được cung cấp.
 """
-
-SYSTEM_PROMPT += """
-V14.3 LANDMARK-ONLY PASS — ƯU TIÊN CAO NHẤT:
-Lượt AI này CHỈ nhận diện landmark. Không chẩn đoán, differential, khuyến nghị, interval ms,
-biên độ mV/mm, ST elevation/depression hay T cao nhọn.
-Chỉ trả JSON gồm technical_review và lead_landmarks.
-lead_landmarks cố gắng đủ I, II, III, aVR, aVL, aVF, V1-V6; landmark không chắc = null.
-Mỗi landmark = {"x_pct":0..100,"y_pct":0..100} theo đúng ảnh region_id.
-Mỗi lead dùng các key: lead, region_id, cycle_id, quality, p_on, p_peak, p_off, qrs_on,
-q_peak, r_peak, s_peak, r_prime_peak, j_point, t_peak, t_end, baseline_point,
-morphology_candidate, limitation.
-Lead không đọc được: quality="not_visible", các landmark=null.
-
-V14.1 JSON CONTRACT:
-- Trả về MỘT JSON object duy nhất, không Markdown, không code fence.
-- Phải giữ đầy đủ các key mà ứng dụng yêu cầu: quality_summary, technical_review, lead_landmarks, conduction_assessment, summary_measurement_ids, lead_features, hypotheses, observations, measurements, rhythm, conduction, repolarization, impression, verification_needed, urgency.
-- lead_landmarks phải có đúng 12 lead I, II, III, aVR, aVL, aVF, V1-V6, mỗi lead đúng một lần.
-- Tọa độ landmark là x_pct/y_pct 0..100 của CHÍNH ảnh region_id được gửi; mốc không thấy rõ phải là null.
-- Không thêm key ngoài cấu trúc yêu cầu. Không đổi tên key.
-
-V14 LANDMARK-FIRST WORKFLOW — ƯU TIÊN CAO NHẤT:
-- Vai trò AI trong lượt này là NHẬN DIỆN và ĐỀ XUẤT LANDMARK trên ảnh, không phải làm thước đo cuối cùng.
-- lead_landmarks phải có đúng 12 lead. Chọn MỘT nhát đại diện rõ nhất trong vùng chi tiết của từng lead và đánh dấu bằng tọa độ phần trăm của chính region đó.
-- Các mốc có thể dùng: P-on, P-peak, P-off, QRS-on, q-peak, R-peak, S-peak, R-prime, J-point, T-peak, T-end, baseline. Không thấy rõ mốc nào thì để null; TUYỆT ĐỐI không bịa mốc để hoàn thành.
-- QRS-on là khởi đầu phức bộ QRS; J-point là tận cùng QRS/chuyển sang ST. T-peak phải nằm sau J. Không lấy T làm R/QRS.
-- baseline_point phải nằm trên đoạn TP hoặc PR thật sự đẳng điện của CÙNG lead/cycle; không đặt trên ST/T.
-- morphology_candidate chỉ là mô tả thị giác đề xuất (ví dụ R, rS, RS, QS, rSR′); code sẽ kiểm tra lại polarity/thứ tự.
-- technical_review phải đánh giá: chất lượng ảnh, chữ tốc độ/gain/test calibration nếu thấy, và dấu gợi ý mắc lộn điện cực. Nếu không đủ dữ liệu, ghi cannot_assess thay vì khẳng định.
-- Không dùng tọa độ landmark để tự tính số ms/mm/mV trong diễn giải. Measurement Core phía code sẽ tính sau.
-"""
 SYSTEM_PROMPT += "\nMEASUREMENT AUTHORITY v11.3: measurements và tọa độ bạn trả chỉ là AI_PROPOSAL. Không được gọi chúng là code đo/xác nhận/verified. RR và ST chỉ được dùng định lượng khi measurement_authority/engine tương ứng PASS. Nếu engine REVIEW/UNRESOLVED, số AI không được dùng hỗ trợ chẩn đoán. Không được khẳng định phenotype T cao/nhọn/đối xứng như đã xác minh khi chưa có T-wave measurement engine; chỉ mô tả impression thị giác và ghi chưa định lượng.\n"
 SYSTEM_PROMPT += "\nJ/ST ENGINE v11.2b: j_st_engine là bằng chứng đo candidate; local grid chỉ đáng tin khi scale đã qua cross-validation major-grid/calibration. Không được gọi ST elevation/depression chỉ từ hình ảnh nếu lead tương ứng không có ST QC=PASS hoặc bác sĩ chưa xác minh. Giá trị st_at_j_small_boxes và J+1/J+2 là độ lệch theo ô nhỏ so với baseline cục bộ, không tự động đồng nghĩa bất thường. Nếu engine UNRESOLVED/REVIEW, mô tả tái cực phải nêu không đủ bằng chứng định lượng. Không suy STEMI/pericarditis/early repolarization từ engine đơn độc.\n"
 SYSTEM_PROMPT += "\nQRS/CENTERLINE v11.2d: qrs_template_landmarks chỉ cung cấp O=onset candidate, J=QRS offset/J candidate và width theo ô nhỏ từ aligned median beats. Không được tự đặt tên Q/R/S/R\'/QS/rS/RS. UNRESOLVED không được hoàn thành. Mọi width vẫn là measurement candidate cho đến khi overlay được bác sĩ xác minh.\n"
@@ -2771,28 +2751,11 @@ def report_schema(region_ids):
         "limitation": text})
     hypothesis = object_schema({"possibility": text, "supporting_evidence": text,
         "opposing_or_missing": text, "verification": text})
-    landmark_quality = {"type":"string","enum":["clear","uncertain","not_visible"]}
-    lead_landmark = object_schema({
-        "lead":{"type":"string","enum":LEADS},
-        "region_id":{"type":"string","enum":region_ids},
-        "cycle_id":text,"quality":landmark_quality,
-        "p_on":point,"p_peak":point,"p_off":point,
-        "qrs_on":point,"q_peak":point,"r_peak":point,"s_peak":point,"r_prime_peak":point,
-        "j_point":point,"t_peak":point,"t_end":point,"baseline_point":point,
-        "morphology_candidate":text,"limitation":text})
-    technical_review = object_schema({
-        "image_suitability":{"type":"string","enum":["adequate","limited","not_an_ecg"]},
-        "calibration_pulse":{"type":"string","enum":["present_plausible","present_uncertain","not_visible"]},
-        "calibration_text":text,
-        "possible_lead_reversal":{"type":"string","enum":["unlikely","possible","cannot_assess"]},
-        "reversal_reason":text,"limitations":text})
     conduction_assessment = object_schema({
         "av_status":{"type":"string","enum":["normal","abnormal","uncertain"]},
         "qrs_status":{"type":"string","enum":["narrow","wide","uncertain"]},
         "pr_measurement_id":text, "qrs_measurement_id":text})
     return object_schema({"quality_summary": text,
-        "technical_review":technical_review,
-        "lead_landmarks":{"type":"array","items":lead_landmark},
         "conduction_assessment":conduction_assessment,
         "summary_measurement_ids":{"type":"array","items":text},
         "lead_features": {"type": "array", "items": feature},
@@ -2829,20 +2792,6 @@ def validate_schema(value, schema, path="report"):
             validate_schema(item, schema["items"], f"{path}[{i}]")
 
 
-def parse_json_object(raw):
-    if len(raw)>250000:
-        raise ValueError("JSON quá dài.")
-    def unique_object(pairs):
-        obj={}
-        for key,value in pairs:
-            if key in obj: raise ValueError("JSON có trường bị lặp.")
-            obj[key]=value
-        return obj
-    value=json.loads(raw,object_pairs_hook=unique_object)
-    if not isinstance(value,dict):
-        raise ValueError("JSON landmark phải là object.")
-    return value
-
 def parse_report(raw, regions):
     if len(raw) > 250000:
         raise ValueError("Báo cáo quá dài.")
@@ -2869,9 +2818,6 @@ def parse_report(raw, regions):
     leads = [f["lead"] for f in data["lead_features"]]
     if sorted(leads) != sorted(LEADS):
         raise ValueError("Bảng 12 chuyển đạo thiếu hoặc lặp nhãn.")
-    landmark_leads = [f["lead"] for f in data["lead_landmarks"]]
-    if sorted(landmark_leads) != sorted(LEADS):
-        raise ValueError("Bảng landmark 12 chuyển đạo thiếu hoặc lặp nhãn.")
     if len(data["hypotheses"]) > 3:
         raise ValueError("Quá nhiều giả thuyết.")
     return data
@@ -3200,11 +3146,7 @@ def arithmetic_checks(data, known, age_years=None):
 
 # ----------------- MỘT YÊU CẦU API CHỨA NHIỀU ẢNH -----------------
 def gemini_config(model_name, thinking, schema=None):
-    # v14.1: use JSON MIME mode only. The full ECG schema is validated locally in Python.
-    # Some multimodal Gemini endpoints reject complex response_json_schema with HTTP 400.
-    options = {"system_instruction": SYSTEM_PROMPT,
-               "max_output_tokens": 12288,
-               "response_mime_type": "application/json"}
+    options = {"system_instruction": SYSTEM_PROMPT, "max_output_tokens": 12288, "response_mime_type": "application/json"}
     if model_name.removeprefix("models/") == GEMINI_MODEL:
         options["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
         options["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
@@ -3212,32 +3154,14 @@ def gemini_config(model_name, thinking, schema=None):
 
 
 def analyze_gemini(api_key, model, regions, prompt, thinking):
-    """v14.2: proven v13 Gemini transport; v14 landmark JSON is validated locally."""
     parts = [types.Part.from_text(text=prompt)]
     for r in regions:
-        png = r.get("png")
-        if not png:
-            image = r.get("image")
-            if image is None:
-                continue
-            buf = io.BytesIO()
-            image.convert("RGB").save(buf, format="PNG")
-            png = buf.getvalue()
-        parts += [
-            types.Part.from_text(text=f"ẢNH {r['id']} — {r['label']}"),
-            types.Part.from_bytes(data=png, mime_type="image/png")
-        ]
-    with genai.Client(
-        api_key=api_key.strip(),
-        http_options=types.HttpOptions(
-            timeout=REQUEST_TIMEOUT_SECONDS*1000,
-            retry_options=types.HttpRetryOptions(attempts=1)
-        )
-    ) as client:
-        response = client.models.generate_content_stream(
-            model=model, contents=parts,
-            config=gemini_config(model, thinking)
-        )
+        parts += [types.Part.from_text(text=f"ẢNH {r['id']} — {r['label']}"),
+                  types.Part.from_bytes(data=r["png"], mime_type="image/png")]
+    with genai.Client(api_key=api_key.strip(), http_options=types.HttpOptions(
+            timeout=REQUEST_TIMEOUT_SECONDS*1000, retry_options=types.HttpRetryOptions(attempts=1))) as client:
+        response = client.models.generate_content_stream(model=model, contents=parts,
+            config=gemini_config(model, thinking, report_schema([r["id"] for r in regions])))
         finished = False
         try:
             for chunk in response:
@@ -3253,6 +3177,7 @@ def analyze_gemini(api_key, model, regions, prompt, thinking):
                 raise RuntimeError("Thiếu tín hiệu hoàn tất báo cáo.")
         finally:
             response.close()
+
 
 def analyze_openai(api_key, model, regions, prompt):
     content = [{"type": "text", "text": prompt}]
@@ -3299,57 +3224,13 @@ def friendly_api_error(error):
     if isinstance(error, TimeoutError) or "timeout" in message or "timed out" in message:
         return "Phân tích quá thời gian chờ. Chưa có báo cáo hoàn chỉnh."
     if code == "400" or "400" in message:
-        return "Yêu cầu bị API từ chối (400). Xem lịch sử route và lỗi chi tiết; không suy đoán nguyên nhân từ mã 400."
+        return "Yêu cầu không được model hỗ trợ hoặc cấu hình chưa phù hợp (400). Model cần hỗ trợ ảnh và JSON Schema."
     return "Phân tích không hoàn tất hoặc dữ liệu trả về không hợp lệ. Không tự gửi lại yêu cầu."
 
 
 # ----------------- NGUỒN API VÀ HẠN MỨC -----------------
-def get_ecg_api_routes_secret():
-    """Read [[ECG_API_ROUTES]] robustly from Streamlit Secrets.
-    Streamlit may expose nested TOML arrays as proxy/list-like objects rather than plain list.
-    """
-    raw=None
-    # Direct access first: do not route this nested structure through scalar-oriented helpers.
-    try:
-        if "ECG_API_ROUTES" in st.secrets:
-            raw=st.secrets["ECG_API_ROUTES"]
-    except Exception:
-        raw=None
-    if raw is None:
-        try:
-            raw=get_secret("ECG_API_ROUTES", None)
-        except Exception:
-            raw=None
-    if raw is None:
-        return []
-
-    # Normalize list/tuple or Streamlit/TOML proxy iterable into plain list[dict].
-    if isinstance(raw,(list,tuple)):
-        items=list(raw)
-    else:
-        try:
-            items=list(raw)
-        except Exception:
-            return []
-
-    out=[]
-    for item in items:
-        try:
-            if isinstance(item,dict):
-                d=dict(item)
-            elif hasattr(item,"to_dict"):
-                d=dict(item.to_dict())
-            elif hasattr(item,"items"):
-                d=dict(item.items())
-            else:
-                continue
-            out.append(d)
-        except Exception:
-            continue
-    return out
-
 def configured_routes(primary_provider, primary_model, thinking, manual_key=""):
-    configured = get_ecg_api_routes_secret()
+    configured = get_secret("ECG_API_ROUTES", [])
     routes = []
     if configured:
         if not isinstance(configured, (list, tuple)) or len(configured) > 12:
@@ -3459,7 +3340,7 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
     fragments, first = [], None
     status = st.empty()
     status.caption("Đang phân tích toàn cảnh và chi tiết trong cùng một yêu cầu...")
-    completed, error, meta, raw_error = False, None, None, None
+    completed, error, meta = False, None, None
     try:
         for text in generator:
             elapsed = time.monotonic()-started
@@ -3475,140 +3356,82 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
     except Exception as exc:
         meta = error_metadata(exc,provider)
         error = friendly_api_error(exc)
-        raw_error = str(exc)[:1800]
     finally:
         generator.close()
     return {"raw_response":"".join(fragments),"api_completed":completed,"error":error,
-        "raw_error":raw_error,"error_meta":meta,"total_seconds":round(time.monotonic()-started,2),
+        "error_meta":meta,"total_seconds":round(time.monotonic()-started,2),
         "first_text_seconds":round(first,2) if first is not None else None}
 
 
-class APIRoutesFailed(RuntimeError):
-    def __init__(self, history):
-        self.history=history
-        super().__init__("Tất cả nguồn API đều thất bại.")
-
-def _safe_route_history(history):
-    safe=[]
-    for h in history or []:
-        x={k:v for k,v in h.items() if k in ("name","model","status","attempt","seconds","http","detail")}
-        d=str(x.get("detail",""))
-        d=re.sub(r'AIza[0-9A-Za-z_-]{15,}', '[REDACTED_API_KEY]', d)
-        d=re.sub(r'AQ\.[0-9A-Za-z_.-]{15,}', '[REDACTED_AUTH_KEY]', d)
-        d=re.sub(r'(?i)(api[_ -]?key\s*[:=]\s*)[^\s,}\]]+', r'\1[REDACTED]', d)
-        x["detail"]=d[:700]
-        safe.append(x)
-    return safe
-
-def _retryable_route_error(exc):
-    # Local code defects must never consume retries/routes.
-    if isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError)):
-        return False
-    t=str(exc).lower()
-    if any(x in t for x in ("api_key_invalid","api key not valid","permission_denied",
-                            "model not found","not_found","unsupported","invalid_argument")):
-        return False
-    return any(x in t for x in ("429","quota","503","504","500","502","unavailable",
-                                "deadline exceeded","timed out","temporar","overload","rate limit"))
-
-def _outcome_error_text(outcome):
-    if not isinstance(outcome,dict):
-        return "invalid_outcome"
-    for key in ("raw_error","error","error_message","message","detail"):
-        value=outcome.get(key)
-        if value:
-            return str(value)
-    # collect_response may keep the original exception/status under diagnostics.
-    for key in ("diagnostics","api_error","failure"):
-        value=outcome.get(key)
-        if value:
-            return str(value)
-    return "api_completed_false_without_error_detail"
-
-def _outcome_http_code(outcome):
-    if not isinstance(outcome,dict):
-        return None
-    for key in ("http_code","status_code","code"):
-        value=outcome.get(key)
-        if value is not None:
-            try:return int(value)
-            except Exception:pass
-    meta=outcome.get("error_meta")
-    if isinstance(meta,dict):
-        for key in ("http_code","status_code","code"):
-            value=meta.get(key)
-            if value is not None:
-                try:return int(value)
-                except Exception:pass
-    text=_outcome_error_text(outcome)
-    import re as _re
-    m=_re.search(r'\b(400|401|403|404|408|409|429|500|502|503|504)\b',text)
-    return int(m.group(1)) if m else None
-
-def run_with_failover(routes, regions, prompt):
-    """v14.4 stable sequential failover.
-    One route at a time. Fixed route error -> next route. Transient -> retry same route up to 3.
-    No shared global budget may prevent later routes from being attempted.
-    """
-    history=[]
+def run_with_failover(routes, regions, prompt, runtime=None, collect=None):
+    runtime = api_runtime() if runtime is None else runtime
+    collect = collect_response if collect is None else collect
+    started = time.monotonic()
+    attempts, calls, visited, visited_keys = [], 0, set(), set()
+    selected = routes[0]
+    outcome = {"raw_response":"","api_completed":False,"error":"Các nguồn đang nghỉ hoặc bận. Xem lịch sử nguồn API.",
+        "error_meta":None,"total_seconds":0,"first_text_seconds":None}
     for route in routes:
-        if route.get("cooldown_until",0)>time.time():
-            history.append({"name":route["name"],"model":route["model"],"status":"Bỏ qua: cooldown",
-                            "attempt":None,"seconds":None,"http":None,"detail":""})
+        if calls >= MAX_ROUTE_ATTEMPTS or time.monotonic()-started >= FAILOVER_BUDGET_SECONDS:
+            break
+        bucket, now = quota_bucket(route), time.time()
+        if bucket in visited or route["key_id"] in visited_keys:
+            attempts.append({"Nguồn":route["name"],"Model":route["model"],"Trạng thái":"Bỏ qua: cùng project/model đã xét"})
             continue
-
-        for attempt in range(1,4):
-            st.caption(f"Đang dùng {route['name']} · {route['model']} · lần {attempt}/3")
-            t0=time.monotonic()
-            try:
-                generator=analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"])
-                # collect_response has its own default STREAM_BUDGET_SECONDS from the proven transport.
-                outcome=collect_response(generator,route["provider"])
-                sec=round(time.monotonic()-t0,2)
-
-                if isinstance(outcome,dict) and outcome.get("api_completed") is True:
-                    history.append({"name":route["name"],"model":route["model"],"status":"Hoàn tất",
-                                    "attempt":attempt,"seconds":sec,"http":_outcome_http_code(outcome),"detail":""})
-                    outcome["route_history"]=_safe_route_history(history)
-                    outcome["request_summary"]={"route":route["name"],"attempt":attempt,
-                                                "images":len(regions),"parallel":False}
-                    return outcome,route
-
-                detail=_outcome_error_text(outcome)
-                code=_outcome_http_code(outcome)
-                fixed=(code in (400,401,403,404,409)) or any(x in detail.lower() for x in
-                       ("invalid_argument","api_key_invalid","permission_denied","not_found","unsupported"))
-                transient=(code in (408,429,500,502,503,504)) or _retryable_route_error(RuntimeError(detail))
-                history.append({"name":route["name"],"model":route["model"],
-                                "status":"Lỗi cố định → route kế" if fixed else
-                                         ("Lỗi tạm thời → retry" if transient else "Lỗi không xác định → route kế"),
-                                "attempt":attempt,"seconds":sec,"http":code,"detail":detail[:700]})
-                if fixed or not transient:
-                    break
-                if attempt<3:
-                    time.sleep(min(2**(attempt-1),4))
-
-            except Exception as exc:
-                sec=round(time.monotonic()-t0,2)
-                if isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError)):
-                    history.append({"name":route["name"],"model":route["model"],"status":"Lỗi code local — dừng",
-                                    "attempt":attempt,"seconds":sec,"http":None,"detail":str(exc)[:700]})
-                    raise RuntimeError("Lỗi code local; không gọi thêm API: "+str(exc)) from exc
-                retryable=_retryable_route_error(exc)
-                history.append({"name":route["name"],"model":route["model"],
-                                "status":"Lỗi tạm thời → retry" if retryable else "Lỗi cố định → route kế",
-                                "attempt":attempt,"seconds":sec,"http":None,"detail":str(exc)[:700]})
-                if not retryable:
-                    break
-                if attempt<3:
-                    time.sleep(min(2**(attempt-1),4))
-
-        # IMPORTANT: execution reaches here after break from attempt loop and continues next route.
-        continue
-
-    raise APIRoutesFailed(_safe_route_history(history))
+        visited.add(bucket)
+        visited_keys.add(route["key_id"])
+        with runtime["lock"]:
+            # Bounded state: expired entries don't survive indefinitely.
+            for field in ("cooldowns","inflight","invalid_keys"):
+                for key, expiry in list(runtime[field].items()):
+                    if expiry <= now: del runtime[field][key]
+            expiry = max(runtime["cooldowns"].get(bucket,0),runtime["invalid_keys"].get(route["key_id"],0))
+            busy = runtime["inflight"].get(bucket,0) > now
+            if expiry <= now and not busy:
+                runtime["inflight"][bucket] = now+FAILOVER_BUDGET_SECONDS+REQUEST_TIMEOUT_SECONDS+30
+        if expiry > now or busy:
+            label = "Bỏ qua: nguồn đang xử lý yêu cầu khác" if busy else "Bỏ qua: nguồn đang trong thời gian nghỉ"
+            attempts.append({"Nguồn":route["name"],"Model":route["model"],"Trạng thái":label})
+            continue
+        selected, calls = route, calls+1
+        st.caption(f"Đang dùng {route['name']} · {route['model']} · lần gọi {calls}/{MAX_ROUTE_ATTEMPTS}")
+        try:
+            generator = analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"]) if route["provider"] == "Google Gemini" else analyze_openai(route["key"],route["model"],regions,prompt)
+            remaining = max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-started))
+            outcome = collect(generator,route["provider"],min(STREAM_BUDGET_SECONDS,remaining))
+        finally:
+            with runtime["lock"]:
+                runtime["inflight"].pop(bucket,None)
+        meta = outcome.get("error_meta") or {}
+        attempts.append({"Nguồn":route["name"],"Model":route["model"],"Trạng thái":"Hoàn tất" if outcome["api_completed"] else meta.get("message","Không hoàn tất"),
+            "HTTP":meta.get("http_status",""),"Giây":outcome["total_seconds"]})
+        if outcome["api_completed"]:
+            break
+        kind = meta.get("kind")
+        now = time.time()
+        with runtime["lock"]:
+            if kind == "daily_quota":
+                until = now+meta["retry_seconds"]+2 if meta.get("retry_seconds") else next_daily_reset(now) if route["provider"] == "Google Gemini" else now+86400
+                runtime["cooldowns"][bucket] = until
+            elif kind in ("rate_limit","unavailable","billing_quota"):
+                delay = max(meta.get("retry_seconds",0),86400 if kind == "billing_quota" else 60)
+                runtime["cooldowns"][bucket] = now+delay
+            elif kind == "auth":
+                runtime["invalid_keys"][route["key_id"]] = now+300
+        # A timeout may already have consumed quota. Never multiply it automatically.
+        # A partial response or invalid completed JSON also NEVER triggers failover.
+        if outcome["raw_response"] or kind not in ("daily_quota","rate_limit","unavailable","billing_quota","auth"):
+            break
+    outcome["attempts"] = attempts
+    outcome["api_calls"] = calls
+    outcome["total_seconds"] = round(time.monotonic()-started,2)
+    return outcome,selected
 
 
+# ----------------- HIỂN THỊ VÀ XUẤT ĐỐI CHIẾU -----------------
+
+
+# ===== v14 landmark deterministic measurement helpers =====
 def _point_to_px(point, region):
     if not isinstance(point, dict):
         return None
@@ -3621,7 +3444,6 @@ def _point_to_px(point, region):
         return np.array([x, y], float)
     except Exception:
         return None
-
 
 def _region_grid_map(regions, ecg_image):
     """Detect local 1-mm grid in source pixels, then convert it to the exact sent-image coordinate system."""
@@ -3653,12 +3475,10 @@ def _region_grid_map(regions, ecg_image):
                             "detail": type(e).__name__}
     return out
 
-
 def _lead_gain(lead, known):
     if lead in ("I", "II", "III", "aVR", "aVL", "aVF"):
         return known.get("limb_mm_mv")
     return known.get("chest_mm_mv")
-
 
 def _morphology_from_landmarks(lm, region):
     base = _point_to_px(lm.get("baseline_point"), region)
@@ -3682,40 +3502,6 @@ def _morphology_from_landmarks(lm, region):
     return {"status": "PASS" if ok else "REVIEW", "sequence": "-".join(seq),
             "candidate": lm.get("morphology_candidate", ""),
             "reason": None if ok else "landmark_polarity_conflict"}
-
-
-V14_LEADS = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
-V14_LANDMARK_KEYS = ["p_on","p_peak","p_off","qrs_on","q_peak","r_peak","s_peak","r_prime_peak","j_point","t_peak","t_end","baseline_point"]
-
-def normalize_v14_landmark_response(data, regions):
-    if not isinstance(data,dict): data={}
-    issues=[]; raw=data.get("lead_landmarks")
-    if not isinstance(raw,list): raw=[]; issues.append("lead_landmarks_missing")
-    region_ids={r.get("id") for r in regions}; bylead={}
-    for item in raw:
-        if not isinstance(item,dict): continue
-        lead=str(item.get("lead","")).strip()
-        if lead not in V14_LEADS or lead in bylead: continue
-        x=dict(item); x["lead"]=lead
-        if x.get("region_id") not in region_ids:
-            x["quality"]="not_visible"; issues.append(lead+":invalid_region")
-        if x.get("quality") not in ("clear","review","not_visible"): x["quality"]="review"
-        for k in V14_LANDMARK_KEYS:
-            p=x.get(k)
-            try:
-                xp=float(p["x_pct"]); yp=float(p["y_pct"])
-                if not (0<=xp<=100 and 0<=yp<=100): raise ValueError
-                x[k]={"x_pct":xp,"y_pct":yp}
-            except Exception: x[k]=None
-        bylead[lead]=x
-    for lead in V14_LEADS:
-        if lead not in bylead:
-            z={"lead":lead,"region_id":None,"cycle_id":None,"quality":"not_visible","morphology_candidate":None,"limitation":"AI did not return this lead"}
-            for k in V14_LANDMARK_KEYS: z[k]=None
-            bylead[lead]=z; issues.append(lead+":missing")
-    tech=data.get("technical_review")
-    if not isinstance(tech,dict): tech={"image_readable":None,"calibration_visible":None,"lead_reversal_suspicion":"cannot_assess","notes":"not returned"}
-    return {"technical_review":tech,"lead_landmarks":[bylead[x] for x in V14_LEADS]},issues
 
 def build_v14_measurement_authority(data, regions, ecg_image, known):
     """v14.1: AI identifies landmarks; deterministic code measures them in the sent-image coordinate system."""
@@ -3855,7 +3641,48 @@ def _annotate_v14_landmarks(region, lm):
         pass
     return img
 
-# ----------------- HIỂN THỊ VÀ XUẤT ĐỐI CHIẾU -----------------
+V14_LEADS = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+V14_LANDMARK_KEYS = ["p_on","p_peak","p_off","qrs_on","q_peak","r_peak","s_peak","r_prime_peak","j_point","t_peak","t_end","baseline_point"]
+
+def normalize_v14_landmark_response(data, regions):
+    if not isinstance(data,dict): data={}
+    raw=data.get("lead_landmarks")
+    if not isinstance(raw,list): raw=[]
+    region_ids={r.get("id") for r in regions}; bylead={}; issues=[]
+    for item in raw:
+        if not isinstance(item,dict): continue
+        lead=str(item.get("lead","")).strip()
+        if lead not in V14_LEADS or lead in bylead: continue
+        x=dict(item)
+        if x.get("region_id") not in region_ids:
+            x["quality"]="not_visible"; issues.append(lead+":invalid_region")
+        if x.get("quality") not in ("clear","review","not_visible"): x["quality"]="review"
+        for k in V14_LANDMARK_KEYS:
+            p=x.get(k)
+            try:
+                xp=float(p["x_pct"]); yp=float(p["y_pct"])
+                if not (0<=xp<=100 and 0<=yp<=100): raise ValueError
+                x[k]={"x_pct":xp,"y_pct":yp}
+            except Exception: x[k]=None
+        bylead[lead]=x
+    for lead in V14_LEADS:
+        if lead not in bylead:
+            z={"lead":lead,"region_id":None,"cycle_id":None,"quality":"not_visible",
+               "morphology_candidate":None,"limitation":"AI did not return this lead"}
+            for k in V14_LANDMARK_KEYS:z[k]=None
+            bylead[lead]=z; issues.append(lead+":missing")
+    tech=data.get("technical_review")
+    if not isinstance(tech,dict):
+        tech={"image_readable":None,"calibration_visible":None,
+              "lead_reversal_suspicion":"cannot_assess","notes":"not returned"}
+    return {"technical_review":tech,"lead_landmarks":[bylead[x] for x in V14_LEADS]},issues
+
+def parse_v14_landmark_json(raw, regions):
+    if len(raw)>250000: raise ValueError("JSON landmark quá dài.")
+    data=json.loads(raw)
+    return normalize_v14_landmark_response(data,regions)
+
+
 def observation_rows(data, regions):
     labels = {r["id"]: r["label"] for r in regions}
     return [{"Vùng": labels[o["region_id"]], "Nhãn AI đọc": ", ".join(o["visible_leads"]),
@@ -3947,28 +3774,6 @@ def render_result(result):
         st.caption("Không hiển thị JSON dở dang như một kết luận. Có thể tải gói đối chiếu để kiểm tra.")
     else:
         st.write(data["quality_summary"])
-        _v14 = result.get("v14_measurement_authority") or {}
-        _tc = data.get("technical_review") or {}
-        st.subheader("v14.1 — AI Landmark → Scale-safe Deterministic Measurement")
-        _c = st.columns(4)
-        _c[0].metric("Measurement QC", _v14.get("status", "UNRESOLVED"))
-        _c[1].metric("PASS leads", _v14.get("pass_count", 0))
-        _c[2].metric("REVIEW leads", _v14.get("review_count", 0))
-        _c[3].metric("Ảnh", _tc.get("image_suitability", "—"))
-        st.caption(f"Calibration: {_tc.get('calibration_pulse','—')} · Lead reversal: {_tc.get('possible_lead_reversal','—')}")
-        if _tc.get("reversal_reason"):
-            st.caption("Điện cực: " + _tc.get("reversal_reason"))
-        if _v14.get("rows"):
-            st.dataframe(_v14["rows"], hide_index=True, use_container_width=True)
-        with st.expander("AI landmark overlay — đề xuất để bác sĩ kiểm tra", expanded=True):
-            _lms = {x["lead"]: x for x in data.get("lead_landmarks", [])}
-            _lead = st.selectbox("Chọn lead", LEADS, key="v14_landmark_lead_" + result["signature"][:12])
-            _lm = _lms.get(_lead)
-            if _lm:
-                _reg = next((r for r in result["regions"] if r["id"] == _lm.get("region_id")), None)
-                if _reg:
-                    st.image(_annotate_v14_landmarks(_reg, _lm), width="stretch")
-                    st.caption(f"{_lead} · {_lm.get('quality')} · AI morphology candidate: {_lm.get('morphology_candidate') or '—'} · {_lm.get('limitation') or ''}")
         st.subheader("Bảng quan sát từng nhóm")
         st.dataframe(observation_rows(data, result["regions"]), hide_index=True)
         with st.expander("Chuẩn ghi AI đề xuất — chưa xác minh"):
@@ -4298,8 +4103,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.4.2 thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · Waveform Bridge + Independent QRS Morphology")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v13.7.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4319,25 +4124,18 @@ with st.sidebar:
         model = st.text_input("Model chính", value=get_secret("GEMINI_MODEL", GEMINI_MODEL) if provider == "Google Gemini" else get_secret("OPENAI_MODEL", "gpt-4o"), key="model_v9_"+provider).strip()
         thinking = st.selectbox("Mức suy luận Gemini 3.6 Flash", ["medium", "high", "low"], key="thinking_v9")
         auto_failover = True
-        st.caption("Failover tuần tự: BẬT bắt buộc khi đã khai báo ECG_API_ROUTES.")
+        st.caption("Failover tuần tự: BẬT · dùng toàn bộ ECG_API_ROUTES đã khai báo.")
         allow_other_provider = st.checkbox("Cho phép gửi ảnh sang nhà cung cấp khác khi dự phòng", value=False, key="cross_provider_v9")
         manual_key = ""
         if not get_secret("ECG_API_ROUTES", []) and not get_secret("GEMINI_API_KEY" if provider == "Google Gemini" else "OPENAI_API_KEY", ""):
             manual_key = st.text_input("API key chính", type="password", key="manual_key_v9")
         try:
             routes = configured_routes(provider, model, thinking, manual_key)
-            # v14.4.2 loader diagnostic: names/count only, never keys.
-            _secret_routes = get_ecg_api_routes_secret()
-            st.caption(f"Secrets ECG_API_ROUTES: {len(_secret_routes)} · Loaded routes: {len(routes)}")
-            if _secret_routes:
-                st.caption("Secrets routes: " + " → ".join(str(x.get("name","(không tên)")) for x in _secret_routes))
-
+            st.caption(f"v13-base routes loaded: {len(routes)} · " + " → ".join(r["name"] for r in routes))
             if not allow_other_provider:
                 routes = [r for r in routes if r["provider"] == provider]
-            # v14.4.1: never silently truncate configured backup routes.
-            st.caption(f"Loaded routes: {len(routes)}")
-            st.caption("Thứ tự failover: " + (" → ".join(r["name"] + " (" + r["model"] + ")" for r in routes) or "Chưa có nguồn API"))
-            st.caption("Mỗi route: lỗi tạm thời retry tối đa 3 lần; lỗi cố định chuyển ngay route kế. Thành công thì dừng. Không gọi song song.")
+            st.caption("Thứ tự: " + (" → ".join(r["name"] + " (" + r["model"] + ")" for r in routes) or "Chưa có nguồn API"))
+            st.caption("Tối đa 3 lần gọi/lượt. Bỏ qua quota đang nghỉ; không đổi key cùng project để vượt quota. Không gửi lại khi báo cáo dở dang hoặc sai cấu trúc.")
             runtime = api_runtime()
             with runtime["lock"]:
                 for r in routes:
@@ -4563,34 +4361,28 @@ else:
     qrs_morphology_authority=build_qrs_morphology_authority(digitizer_result,digitizer_evidence,ecg)
     if digitizer_evidence is not None:
         digitizer_evidence["qrs_morphology_authority"]=qrs_morphology_authority
-    show_legacy_qc = st.checkbox(
-        "Hiển thị bộ detector thử nghiệm v13 (debug)",
-        value=False,
-        help="Mặc định tắt; chỉ bật để debug/đối chiếu. Không phải reader chính v14."
-    )
-    if show_legacy_qc:
-        st.markdown("**Experimental QC — legacy waveform detector (không phải reader chính v14)**")
-        _qm=qrs_morphology_authority or {}
-        _qc=st.columns(4)
-        _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
-        _qc[1].metric("PASS leads",_qm.get("pass_count",0))
-        _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
-        _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
-        st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
-        with st.expander("Experimental waveform QC visual audit",expanded=False):
-            for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
-                _ev=(_qm.get("leads") or {}).get(_lead,{})
-                _tw=_ev.get("template_wave")
-                if not _tw: continue
-                _win={"on":_ev.get("template_qrs_on"),"off":_ev.get("template_qrs_off")}
-                _img=_morphology_audit_image(np.asarray(_tw,float),_win,_ev)
-                if _img is not None:
-                    st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
-                    st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
-        if _qm.get("status")=="UNRESOLVED":
-            st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
-        with st.expander("Experimental waveform QC evidence",expanded=False):
-            st.json(_qm)
+    st.markdown("**v13.7.1 — QRS Identity + Schema-safe Authority Sanitizer**")
+    _qm=qrs_morphology_authority or {}
+    _qc=st.columns(4)
+    _qc[0].metric("Overall",_qm.get("status","UNRESOLVED"))
+    _qc[1].metric("PASS leads",_qm.get("pass_count",0))
+    _qc[2].metric("REVIEW leads",_qm.get("review_count",0))
+    _qc[3].metric("Resolved",_qm.get("pass_count",0)+_qm.get("review_count",0))
+    st.dataframe(qrs_morphology_table_rows(_qm),use_container_width=True,hide_index=True)
+    with st.expander("v13.7.1 QRS-identity + full-QRS visual audit",expanded=True):
+        for _lead in ("I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"):
+            _ev=(_qm.get("leads") or {}).get(_lead,{})
+            _tw=_ev.get("template_wave")
+            if not _tw: continue
+            _win={"on":_ev.get("template_qrs_on"),"off":_ev.get("template_qrs_off")}
+            _img=_morphology_audit_image(np.asarray(_tw,float),_win,_ev)
+            if _img is not None:
+                st.markdown(f"**{_lead} · {_ev.get('status')} · morphology candidate: {_ev.get('morphology','—')}**")
+                st.image(_img,caption=f"{_lead}: canonical ECG-y · positive=UP · thick lines=QRS boundaries · component labels shown at peaks · polarity={(_ev.get('polarity_audit') or {}).get('dominant_polarity','—')}",width="stretch")
+    if _qm.get("status")=="UNRESOLVED":
+        st.info("v13.6 chưa resolve đủ lead. QRS identity gate phải loại T-like candidates trước phase-lock; không nới threshold để ép morphology PASS.")
+    with st.expander("v13.7.1 QRS identity + morphology evidence",expanded=False):
+        st.json(_qm)
     st.caption(f"Sẽ gửi {len(regions)} ảnh trong mỗi lần gọi; bình thường 1 lần, tối đa 3 nếu cần dự phòng. Ảnh chi tiết được cắt từ ảnh gốc trước khi thu nhỏ. Nhiều ảnh có thể tăng token, chi phí và thời gian. Khi phân tích, ảnh và thông tin ca được gửi đến các nguồn được liệt kê trong Thiết lập AI.")
     if median_landmark_authority:
         if digitizer_evidence is not None:
@@ -4685,34 +4477,23 @@ else:
             st.warning("Cần thiết lập model và API key trong Thiết lập AI.")
         else:
             st.session_state.pop("last_report_v9",None)
-            st.caption(f"Routes sẵn sàng cho lượt này: {len(routes)} · " + " → ".join(r["name"] for r in routes))
-            try:
-                outcome, selected = run_with_failover(routes, regions, prompt)
-            except APIRoutesFailed as exc:
-                st.error("Không nguồn API nào hoàn tất lượt landmark. Chi tiết từng route:")
-                hist=_safe_route_history(exc.history)
-                if hist:
-                    st.dataframe(hist, width="stretch", hide_index=True)
-                else:
-                    st.warning("Không có lịch sử route — lỗi xảy ra trước khi gọi API.")
-                st.stop()
-            except Exception as exc:
-                st.error(f"Lỗi local trước khi có báo cáo AI: {type(exc).__name__}: {str(exc)[:700]}")
-                st.stop()
+            outcome, selected = run_with_failover(routes, regions, prompt)
             actual_provider, actual_model = selected["provider"], selected["model"]
             actual_thinking = selected["thinking"]
             data, checks = None, None
-            sanitizer_audit = None
             v14_measurement_authority = None
+            sanitizer_audit = None
             if outcome["api_completed"]:
                 try:
-                    raw_data = parse_json_object(outcome["raw_response"])
-                    data, landmark_parse_issues = normalize_v14_landmark_response(raw_data, regions)
+                    data, landmark_parse_issues = parse_v14_landmark_json(outcome["raw_response"],regions)
                     checks = {"landmark_parse_issues": landmark_parse_issues}
+                    v14_measurement_authority = build_v14_measurement_authority(
+                        data, regions, ecg_image,
+                        {"speed_mm_s":speed,"limb_gain_mm_mv":limb_gain,"chest_gain_mm_mv":chest_gain}
+                    )
                     # Schema is now proven valid. Sanitize only user-visible semantic content.
                     data, sanitizer_audit = _sanitize_ai_result_v137(
                         data,rr_authority,median_landmark_authority,qrs_morphology_authority,None,None)
-                    v14_measurement_authority = build_v14_measurement_authority(data, regions, ecg, known)
                     checks = arithmetic_checks(data,known,age_years=age)
                     authority_report = measurement_authority_conflicts(data,rr_authority,j_st_evidence)
                     # Authority warnings are separate from arithmetic consistency:
@@ -4732,7 +4513,6 @@ else:
                 "prompt_sha256":hashlib.sha256(prompt.encode()).hexdigest(),"app_version":APP_VERSION,
                 "prompt_version":PROMPT_VERSION,"system_prompt":SYSTEM_PROMPT,"source_sha256":upload_sha,"context":context,
                 "authority_sanitizer":sanitizer_audit,
-                "v14_measurement_authority":v14_measurement_authority,
                 "digitizer":digitizer_evidence,"ocr_evidence":ocr_evidence,
                 "measurement_authority":{"rr":rr_authority,"intervals":interval_authority,"median_landmarks":median_landmark_authority,"qrs_morphology":qrs_morphology_authority,
                     "conflicts": measurement_authority_conflicts(data,rr_authority,j_st_evidence) if data else None},
