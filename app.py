@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v16.1-constrained-three-track-edge-clock"
+APP_VERSION = "v17.0-ecg-ink-segmentation"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -4113,6 +4113,170 @@ def v161_contact_sheet(track_regions,results):
     for im in scaled:out.paste(im,(0,y));y+=im.height+8
     return out
 # ================= END v16.1 =================
+
+
+# ================= v17.0 ECG INK SEGMENTATION VALIDATION =================
+def _v17_morph_skeleton(mask):
+    """Binary morphological skeleton. No synthetic interpolation or DP path."""
+    img=(mask.astype(np.uint8)*255)
+    skel=np.zeros_like(img)
+    element=cv2.getStructuringElement(cv2.MORPH_CROSS,(3,3))
+    for _ in range(max(32,min(320,max(img.shape)))):
+        opened=cv2.morphologyEx(img,cv2.MORPH_OPEN,element)
+        skel=cv2.bitwise_or(skel,cv2.subtract(img,opened))
+        img=cv2.erode(img,element)
+        if cv2.countNonZero(img)==0: break
+    return skel>0
+
+
+def _v17_black_ink_probability(pil_img):
+    """Prefer neutral dark ink and suppress saturated red/pink ECG grid."""
+    rgb=np.asarray(pil_img.convert('RGB'),dtype=np.uint8)
+    hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
+    lab=cv2.cvtColor(rgb,cv2.COLOR_RGB2LAB)
+    H,S,V=[x.astype(np.float32) for x in cv2.split(hsv)]
+    L,A,B=[x.astype(np.float32) for x in cv2.split(lab)]
+    darkness=(255.0-V)/255.0
+    neutral=1.0-S/255.0
+    # Lab a-channel rises for red grid; black/gray waveform stays close to neutral 128.
+    red_pen=np.clip((A-132.0)/55.0,0,1)
+    prob=darkness*(0.35+0.65*neutral)*(1.0-0.82*red_pen)
+    # Very dark neutral pixels remain eligible even if local colour cast is present.
+    prob=np.maximum(prob,((V<92)&(S<135)).astype(np.float32)*0.72)
+    return np.clip(prob,0,1)
+
+
+def _v17_segment_region(region, expected_x=None):
+    """Segment ECG ink in one lead band; retain morphology, do not force a 1-D path."""
+    pil=_region_pil_image(region).convert('RGB'); arr=np.asarray(pil)
+    h,w=arr.shape[:2]
+    prob=_v17_black_ink_probability(pil)
+    # Adaptive but bounded threshold: low-voltage gray ink must survive.
+    central=prob[int(.08*h):max(int(.09*h),int(.92*h)), int(.04*w):max(int(.05*w),int(.96*w))]
+    q=float(np.percentile(central,82)) if central.size else .24
+    thr=float(np.clip(0.72*q,0.18,0.34))
+    mask=prob>=thr
+    # Exclude crop borders/lead labels; right calibration is handled component-wise below.
+    mask[:max(2,int(.025*h)),:]=False; mask[-max(2,int(.025*h)):,:]=False
+    mask[:,:max(3,int(.035*w))]=False
+    # Remove red-grid residue / isolated dots, then reconnect thin black ECG strokes locally.
+    u=(mask.astype(np.uint8)*255)
+    u=cv2.morphologyEx(u,cv2.MORPH_OPEN,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2,2)))
+    u=cv2.morphologyEx(u,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)))
+    # Connected-component selection. Keep horizontally useful ink and components supported at heartbeat windows.
+    n,labels,stats,cents=cv2.connectedComponentsWithStats((u>0).astype(np.uint8),8)
+    expected=[int(x) for x in (expected_x or []) if 0<=int(x)<w]
+    rad=max(7,int(.035*w)); keep=np.zeros(n,dtype=bool); component_meta=[]
+    for k in range(1,n):
+        x,y,ww,hh,area=[int(v) for v in stats[k]]
+        if area<max(8,int(.00008*w*h)): continue
+        hits=sum(1 for t in expected if x-rad<=t<=x+ww+rad)
+        span=ww/max(1,w); aspect=ww/max(1,hh)
+        # Text tends to be compact; ECG fragments are horizontally elongated or heartbeat-supported.
+        ok=(span>=.055 and aspect>=.55) or hits>=1 or (area>=.0012*w*h and span>=.025)
+        # Reject tall calibration-like blocks near the far right unless they also span useful waveform width.
+        cal_like=(x>.72*w and hh>.28*h and ww<.16*w)
+        if cal_like and hits==0: ok=False
+        if ok:
+            keep[k]=True
+            component_meta.append({'x':x,'y':y,'w':ww,'h':hh,'area':area,'heartbeat_hits':hits})
+    selected=keep[labels]
+    # A modest horizontal close joins waveform fragments across grid erasure without inventing long gaps.
+    sel=(selected.astype(np.uint8)*255)
+    sel=cv2.morphologyEx(sel,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(5,1)))
+    skeleton=_v17_morph_skeleton(sel>0)
+    # QC: heartbeat windows should contain skeleton/ink; skeleton must have meaningful horizontal coverage.
+    beat_hits=[]
+    for t in expected:
+        a=max(0,t-rad); b=min(w,t+rad+1)
+        beat_hits.append(bool(np.any(skeleton[:,a:b])))
+    col_cov=float(np.mean(np.any(skeleton,axis=0))) if w else 0.0
+    ink_fraction=float(np.mean(sel>0))
+    beat_ratio=float(np.mean(beat_hits)) if beat_hits else 0.0
+    # Penalize implausibly dense masks (text/fold contamination) and nearly empty masks.
+    density_ok=.0005<=ink_fraction<=.16
+    status='PASS' if density_ok and col_cov>=.28 and (not expected or beat_ratio>=.75) else 'REVIEW'
+    reason=[]
+    if not density_ok: reason.append('mask_density')
+    if col_cov<.28: reason.append('skeleton_horizontal_coverage')
+    if expected and beat_ratio<.75: reason.append('heartbeat_anchor_coverage')
+    return {'lead':region.get('lead'),'status':status,'threshold':round(thr,3),
+            'mask_ink_fraction':round(ink_fraction,4),'skeleton_column_coverage':round(col_cov,3),
+            'heartbeat_anchor_hit_ratio':round(beat_ratio,3),'heartbeat_hits':beat_hits,
+            'heartbeat_clock_expected_x':expected,'review_reason':','.join(reason) or None,
+            'component_count':int(len(component_meta)),'components':component_meta,
+            '_mask':sel>0,'_skeleton':skeleton}
+
+
+def _v17_group_regions(selected_groups, rhythm_region, rr):
+    """Use hard ordered thirds of each verified group; segmentation decides ink, not DP."""
+    lead_map={'group_1':['I','II','III'],'group_2':['aVR','aVL','aVF'],
+              'group_3':['V1','V2','V3'],'group_4':['V4','V5','V6']}
+    detected=_v160_clock_global_x(rhythm_region,rr)
+    clock_global,pred_global=_v161_extend_clock_global(detected,rhythm_region,rr,selected_groups)
+    regions=[]; results=[]; groups=[]
+    for g in selected_groups:
+        leads=lead_map.get(g.get('id'))
+        if not leads: continue
+        img=_region_pil_image(g); H,W=img.height,img.width
+        expected=_v160_project_clock_to_group(g,clock_global,W)
+        pred_local=_v160_project_clock_to_group(g,pred_global,W)
+        bands=[]
+        for i,lead in enumerate(leads):
+            # Midpoint topology only: no DP-selected vertical band.
+            y0=int(round(i*H/3)); y1=int(round((i+1)*H/3))
+            # Small inset prevents boundary ink from adjacent row while preserving tall QRS.
+            inset=max(0,int(.015*H))
+            lo=y0+(inset if i>0 else 0); hi=y1-(inset if i<2 else 0)
+            reg=_v160_region_from_group_band(g,lead,lo,hi)
+            res=_v17_segment_region(reg,expected)
+            res['source_group']=g.get('id'); res['band_y']=[lo,hi]
+            res['heartbeat_clock_predicted_edge_x']=list(pred_local)
+            regions.append(reg); results.append(res); bands.append([lo,hi])
+        groups.append({'group':g.get('id'),'box_pixels':g.get('box_pixels'),'clock_expected_x':expected,
+                       'clock_predicted_edge_x':pred_local,'lead_set':leads,'hard_third_bands':bands})
+    return regions,results,{'clock_detected_global_x':[round(x,2) for x in detected],
+        'clock_global_x':[round(x,2) for x in clock_global],
+        'clock_predicted_edge_global_x':[round(x,2) for x in pred_global],
+        'groups':groups,'rhythm_status':(rr or {}).get('status'),'rhythm_rr_px':(rr or {}).get('median_rr_px')}
+
+
+def v17_segmentation_overlay(region,res):
+    img=_region_pil_image(region).convert('RGBA'); a=np.asarray(img).copy(); h,w=a.shape[:2]
+    mask=res.get('_mask'); sk=res.get('_skeleton')
+    if isinstance(mask,np.ndarray) and mask.shape==(h,w):
+        # translucent green = selected ECG ink mask
+        a[mask,1]=np.maximum(a[mask,1],190); a[mask,3]=255
+    out=Image.fromarray(a,'RGBA'); d=ImageDraw.Draw(out,'RGBA')
+    if isinstance(sk,np.ndarray) and sk.shape==(h,w):
+        yy,xx=np.where(sk); 
+        for x,y in zip(xx.tolist(),yy.tolist()): d.point((x,y),fill=(0,90,255,245))
+    for x in res.get('heartbeat_clock_expected_x') or []:
+        d.line((int(x),0,int(x),h-1),fill=(150,40,180,150),width=1)
+    for x in res.get('heartbeat_clock_predicted_edge_x') or []:
+        d.line((int(x),0,int(x),h-1),fill=(190,20,190,230),width=2)
+    d.rectangle((0,0,min(w-1,820),31),fill=(255,255,255,240))
+    d.text((6,6),f"v17 {res.get('lead')} | {res.get('status')} | mask {res.get('mask_ink_fraction')} | skelCov {res.get('skeleton_column_coverage')} | beatHit {res.get('heartbeat_anchor_hit_ratio')}",fill=(0,0,0,255))
+    return out.convert('RGB')
+
+
+def v17_contact_sheet(regions,results):
+    by={r.get('lead'):r for r in results}; ims=[]
+    for reg in regions:
+        rr=by.get(reg.get('lead'))
+        if rr: ims.append(v17_segmentation_overlay(reg,rr))
+    if not ims:return None
+    target=900; scaled=[]
+    for im in ims:
+        hh=max(1,int(im.height*target/im.width)); scaled.append(im.resize((target,hh)))
+    out=Image.new('RGB',(target,sum(x.height+8 for x in scaled)),'white'); y=0
+    for im in scaled: out.paste(im,(0,y)); y+=im.height+8
+    return out
+
+
+def _v17_public_result(res):
+    return {k:v for k,v in res.items() if not k.startswith('_')}
+# ================= END v17.0 =================
 
 def v160_waveform_overlay(region,res):
     from PIL import ImageDraw
@@ -6002,57 +6166,49 @@ else:
                     with _cc[_j]:
                         st.image(_r["png"],caption=_r["lead"],width="stretch")
 
-        # v16.0 Group-Synchronous Engine — architecture validation before PQRST measurement.
-        st.markdown("### v16.1 — Constrained 3-Track + Edge Heartbeat Clock")
-        st.caption("AUTO-first: Rhythm II tạo heartbeat clock; clock được extrapolate có kiểm chứng ở mép. Mỗi group chọn 3 track có thứ tự hàng cố định bằng morphology tại heartbeat windows; lead không được tự tạo heartbeat. Không dùng landmark Gemini, chưa đo P/T/PR/QT.")
+        # v17.0 ECG Ink Segmentation — validate mask/skeleton before any 1-D waveform/PQRST.
+        st.markdown("### v17.0 — ECG Ink Segmentation Validation")
+        st.caption("Giữ heartbeat clock v16.1; bỏ DP waveform tracker. Pipeline mới: suppress grid đỏ → neutral-dark ECG ink mask → connected-component selection bằng heartbeat anchors → skeleton. Chưa nội suy waveform 1-D, chưa đo PQRST.")
 
-        # v16 does NOT depend on the manual Rhythm-II sliders above. It re-detects from the automatic proposal.
-        _v16_rhythm,_v16_rr,_v16_rmeta=v160_auto_rhythm_region(
+        _v17_rhythm,_v17_rr,_v17_rmeta=v160_auto_rhythm_region(
             ecg,auto_rhythm_box,enhance,_normalize_paper_speed(speed))
-        if _v16_rhythm is not None:
-            st.image(_v16_rhythm["png"],caption=f"Rhythm II AUTO adaptive-height · QC {_v16_rr.get('status')} · R accepted {_v16_rr.get('r_accepted')} · RRcv {_v16_rr.get('snapped_rr_cv')}",width="stretch")
+        if _v17_rhythm is not None:
+            st.image(_v17_rhythm["png"],caption=f"Rhythm II clock giữ từ v16.1 · QC {_v17_rr.get('status')} · R accepted {_v17_rr.get('r_accepted')} · RRcv {_v17_rr.get('snapped_rr_cv')}",width="stretch")
         else:
-            st.error("v16 không tự dựng được Rhythm II.")
+            st.error("v17 không tự dựng được Rhythm II.")
 
-        # Selected candidate A/B/C/D remains a rescue/audit layer; default A requires no manual work.
-        _v16_tracks,_v16_results,_v16_meta=v161_group_synchronous_engine(_selected_groups,_v16_rhythm,_v16_rr)
-        _v16_by={x.get("lead"):x for x in _v16_results}
-        _v16_lead=st.selectbox("Lead kiểm tra v16",[r["lead"] for r in _v16_tracks],key="v16_waveform_lead_"+frame_id)
-        _v16_reg=next(r for r in _v16_tracks if r["lead"]==_v16_lead)
-        _v16_res=_v16_by[_v16_lead]
-        if _v16_res.get("status")!="ERROR":
-            st.image(v161_waveform_overlay(_v16_reg,_v16_res),caption="Xanh = waveform; tím = clock từ Rhythm II; tím đậm = heartbeat extrapolate ở mép; cam = QRS có morphology evidence. Ba track bị khóa thứ tự hàng.",width="stretch")
-        else: st.error(_v16_res.get("error"))
-        st.dataframe([{k:v for k,v in x.items() if k in (
-            "lead","source_group","status","support","continuity","heartbeat_clock_expected_x",
-            "qrs_candidates_local_raw_x","qrs_candidates_x","clock_alignment_error_px","clock_hit_ratio",
-            "corridor_y","calibration_exclusion_x","heartbeat_clock_predicted_edge_x","beat_morphology_evidence","v161_track_band","v161_review_reason","error")} for x in _v16_results],hide_index=True,width="stretch")
-
-        with st.expander("v16 heartbeat clock / geometry audit",expanded=False):
-            st.json({"rhythm_meta":_v16_rmeta,"rhythm_rr":{k:_v16_rr.get(k) for k in (
-                "status","r_accepted","fiducials_x","median_rr_px","snapped_rr_cv","phase_coverage","reason")},
-                "group_projection":_v16_meta})
-
+        _v17_regions,_v17_results,_v17_meta=_v17_group_regions(_selected_groups,_v17_rhythm,_v17_rr)
+        _v17_by={x.get('lead'):x for x in _v17_results}
+        _v17_lead=st.selectbox("Lead kiểm tra v17",[r['lead'] for r in _v17_regions],key="v17_seg_lead_"+frame_id)
+        _v17_reg=next(r for r in _v17_regions if r['lead']==_v17_lead)
+        _v17_res=_v17_by[_v17_lead]
+        st.image(v17_segmentation_overlay(_v17_reg,_v17_res),
+                 caption="Xanh lá = mask mực ECG được giữ; xanh dương = skeleton; tím = heartbeat clock. v17 chưa ép skeleton thành waveform 1-D.",width="stretch")
+        st.dataframe([_v17_public_result(x) for x in _v17_results],hide_index=True,width="stretch")
+        with st.expander("v17 heartbeat clock / group geometry audit",expanded=False):
+            st.json({'rhythm_meta':_v17_rmeta,'rhythm_rr':{k:_v17_rr.get(k) for k in (
+                'status','r_accepted','fiducials_x','median_rr_px','snapped_rr_cv','phase_coverage','reason')},
+                'group_projection':_v17_meta})
         try:
-            _v16_sheet=v161_contact_sheet(_v16_tracks,_v16_results)
-            _v16_buf=io.BytesIO(); _v16_sheet.save(_v16_buf,format="PNG") if _v16_sheet is not None else None
-            _v16_png=_v16_buf.getvalue() if _v16_sheet is not None else b""
+            _v17_sheet=v17_contact_sheet(_v17_regions,_v17_results)
+            _v17_buf=io.BytesIO(); _v17_sheet.save(_v17_buf,format='PNG') if _v17_sheet is not None else None
+            _v17_png=_v17_buf.getvalue() if _v17_sheet is not None else b''
         except Exception as _exc:
-            _v16_png=b"";st.warning("Không dựng được v16 validation sheet: "+str(_exc))
-        _v16_payload={"version":"v16.1","rhythm_meta":_v16_rmeta,
-                      "heartbeat_clock":{k:_v16_rr.get(k) for k in (
-                          "status","r_accepted","fiducials_x","predicted_x","median_rr_px","snapped_rr_cv",
-                          "phase_coverage","morphology_score","reason","rhythm_box","rhythm_size")},
-                      "group_projection":_v16_meta,"leads":_v16_results}
-        _v16_json=json.dumps(_v16_payload,ensure_ascii=False,indent=2).encode("utf-8")
+            _v17_png=b''; st.warning('Không dựng được v17 validation sheet: '+str(_exc))
+        _v17_payload={'version':'v17.0-ink-segmentation','rhythm_meta':_v17_rmeta,
+                      'heartbeat_clock':{k:_v17_rr.get(k) for k in (
+                          'status','r_accepted','fiducials_x','predicted_x','median_rr_px','snapped_rr_cv',
+                          'phase_coverage','morphology_score','reason','rhythm_box','rhythm_size')},
+                      'group_projection':_v17_meta,'leads':[_v17_public_result(x) for x in _v17_results]}
+        _v17_json=json.dumps(_v17_payload,ensure_ascii=False,indent=2).encode('utf-8')
         _a,_b=st.columns(2)
         with _a:
-            if _v16_png: st.download_button("Tải v16 Validation PNG",_v16_png,"ecg_v16_1_constrained_tracks_validation.png","image/png",key="v16_png_"+frame_id,width="stretch")
+            if _v17_png: st.download_button('Tải v17 Segmentation PNG',_v17_png,'ecg_v17_ink_segmentation_validation.png','image/png',key='v17_png_'+frame_id,width='stretch')
         with _b:
-            st.download_button("Tải v16 JSON",_v16_json,"ecg_v16_1_constrained_tracks_validation.json","application/json",key="v16_json_"+frame_id,width="stretch")
-        _pass=sum(1 for x in _v16_results if x.get("status")=="PASS")
-        _clock_ok=_v16_rr.get("status") in ("PASS","REVIEW") and len(_v16_rr.get("fiducials_x") or [])>=3
-        st.info(f"v16.1 QC: heartbeat clock {'OK' if _clock_ok else 'REVIEW'} · lead PASS {_pass}/12. Chưa dùng để chẩn đoán; chỉ khi clock + waveform ổn mới mở PQRST/measurement.")
+            st.download_button('Tải v17 JSON',_v17_json,'ecg_v17_ink_segmentation_validation.json','application/json',key='v17_json_'+frame_id,width='stretch')
+        _pass=sum(1 for x in _v17_results if x.get('status')=='PASS')
+        _clock_ok=_v17_rr.get('status') in ('PASS','REVIEW') and len(_v17_rr.get('fiducials_x') or [])>=3
+        st.info(f"v17.0 QC: heartbeat clock {'OK' if _clock_ok else 'REVIEW'} · segmentation PASS {_pass}/12. Chưa dùng để chẩn đoán; chỉ khi mask+skeleton đúng 12 lead mới chuyển sang waveform 1-D/PQRST.")
 
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     context = {"age":age,"sex":sex,"history":history.strip() or None,"user_confirmed_calibration":known}
