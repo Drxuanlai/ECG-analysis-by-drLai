@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.3.3"
-PROMPT_VERSION = "ecg-landmark-only-outcome-aware-v14.3.3"
+APP_VERSION = "v14.3.4"
+PROMPT_VERSION = "ecg-landmark-only-route-continuation-v14.3.4"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3415,7 +3415,7 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
     fragments, first = [], None
     status = st.empty()
     status.caption("Đang phân tích toàn cảnh và chi tiết trong cùng một yêu cầu...")
-    completed, error, meta = False, None, None
+    completed, error, meta, raw_error = False, None, None, None
     try:
         for text in generator:
             elapsed = time.monotonic()-started
@@ -3431,10 +3431,11 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
     except Exception as exc:
         meta = error_metadata(exc,provider)
         error = friendly_api_error(exc)
+        raw_error = str(exc)[:1800]
     finally:
         generator.close()
     return {"raw_response":"".join(fragments),"api_completed":completed,"error":error,
-        "error_meta":meta,"total_seconds":round(time.monotonic()-started,2),
+        "raw_error":raw_error,"error_meta":meta,"total_seconds":round(time.monotonic()-started,2),
         "first_text_seconds":round(first,2) if first is not None else None}
 
 
@@ -3449,7 +3450,8 @@ def _safe_route_history(history):
         x={k:v for k,v in h.items() if k in ("name","model","status","attempt","seconds","http","detail")}
         d=str(x.get("detail",""))
         d=re.sub(r'AIza[0-9A-Za-z_-]{15,}', '[REDACTED_API_KEY]', d)
-        d=re.sub(r'AQ\.[0-9A-Za-z_-]{15,}', '[REDACTED_AUTH_KEY]', d)
+        d=re.sub(r'AQ\.[0-9A-Za-z_.-]{15,}', '[REDACTED_AUTH_KEY]', d)
+        d=re.sub(r'(?i)(api[_ -]?key\s*[:=]\s*)[^\s,}\]]+', r'\1[REDACTED]', d)
         x["detail"]=d[:700]
         safe.append(x)
     return safe
@@ -3468,7 +3470,7 @@ def _retryable_route_error(exc):
 def _outcome_error_text(outcome):
     if not isinstance(outcome,dict):
         return "invalid_outcome"
-    for key in ("error","error_message","message","detail"):
+    for key in ("raw_error","error","error_message","message","detail"):
         value=outcome.get(key)
         if value:
             return str(value)
@@ -3487,6 +3489,13 @@ def _outcome_http_code(outcome):
         if value is not None:
             try:return int(value)
             except Exception:pass
+    meta=outcome.get("error_meta")
+    if isinstance(meta,dict):
+        for key in ("http_code","status_code","code"):
+            value=meta.get(key)
+            if value is not None:
+                try:return int(value)
+                except Exception:pass
     text=_outcome_error_text(outcome)
     import re as _re
     m=_re.search(r'\b(400|401|403|404|408|409|429|500|502|503|504)\b',text)
@@ -3525,15 +3534,21 @@ def run_with_failover(routes, regions, prompt):
 
                 detail=_outcome_error_text(outcome)
                 code=_outcome_http_code(outcome)
-                # Classify the FAILED OUTCOME, not only exceptions.
-                pseudo_exc=RuntimeError(detail)
-                retryable=_retryable_route_error(pseudo_exc)
+                # Route-local fixed errors skip remaining attempts but MUST continue to next route.
+                fixed_http=code in (400,401,403,404,409)
+                transient_http=code in (408,429,500,502,503,504)
+                if fixed_http:
+                    retryable=False
+                elif transient_http:
+                    retryable=True
+                else:
+                    retryable=_retryable_route_error(RuntimeError(detail))
                 history.append({"name":route["name"],"model":route["model"],
-                                "status":"Lỗi tạm thời" if retryable else "Lỗi cố định",
+                                "status":"Lỗi cố định → chuyển route" if not retryable else "Lỗi tạm thời → retry",
                                 "attempt":attempt,"seconds":sec,"http":code,
                                 "detail":detail[:700]})
                 if not retryable:
-                    break
+                    break  # breaks attempt-loop only; outer route-loop continues.
                 if attempt<max_attempts_per_route:
                     time.sleep(min(2**(attempt-1),4))
 
@@ -4247,7 +4262,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.3 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.4 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
