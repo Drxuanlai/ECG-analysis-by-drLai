@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.3.1"
-PROMPT_VERSION = "ecg-landmark-only-sequential-v14.3.1"
+APP_VERSION = "v14.3.2"
+PROMPT_VERSION = "ecg-landmark-only-sequential-diagnostics-v14.3.2"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3299,7 +3299,7 @@ def friendly_api_error(error):
     if isinstance(error, TimeoutError) or "timeout" in message or "timed out" in message:
         return "Phân tích quá thời gian chờ. Chưa có báo cáo hoàn chỉnh."
     if code == "400" or "400" in message:
-        return "Yêu cầu bị API từ chối (400). v14.1 dùng JSON mode và kiểm tra schema tại Python; nếu còn lỗi hãy xem lịch sử nguồn/API."
+        return "Yêu cầu bị API từ chối (400). Xem lịch sử route và lỗi chi tiết; không suy đoán nguyên nhân từ mã 400."
     return "Phân tích không hoàn tất hoặc dữ liệu trả về không hợp lệ. Không tự gửi lại yêu cầu."
 
 
@@ -3438,6 +3438,22 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
         "first_text_seconds":round(first,2) if first is not None else None}
 
 
+class APIRoutesFailed(RuntimeError):
+    def __init__(self, history):
+        self.history=history
+        super().__init__("Tất cả nguồn API đều thất bại.")
+
+def _safe_route_history(history):
+    safe=[]
+    for h in history or []:
+        x={k:v for k,v in h.items() if k in ("name","model","status","attempt","seconds","detail")}
+        d=str(x.get("detail",""))
+        d=re.sub(r'AIza[0-9A-Za-z_-]{15,}', '[REDACTED_API_KEY]', d)
+        d=re.sub(r'AQ\.[0-9A-Za-z_-]{15,}', '[REDACTED_AUTH_KEY]', d)
+        x["detail"]=d[:700]
+        safe.append(x)
+    return safe
+
 def _retryable_route_error(exc):
     # Local code defects must never consume retries/routes.
     if isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError)):
@@ -3476,7 +3492,7 @@ def run_with_failover(routes, regions, prompt):
                     raise RuntimeError("Lỗi code local; không retry/chuyển API: "+str(exc)) from exc
                 if not retryable: break
                 if attempt<max_attempts_per_route: time.sleep(min(2**(attempt-1),4))
-    raise RuntimeError("Tất cả nguồn API đều thất bại: "+json.dumps(history,ensure_ascii=False))
+    raise APIRoutesFailed(_safe_route_history(history))
 
 
 def _point_to_px(point, region):
@@ -4169,7 +4185,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.1 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.2 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4548,7 +4564,19 @@ else:
             st.warning("Cần thiết lập model và API key trong Thiết lập AI.")
         else:
             st.session_state.pop("last_report_v9",None)
-            outcome, selected = run_with_failover(routes, regions, prompt)
+            try:
+                outcome, selected = run_with_failover(routes, regions, prompt)
+            except APIRoutesFailed as exc:
+                st.error("Không nguồn API nào hoàn tất lượt landmark. Chi tiết từng route:")
+                hist=_safe_route_history(exc.history)
+                if hist:
+                    st.dataframe(hist, width="stretch", hide_index=True)
+                else:
+                    st.warning("Không có lịch sử route — lỗi xảy ra trước khi gọi API.")
+                st.stop()
+            except Exception as exc:
+                st.error(f"Lỗi local trước khi có báo cáo AI: {type(exc).__name__}: {str(exc)[:700]}")
+                st.stop()
             actual_provider, actual_model = selected["provider"], selected["model"]
             actual_thinking = selected["thinking"]
             data, checks = None, None
