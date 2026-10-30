@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.3"
-PROMPT_VERSION = "ecg-landmark-only-sequential-v14.3"
+APP_VERSION = "v14.3.1"
+PROMPT_VERSION = "ecg-landmark-only-sequential-v14.3.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3439,9 +3439,15 @@ def collect_response(generator, provider="Google Gemini", budget=STREAM_BUDGET_S
 
 
 def _retryable_route_error(exc):
+    # Local code defects must never consume retries/routes.
+    if isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError)):
+        return False
     t=str(exc).lower()
-    if any(x in t for x in ("api_key_invalid","api key not valid","permission_denied","model not found","not_found","unsupported")): return False
-    return any(x in t for x in ("429","quota","503","504","500","502","unavailable","deadline","timeout","temporar","overload","rate limit"))
+    if any(x in t for x in ("api_key_invalid","api key not valid","permission_denied",
+                            "model not found","not_found","unsupported","invalid_argument")):
+        return False
+    return any(x in t for x in ("429","quota","503","504","500","502","unavailable",
+                                "deadline exceeded","timed out","temporar","overload","rate limit"))
 
 def run_with_failover(routes, regions, prompt):
     history=[]; max_attempts_per_route=3
@@ -3455,14 +3461,19 @@ def run_with_failover(routes, regions, prompt):
             try:
                 generator=analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"])
                 remaining=max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-t0))
-                outcome=collect_response(generator,route["provider"],min(STREAM_TIMEOUT_SECONDS,remaining))
+                outcome=collect_response(generator,route["provider"],remaining)
                 history.append({"name":route["name"],"model":route["model"],"status":"Hoàn tất","attempt":attempt,"seconds":round(time.monotonic()-t0,2)})
                 outcome["route_history"]=history
                 outcome["request_summary"]={"route":route["name"],"attempt":attempt,"images":len(regions),"parallel":False}
                 return outcome,route
             except Exception as exc:
+                local_bug=isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError))
                 retryable=_retryable_route_error(exc)
-                history.append({"name":route["name"],"model":route["model"],"status":"Lỗi tạm thời" if retryable else "Lỗi cố định","attempt":attempt,"seconds":round(time.monotonic()-t0,2),"detail":str(exc)[:400]})
+                history.append({"name":route["name"],"model":route["model"],
+                                "status":"Lỗi code local — dừng ngay" if local_bug else ("Lỗi tạm thời" if retryable else "Lỗi cố định"),
+                                "attempt":attempt,"seconds":round(time.monotonic()-t0,2),"detail":str(exc)[:400]})
+                if local_bug:
+                    raise RuntimeError("Lỗi code local; không retry/chuyển API: "+str(exc)) from exc
                 if not retryable: break
                 if attempt<max_attempts_per_route: time.sleep(min(2**(attempt-1),4))
     raise RuntimeError("Tất cả nguồn API đều thất bại: "+json.dumps(history,ensure_ascii=False))
@@ -4158,7 +4169,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
