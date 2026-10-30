@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.6-v13base"
+APP_VERSION = "v14.6.1-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -4262,7 +4262,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · ROI Candidates → 12 Single-lead → Beat-locked Landmark")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.6-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.6.1-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4362,40 +4362,6 @@ else:
     frame_id = hashlib.sha256(json.dumps([image_id, auto_angle,manual,whole_box]).encode()).hexdigest()[:12]
 
     # ---- Digitizer v1.3 integration: local, fail-safe, supplementary evidence ----
-    # v14.6: local candidate chooser for the four 3-lead groups.
-    _group_regions=[r for r in regions if r.get("id") in ("group_1","group_2","group_3","group_4")]
-    if len(_group_regions)==4:
-        st.markdown("### v14.6 — Chọn ROI candidate cho 4 nhóm")
-        st.caption("Mỗi nhóm có 4 crop local. Mặc định A = ROI bác sĩ vừa chỉnh. Chọn B/C/D chỉ khi thumbnail giữ sóng tốt hơn. Bước này không gọi API.")
-        _selected_groups=[]
-        for _g in _group_regions:
-            _cands=build_roi_candidate_regions(ecg,_g,enhance)
-            with st.expander(f"{_g.get('label',_g['id'])} · chọn 1/4",expanded=False):
-                _cols=st.columns(4)
-                for _i,_c in enumerate(_cands):
-                    with _cols[_i]:
-                        st.image(_c["png"],caption=f"{_c['candidate_key']} · {_c['candidate_label']}",width="stretch")
-                _keys=[c["candidate_key"] for c in _cands]
-                _choice=st.radio("Candidate",_keys,index=0,horizontal=True,
-                                 key="v146_roi_candidate_"+frame_id+"_"+_g["id"])
-                _sel=next(c for c in _cands if c["candidate_key"]==_choice)
-                # Normalize selected candidate back to canonical group id for downstream bookkeeping.
-                _sel=dict(_sel);_sel["id"]=_g["id"];_sel["label"]=_g.get("label",_g["id"])
-                _selected_groups.append(_sel)
-
-        _single_leads=build_single_lead_regions(ecg,_selected_groups,enhance)
-        # Landmark pass needs overview + 12 isolated leads. Rhythm/focus remain local evidence,
-        # not extra multimodal payload, to control token/image cost.
-        _overview=next((r for r in regions if r.get("id")=="overview"),None)
-        regions=([_overview] if _overview else [])+_single_leads
-        st.caption(f"AI input v14.6: {len(_single_leads)} single-lead strips + 1 overview · 1 request/API route.")
-        with st.expander("Preview 12 single-lead strips",expanded=False):
-            for _i in range(0,len(_single_leads),3):
-                _cc=st.columns(3)
-                for _j,_r in enumerate(_single_leads[_i:_i+3]):
-                    with _cc[_j]:
-                        st.image(_r["png"],caption=_r["lead"],width="stretch")
-
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     digitizer_result=None; digitizer_evidence=None; rr_authority=None; interval_authority=None; median_landmark_authority=None; qrs_morphology_authority=None; qrs_template_evidence=None; centerline_evidence=None; j_st_evidence=None; ocr_evidence={"label_anchors":{},"recording_text":[],"ocr_available":False}
     with st.expander("Digitizer tự động — bằng chứng bổ sung",expanded=True):
@@ -4537,6 +4503,40 @@ else:
             except ValueError as exc:
                 st.error(str(exc));st.stop()
             st.image(region["png"],width="stretch");regions.append(region)
+
+    # v14.6: local candidate chooser for the four 3-lead groups.
+    _group_regions=[r for r in regions if r.get("id") in ("group_1","group_2","group_3","group_4")]
+    if len(_group_regions)==4:
+        st.markdown("### v14.6 — Chọn ROI candidate cho 4 nhóm")
+        st.caption("Mỗi nhóm có 4 crop local. Mặc định A = ROI bác sĩ vừa chỉnh. Chọn B/C/D chỉ khi thumbnail giữ sóng tốt hơn. Bước này không gọi API.")
+        _selected_groups=[]
+        for _g in _group_regions:
+            _cands=build_roi_candidate_regions(ecg,_g,enhance)
+            with st.expander(f"{_g.get('label',_g['id'])} · chọn 1/4",expanded=False):
+                _cols=st.columns(4)
+                for _i,_c in enumerate(_cands):
+                    with _cols[_i]:
+                        st.image(_c["png"],caption=f"{_c['candidate_key']} · {_c['candidate_label']}",width="stretch")
+                _keys=[c["candidate_key"] for c in _cands]
+                _choice=st.radio("Candidate",_keys,index=0,horizontal=True,
+                                 key="v146_roi_candidate_"+frame_id+"_"+_g["id"])
+                _sel=next(c for c in _cands if c["candidate_key"]==_choice)
+                # Normalize selected candidate back to canonical group id for downstream bookkeeping.
+                _sel=dict(_sel);_sel["id"]=_g["id"];_sel["label"]=_g.get("label",_g["id"])
+                _selected_groups.append(_sel)
+
+        _single_leads=build_single_lead_regions(ecg,_selected_groups,enhance)
+        # Landmark pass needs overview + 12 isolated leads. Rhythm/focus remain local evidence,
+        # not extra multimodal payload, to control token/image cost.
+        _overview=next((r for r in regions if r.get("id")=="overview"),None)
+        regions=([_overview] if _overview else [])+_single_leads
+        st.caption(f"AI input v14.6: {len(_single_leads)} single-lead strips + 1 overview · 1 request/API route.")
+        with st.expander("Preview 12 single-lead strips",expanded=False):
+            for _i in range(0,len(_single_leads),3):
+                _cc=st.columns(3)
+                for _j,_r in enumerate(_single_leads[_i:_i+3]):
+                    with _cc[_j]:
+                        st.image(_r["png"],caption=_r["lead"],width="stretch")
 
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     context = {"age":age,"sex":sex,"history":history.strip() or None,"user_confirmed_calibration":known}
