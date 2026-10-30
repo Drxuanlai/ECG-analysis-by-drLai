@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.3.4"
-PROMPT_VERSION = "ecg-landmark-only-route-continuation-v14.3.4"
+APP_VERSION = "v14.4"
+PROMPT_VERSION = "ecg-landmark-stable-sequential-v14.4"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -3502,31 +3502,29 @@ def _outcome_http_code(outcome):
     return int(m.group(1)) if m else None
 
 def run_with_failover(routes, regions, prompt):
-    """v14.3.3: sequential and outcome-aware. Success means api_completed=True, nothing else."""
+    """v14.4 stable sequential failover.
+    One route at a time. Fixed route error -> next route. Transient -> retry same route up to 3.
+    No shared global budget may prevent later routes from being attempted.
+    """
     history=[]
-    max_attempts_per_route=3
-
     for route in routes:
         if route.get("cooldown_until",0)>time.time():
-            history.append({"name":route["name"],"model":route["model"],
-                            "status":"Bỏ qua: cooldown","attempt":None,"seconds":None,
-                            "http":None,"detail":""})
+            history.append({"name":route["name"],"model":route["model"],"status":"Bỏ qua: cooldown",
+                            "attempt":None,"seconds":None,"http":None,"detail":""})
             continue
 
-        for attempt in range(1,max_attempts_per_route+1):
-            st.caption(f"Đang dùng {route['name']} · {route['model']} · lần {attempt}/{max_attempts_per_route}")
+        for attempt in range(1,4):
+            st.caption(f"Đang dùng {route['name']} · {route['model']} · lần {attempt}/3")
             t0=time.monotonic()
             try:
                 generator=analyze_gemini(route["key"],route["model"],regions,prompt,route["thinking"])
-                remaining=max(1,FAILOVER_BUDGET_SECONDS-(time.monotonic()-t0))
-                outcome=collect_response(generator,route["provider"],remaining)
+                # collect_response has its own default STREAM_BUDGET_SECONDS from the proven transport.
+                outcome=collect_response(generator,route["provider"])
                 sec=round(time.monotonic()-t0,2)
 
-                # CRITICAL: collect_response can return a failed outcome without raising.
                 if isinstance(outcome,dict) and outcome.get("api_completed") is True:
-                    history.append({"name":route["name"],"model":route["model"],
-                                    "status":"Hoàn tất","attempt":attempt,"seconds":sec,
-                                    "http":_outcome_http_code(outcome),"detail":""})
+                    history.append({"name":route["name"],"model":route["model"],"status":"Hoàn tất",
+                                    "attempt":attempt,"seconds":sec,"http":_outcome_http_code(outcome),"detail":""})
                     outcome["route_history"]=_safe_route_history(history)
                     outcome["request_summary"]={"route":route["name"],"attempt":attempt,
                                                 "images":len(regions),"parallel":False}
@@ -3534,40 +3532,35 @@ def run_with_failover(routes, regions, prompt):
 
                 detail=_outcome_error_text(outcome)
                 code=_outcome_http_code(outcome)
-                # Route-local fixed errors skip remaining attempts but MUST continue to next route.
-                fixed_http=code in (400,401,403,404,409)
-                transient_http=code in (408,429,500,502,503,504)
-                if fixed_http:
-                    retryable=False
-                elif transient_http:
-                    retryable=True
-                else:
-                    retryable=_retryable_route_error(RuntimeError(detail))
+                fixed=(code in (400,401,403,404,409)) or any(x in detail.lower() for x in
+                       ("invalid_argument","api_key_invalid","permission_denied","not_found","unsupported"))
+                transient=(code in (408,429,500,502,503,504)) or _retryable_route_error(RuntimeError(detail))
                 history.append({"name":route["name"],"model":route["model"],
-                                "status":"Lỗi cố định → chuyển route" if not retryable else "Lỗi tạm thời → retry",
-                                "attempt":attempt,"seconds":sec,"http":code,
-                                "detail":detail[:700]})
-                if not retryable:
-                    break  # breaks attempt-loop only; outer route-loop continues.
-                if attempt<max_attempts_per_route:
+                                "status":"Lỗi cố định → route kế" if fixed else
+                                         ("Lỗi tạm thời → retry" if transient else "Lỗi không xác định → route kế"),
+                                "attempt":attempt,"seconds":sec,"http":code,"detail":detail[:700]})
+                if fixed or not transient:
+                    break
+                if attempt<3:
                     time.sleep(min(2**(attempt-1),4))
 
             except Exception as exc:
-                local_bug=isinstance(exc,(NameError,UnboundLocalError,AttributeError,
-                                          TypeError,KeyError,ImportError))
                 sec=round(time.monotonic()-t0,2)
+                if isinstance(exc,(NameError,UnboundLocalError,AttributeError,TypeError,KeyError,ImportError)):
+                    history.append({"name":route["name"],"model":route["model"],"status":"Lỗi code local — dừng",
+                                    "attempt":attempt,"seconds":sec,"http":None,"detail":str(exc)[:700]})
+                    raise RuntimeError("Lỗi code local; không gọi thêm API: "+str(exc)) from exc
                 retryable=_retryable_route_error(exc)
                 history.append({"name":route["name"],"model":route["model"],
-                                "status":"Lỗi code local — dừng ngay" if local_bug else
-                                         ("Lỗi tạm thời" if retryable else "Lỗi cố định"),
-                                "attempt":attempt,"seconds":sec,"http":None,
-                                "detail":str(exc)[:700]})
-                if local_bug:
-                    raise RuntimeError("Lỗi code local; không retry/chuyển API: "+str(exc)) from exc
+                                "status":"Lỗi tạm thời → retry" if retryable else "Lỗi cố định → route kế",
+                                "attempt":attempt,"seconds":sec,"http":None,"detail":str(exc)[:700]})
                 if not retryable:
                     break
-                if attempt<max_attempts_per_route:
+                if attempt<3:
                     time.sleep(min(2**(attempt-1),4))
+
+        # IMPORTANT: execution reaches here after break from attempt loop and continues next route.
+        continue
 
     raise APIRoutesFailed(_safe_route_history(history))
 
@@ -4262,7 +4255,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.3.4 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.4 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
