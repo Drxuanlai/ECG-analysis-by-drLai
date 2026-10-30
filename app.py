@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v15.2-multilead-geometry-consensus"
+APP_VERSION = "v16.0-group-synchronous-heartbeat-clock"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3783,6 +3783,214 @@ def build_single_lead_regions(ecg, selected_groups, enhance=False):
     return out
 
 
+
+
+
+def _v160_region_from_group_band(group_region, lead, y0, y1):
+    """Crop a row band from an already-selected 3-lead group while preserving common x geometry."""
+    img=_region_pil_image(group_region).convert("RGB")
+    H=img.height; W=img.width
+    y0=max(0,int(y0)); y1=min(H,int(y1))
+    if y1<=y0+4: raise ValueError("v16 row band too small")
+    crop=img.crop((0,y0,W,y1))
+    png=image_to_png(crop)
+    gbox=list(group_region.get("box_pixels") or [0,0,W,H])
+    # Map row band back to original-image y for audit; x remains the group's original x range.
+    gh=max(1,H); oy0,oy1=float(gbox[1]),float(gbox[3])
+    by0=oy0+(oy1-oy0)*y0/gh; by1=oy0+(oy1-oy0)*y1/gh
+    return {"id":"v16_lead_"+lead,"label":"v16 synchronous track "+lead,
+            "lead":lead,"source_group":group_region.get("id"),"png":png,
+            "sent_size":[crop.width,crop.height],"box_pixels":[gbox[0],int(round(by0)),gbox[2],int(round(by1))],
+            "horizontal_percent":group_region.get("horizontal_percent"),
+            "vertical_percent":group_region.get("vertical_percent"),
+            "v16_group_width":W,"v16_band_y":[y0,y1]}
+
+
+def v160_build_group_tracks(group_region, leads):
+    """Track 3 ordered rows directly inside one group. No row overlap; all tracks share the same x axis."""
+    centers,meta=_v152_group_row_centers(group_region)
+    H=int(meta["group_height"])
+    bounds=[0,int(round((centers[0]+centers[1])/2)),int(round((centers[1]+centers[2])/2)),H]
+    out=[]
+    for i,lead in enumerate(leads):
+        lo,hi=bounds[i],bounds[i+1]
+        # Inward guard is deliberately small: the group-level row order is the hard constraint.
+        guard=max(1,int(.010*H))
+        if i>0: lo+=guard
+        if i<2: hi-=guard
+        r=_v160_region_from_group_band(group_region,lead,lo,hi)
+        r["v16_geometry"]={"group_centers_px":centers,"group_bounds_px":bounds,
+                            "row_center_confidence":meta.get("row_center_confidence"),
+                            "shared_group_x":True}
+        out.append(r)
+    return out
+
+
+def _v160_expand_box_y(box, factor, image_h):
+    x0,x1=box[0]; y0,y1=box[1]
+    c=(float(y0)+float(y1))/2.0; h=max(2.0,float(y1)-float(y0))*float(factor)
+    a=max(0.0,c-h/2.0); b=min(100.0,c+h/2.0)
+    # Do not let adaptive Rhythm II become almost the whole ECG.
+    if b-a>38.0:
+        h=38.0; a=max(0.0,c-h/2); b=min(100.0,c+h/2)
+    return ((float(x0),float(x1)),(round(a,2),round(b,2)))
+
+
+def v160_auto_rhythm_region(ecg, auto_rhythm_box, enhance=False, speed_mm_s=None):
+    """Adaptive-height Rhythm II detection. Tests progressively taller bands and keeps the best clock QC."""
+    base=auto_rhythm_box if auto_rhythm_box else ((1.0,99.0),(76.0,99.0))
+    candidates=[]
+    # Include a modestly expanded option first; narrow legacy boxes are never trusted blindly.
+    for factor in (1.25,1.55,1.90,2.30):
+        x,y=_v160_expand_box_y(base,factor,ecg.height)
+        try:
+            reg=make_region(ecg,"v16_rhythm","v16 Rhythm II adaptive",x,y,enhance)
+            rr=_rr_from_rhythm_region(ecg,reg,speed_mm_s)
+            status=rr.get("status","UNRESOLVED")
+            srank={"PASS":3,"REVIEW":2,"UNRESOLVED":1}.get(status,0)
+            snap=(rr.get("snap_qc") or {}).get("status")
+            snaprank={"PASS":1.0,"REVIEW":.5}.get(snap,0.0)
+            racc=float(rr.get("r_accepted") or 0)
+            cv=rr.get("snapped_rr_cv"); cvpen=0.0 if cv is None else min(1.0,float(cv))
+            score=10*srank+2*snaprank+min(8,racc)-3*cvpen
+            candidates.append((score,reg,rr,{"factor":factor,"x":x,"y":y}))
+        except Exception as exc:
+            candidates.append((-999,None,{"status":"UNRESOLVED","reason":str(exc)[:180]},{"factor":factor}))
+    candidates.sort(key=lambda z:z[0],reverse=True)
+    best=candidates[0]
+    reg,rr,meta=best[1],best[2],best[3]
+    meta=dict(meta); meta["candidate_summary"]=[{"factor":x[3].get("factor"),"score":round(float(x[0]),2),
+                                                "status":(x[2] or {}).get("status")} for x in candidates]
+    return reg,rr,meta
+
+
+def _v160_clock_global_x(rhythm_region, rr):
+    """Convert Rhythm-II local fiducials to original ECG image x coordinates."""
+    if not rhythm_region:return []
+    box=rhythm_region.get("box_pixels") or []
+    if len(box)!=4:return []
+    x0,x1=float(box[0]),float(box[2]); origw=max(1.0,x1-x0)
+    rw=float((rr or {}).get("rhythm_size",[origw,1])[0] or origw)
+    xs=(rr or {}).get("fiducials_x") or (rr or {}).get("predicted_x") or []
+    return [x0+float(x)*origw/max(1.0,rw) for x in xs]
+
+
+def _v160_project_clock_to_group(group_region, clock_global_x, group_sent_w):
+    box=group_region.get("box_pixels") or []
+    if len(box)!=4:return []
+    gx0,gx1=float(box[0]),float(box[2]); gw=max(1.0,gx1-gx0)
+    out=[]
+    # Small tolerance allows heartbeat exactly at a group boundary to remain visible for audit.
+    tol=.035*gw
+    for x in clock_global_x:
+        if gx0-tol<=x<=gx1+tol:
+            t=(x-gx0)/gw
+            if -.04<=t<=1.04: out.append(int(round(max(0,min(1,t))*(group_sent_w-1))))
+    # De-duplicate boundary projections.
+    final=[]
+    for x in sorted(out):
+        if not final or abs(x-final[-1])>max(4,int(.025*group_sent_w)):final.append(x)
+    return final
+
+
+def _v160_refine_clock_on_track(res, expected_x):
+    """A lead cannot create a heartbeat; it only refines QRS morphology near the Rhythm-II clock."""
+    import numpy as np
+    xs=np.asarray(res.get("x") or [],dtype=int); z=np.asarray(res.get("signal") or [],dtype=float)
+    if len(xs)<5 or len(z)!=len(xs):return [],[]
+    dz=np.abs(np.gradient(z)); exclusions=res.get("calibration_exclusion_x") or []
+    def excluded_abs(x):return any(a<=x<=b for a,b in exclusions)
+    # Window is intentionally narrow; timing authority is the clock, not local peak search.
+    if len(expected_x)>=2:
+        rr=float(np.median(np.diff(expected_x))); rad=max(7,int(.16*rr))
+    else: rad=max(7,int(.035*len(z)))
+    out=[]; errs=[]
+    for target in expected_x:
+        # xs are cropped by an inner border; find nearest trace index to target in full lead coords.
+        ci=int(np.argmin(np.abs(xs-int(target))))
+        lo=max(0,ci-rad); hi=min(len(z),ci+rad+1)
+        valid=[k for k in range(lo,hi) if not excluded_abs(int(xs[k]))]
+        if not valid:continue
+        amp90=max(1.0,float(np.percentile(np.abs(z[valid]),90)))
+        sl90=max(1e-6,float(np.percentile(dz[valid],90)))
+        scores=[abs(z[k])/amp90+1.15*dz[k]/sl90-.012*abs(int(xs[k])-int(target)) for k in valid]
+        k=valid[int(np.argmax(scores))]
+        out.append(int(xs[k])); errs.append(int(xs[k])-int(target))
+    return out,errs
+
+
+def v160_group_synchronous_engine(selected_groups, rhythm_region, rr):
+    """Group-synchronous engine: Rhythm II owns heartbeat timing; leads only refine morphology at those times."""
+    lead_map={"group_1":["I","II","III"],"group_2":["aVR","aVL","aVF"],
+              "group_3":["V1","V2","V3"],"group_4":["V4","V5","V6"]}
+    clock_global=_v160_clock_global_x(rhythm_region,rr)
+    track_regions=[]; results=[]; group_meta=[]
+    for g in selected_groups:
+        leads=lead_map.get(g.get("id"))
+        if not leads:continue
+        tracks=v160_build_group_tracks(g,leads); track_regions.extend(tracks)
+        W=int((_region_pil_image(g)).width)
+        expected=_v160_project_clock_to_group(g,clock_global,W)
+        group_meta.append({"group":g.get("id"),"box_pixels":g.get("box_pixels"),
+                           "clock_expected_x":expected,"lead_set":leads})
+        for tr in tracks:
+            try:
+                res=v15_extract_waveform(tr)
+                refined,errs=_v160_refine_clock_on_track(res,expected)
+                res["qrs_candidates_local_raw_x"]=list(res.get("qrs_candidates_x") or [])
+                res["heartbeat_clock_expected_x"]=list(expected)
+                res["qrs_candidates_x"]=refined
+                res["clock_alignment_error_px"]=errs
+                res["timing_authority"]="RhythmII_heartbeat_clock"
+                res["source_group"]=g.get("id")
+                # A track cannot PASS if the clock itself is unresolved or if it misses expected beats.
+                rr_status=(rr or {}).get("status")
+                geom_ok=res.get("support",0)>=.55 and res.get("continuity",0)>=.90
+                clock_ok=rr_status in ("PASS","REVIEW") and len(expected)>=1
+                hit_ratio=len(refined)/max(1,len(expected))
+                align_ok=(not errs) or (np.median(np.abs(errs))<=max(10,.035*W))
+                res["clock_hit_ratio"]=round(float(hit_ratio),3)
+                res["status"]="PASS" if geom_ok and clock_ok and hit_ratio>=.75 and align_ok else "REVIEW"
+            except Exception as exc:
+                res={"lead":tr.get("lead"),"status":"ERROR","error":str(exc)[:300],
+                     "heartbeat_clock_expected_x":list(expected),"qrs_candidates_x":[]}
+            results.append(res)
+    return track_regions,results,{"clock_global_x":[round(x,2) for x in clock_global],"groups":group_meta,
+                                  "rhythm_status":(rr or {}).get("status"),"rhythm_rr_px":(rr or {}).get("median_rr_px")}
+
+
+def v160_waveform_overlay(region,res):
+    from PIL import ImageDraw
+    img=_region_pil_image(region).copy(); d=ImageDraw.Draw(img,'RGBA')
+    cor=res.get('corridor_y') or []
+    if len(cor)==2:d.rectangle((0,int(cor[0]),img.width-1,int(cor[1])),fill=(20,180,80,16),outline=(20,150,70,90),width=1)
+    for a,b in res.get('calibration_exclusion_x') or []:
+        d.rectangle((int(a),0,int(b),img.height-1),fill=(220,30,30,16),outline=(220,30,30,70),width=1)
+    xs=res.get('x') or []; ys=res.get('trace_y') or []
+    if len(xs)>1:d.line([(int(x),int(y)) for x,y in zip(xs,ys)],fill=(0,110,255,255),width=2)
+    # Purple = projected heartbeat clock, orange = QRS refined on this lead.
+    for x in res.get('heartbeat_clock_expected_x') or []:
+        d.line((x,0,x,img.height-1),fill=(135,70,220,150),width=1)
+    for x in res.get('qrs_candidates_x') or []:
+        d.line((x,0,x,img.height-1),fill=(255,90,0,255),width=2)
+    d.rectangle((0,0,min(img.width-1,650),30),fill=(255,255,255,235))
+    d.text((6,6),f"v16 {res.get('lead')} | {res.get('status')} | support {res.get('support')} | clock-hit {res.get('clock_hit_ratio')} | QRS {len(res.get('qrs_candidates_x') or [])}",fill=(0,0,0,255))
+    return img
+
+
+def v160_contact_sheet(track_regions,results):
+    from PIL import Image
+    by={r.get('lead'):r for r in results}; ims=[]
+    for reg in track_regions:
+        rr=by.get(reg.get('lead'))
+        if rr:ims.append(v160_waveform_overlay(reg,rr))
+    if not ims:return None
+    target=900; scaled=[]
+    for im in ims:
+        h=max(1,int(im.height*target/im.width));scaled.append(im.resize((target,h)))
+    total=sum(x.height+8 for x in scaled);out=Image.new('RGB',(target,total),'white');y=0
+    for im in scaled:out.paste(im,(0,y));y+=im.height+8
+    return out
 
 
 def _v152_group_row_centers(group_region):
@@ -5639,39 +5847,57 @@ else:
                     with _cc[_j]:
                         st.image(_r["png"],caption=_r["lead"],width="stretch")
 
-        # v15.0 Waveform Lab: independent of Gemini landmark coordinates.
-        st.markdown("### v15.2 — Multi-lead Geometry + QRS Consensus")
-        st.caption("Geometry-first: group 3 lead → tách 3 hàng không chồng → digitize 1-D → QRS raw → consensus timing giữa các lead đồng thời → refine lại trên từng waveform. Không dùng landmark Gemini.")
-        _v15_results=[]
-        for _r in _single_leads:
-            try:
-                _v15_results.append(v15_extract_waveform(_r))
-            except Exception as _exc:
-                _v15_results.append({"lead":_r.get("lead"),"status":"ERROR","error":str(_exc)[:300],"qrs_candidates_x":[]})
-        _v15_results=v152_apply_multilead_consensus(_single_leads,_v15_results)
-        _v15_by={x.get("lead"):x for x in _v15_results}
-        _v15_lead=st.selectbox("Lead kiểm tra waveform",[r["lead"] for r in _single_leads],key="v15_waveform_lead_"+frame_id)
-        _v15_reg=next(r for r in _single_leads if r["lead"]==_v15_lead)
-        _v15_res=_v15_by[_v15_lead]
-        if _v15_res.get("status")!="ERROR":
-            st.image(v15_waveform_overlay(_v15_reg,_v15_res),caption="Xanh = waveform; cam đậm = QRS sau multi-lead consensus; cam nhạt = candidate thô; xanh lá = lead corridor; đỏ nhạt = calibration/edge exclusion. Chưa phải landmark PQRST.",width="stretch")
+        # v16.0 Group-Synchronous Engine — architecture validation before PQRST measurement.
+        st.markdown("### v16.0 — Group-Synchronous ECG Engine")
+        st.caption("AUTO-first: 4 group giữ nguyên hệ tọa độ x gốc; Rhythm II tự mở rộng chiều cao tạo heartbeat clock; mỗi lead chỉ refine QRS quanh heartbeat đã biết. Không dùng landmark Gemini, chưa đo P/T/PR/QT.")
+
+        # v16 does NOT depend on the manual Rhythm-II sliders above. It re-detects from the automatic proposal.
+        _v16_rhythm,_v16_rr,_v16_rmeta=v160_auto_rhythm_region(
+            ecg,auto_rhythm_box,enhance,_normalize_paper_speed(speed))
+        if _v16_rhythm is not None:
+            st.image(_v16_rhythm["png"],caption=f"Rhythm II AUTO adaptive-height · QC {_v16_rr.get('status')} · R accepted {_v16_rr.get('r_accepted')} · RRcv {_v16_rr.get('snapped_rr_cv')}",width="stretch")
         else:
-            st.error(_v15_res.get("error"))
-        st.dataframe([{k:v for k,v in x.items() if k in ("lead","status","support","continuity","qrs_candidates_raw_x","qrs_candidates_preconsensus_x","qrs_candidates_x","group_consensus_norm","rr_px","rr_cv","corridor_y","calibration_exclusion_x","error")} for x in _v15_results],hide_index=True,width="stretch")
+            st.error("v16 không tự dựng được Rhythm II.")
+
+        # Selected candidate A/B/C/D remains a rescue/audit layer; default A requires no manual work.
+        _v16_tracks,_v16_results,_v16_meta=v160_group_synchronous_engine(_selected_groups,_v16_rhythm,_v16_rr)
+        _v16_by={x.get("lead"):x for x in _v16_results}
+        _v16_lead=st.selectbox("Lead kiểm tra v16",[r["lead"] for r in _v16_tracks],key="v16_waveform_lead_"+frame_id)
+        _v16_reg=next(r for r in _v16_tracks if r["lead"]==_v16_lead)
+        _v16_res=_v16_by[_v16_lead]
+        if _v16_res.get("status")!="ERROR":
+            st.image(v160_waveform_overlay(_v16_reg,_v16_res),caption="Xanh = waveform; tím = heartbeat clock chiếu từ Rhythm II; cam = QRS refine trên lead. Lead KHÔNG được tự tạo thêm heartbeat.",width="stretch")
+        else: st.error(_v16_res.get("error"))
+        st.dataframe([{k:v for k,v in x.items() if k in (
+            "lead","source_group","status","support","continuity","heartbeat_clock_expected_x",
+            "qrs_candidates_local_raw_x","qrs_candidates_x","clock_alignment_error_px","clock_hit_ratio",
+            "corridor_y","calibration_exclusion_x","error")} for x in _v16_results],hide_index=True,width="stretch")
+
+        with st.expander("v16 heartbeat clock / geometry audit",expanded=False):
+            st.json({"rhythm_meta":_v16_rmeta,"rhythm_rr":{k:_v16_rr.get(k) for k in (
+                "status","r_accepted","fiducials_x","median_rr_px","snapped_rr_cv","phase_coverage","reason")},
+                "group_projection":_v16_meta})
+
         try:
-            _v15_sheet=v15_contact_sheet(_single_leads,_v15_results)
-            _v15_buf=io.BytesIO(); _v15_sheet.save(_v15_buf,format="PNG") if _v15_sheet is not None else None
-            _v15_png=_v15_buf.getvalue() if _v15_sheet is not None else b""
+            _v16_sheet=v160_contact_sheet(_v16_tracks,_v16_results)
+            _v16_buf=io.BytesIO(); _v16_sheet.save(_v16_buf,format="PNG") if _v16_sheet is not None else None
+            _v16_png=_v16_buf.getvalue() if _v16_sheet is not None else b""
         except Exception as _exc:
-            _v15_png=b""; st.warning("Không dựng được v15 validation sheet: "+str(_exc))
-        _v15_json=json.dumps(_v15_results,ensure_ascii=False,indent=2).encode("utf-8")
+            _v16_png=b"";st.warning("Không dựng được v16 validation sheet: "+str(_exc))
+        _v16_payload={"version":"v16.0","rhythm_meta":_v16_rmeta,
+                      "heartbeat_clock":{k:_v16_rr.get(k) for k in (
+                          "status","r_accepted","fiducials_x","predicted_x","median_rr_px","snapped_rr_cv",
+                          "phase_coverage","morphology_score","reason","rhythm_box","rhythm_size")},
+                      "group_projection":_v16_meta,"leads":_v16_results}
+        _v16_json=json.dumps(_v16_payload,ensure_ascii=False,indent=2).encode("utf-8")
         _a,_b=st.columns(2)
         with _a:
-            if _v15_png: st.download_button("Tải v15.2 Multi-lead Validation PNG",_v15_png,"ecg_v15_2_multilead_validation.png","image/png",key="v15_png_"+frame_id,width="stretch")
+            if _v16_png: st.download_button("Tải v16 Validation PNG",_v16_png,"ecg_v16_group_synchronous_validation.png","image/png",key="v16_png_"+frame_id,width="stretch")
         with _b:
-            st.download_button("Tải v15.2 Multi-lead Validation JSON",_v15_json,"ecg_v15_2_multilead_validation.json","application/json",key="v15_json_"+frame_id,width="stretch")
-        _pass=sum(1 for x in _v15_results if x.get("status")=="PASS")
-        st.info(f"v15.2 multi-lead QC: PASS {_pass}/12. Chưa dùng để chẩn đoán. Mục tiêu: 12 waveform đúng hàng + QRS timing nhất quán giữa các lead đồng thời.")
+            st.download_button("Tải v16 JSON",_v16_json,"ecg_v16_group_synchronous_validation.json","application/json",key="v16_json_"+frame_id,width="stretch")
+        _pass=sum(1 for x in _v16_results if x.get("status")=="PASS")
+        _clock_ok=_v16_rr.get("status") in ("PASS","REVIEW") and len(_v16_rr.get("fiducials_x") or [])>=3
+        st.info(f"v16 QC: heartbeat clock {'OK' if _clock_ok else 'REVIEW'} · lead PASS {_pass}/12. Chưa dùng để chẩn đoán; chỉ khi clock + waveform ổn mới mở PQRST/measurement.")
 
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     context = {"age":age,"sex":sex,"history":history.strip() or None,"user_confirmed_calibration":known}
