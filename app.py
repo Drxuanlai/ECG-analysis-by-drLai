@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.11-v13base"
+APP_VERSION = "v15.0-waveform-lab"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -3782,6 +3782,122 @@ def build_single_lead_regions(ecg, selected_groups, enhance=False):
             out.append(r)
     return out
 
+
+def v15_extract_waveform(region):
+    """Signal-only digitization. No AI landmark coordinates are consumed."""
+    import numpy as np
+    img=_region_pil_image(region).convert("RGB")
+    a=np.asarray(img,dtype=float); H,W,_=a.shape
+    # Safe border: labels/calibration at extreme edges must not seed the path.
+    bx=max(2,int(0.02*W)); by=max(2,int(0.05*H))
+    crop=a[by:H-by,bx:W-bx]; h,w,_=crop.shape
+    r,g,b=crop[:,:,0],crop[:,:,1],crop[:,:,2]
+    gray=.299*r+.587*g+.114*b
+    chroma=np.maximum.reduce([r,g,b])-np.minimum.reduce([r,g,b])
+    red=r-(g+b)/2.0
+    # Neutral dark ink likelihood. Strongly suppress pink/red grid.
+    ink=np.clip((185-gray)/100.0,0,1)
+    neutral=np.clip(1.0-chroma/85.0,0,1)
+    red_pen=np.clip((45-red)/45.0,0,1)
+    score=ink*(0.65+0.35*neutral)*red_pen
+    score[gray>190]=0
+    # Remove likely text/calibration contamination near top/bottom by row occupancy.
+    occ=(score>0.28).mean(axis=1)
+    row_pen=np.ones(h)
+    row_pen[occ>0.38]=0.25
+    score*=row_pen[:,None]
+
+    # DP continuous path across x. State is y; reward dark ink, penalize vertical jumps.
+    INF=1e9
+    cost=np.full((h,w),INF,dtype=np.float32)
+    parent=np.zeros((h,w),dtype=np.int16)
+    center=h/2.0
+    cost[:,0]=1.2*np.abs(np.arange(h)-center)/max(8,h*.35)-3.2*score[:,0]
+    maxjump=max(4,int(.09*h))
+    yy=np.arange(h)
+    for x in range(1,w):
+        prev=cost[:,x-1]
+        for y in range(h):
+            lo=max(0,y-maxjump); hi=min(h,y+maxjump+1)
+            cand=prev[lo:hi]+0.16*np.abs(np.arange(lo,hi)-y)
+            k=int(np.argmin(cand)); py=lo+k
+            cost[y,x]=cand[k]-3.2*score[y,x]
+            parent[y,x]=py
+    y=int(np.argmin(cost[:,-1])); trace=np.zeros(w,dtype=float)
+    for x in range(w-1,-1,-1):
+        trace[x]=y+by
+        if x:y=int(parent[y,x])
+    # Robust median smoothing.
+    sm=trace.copy()
+    for x in range(w):
+        lo=max(0,x-2); hi=min(w,x+3); sm[x]=float(np.median(trace[lo:hi]))
+    xfull=np.arange(w)+bx
+    # Baseline: median trace; signal positive upward.
+    baseline=float(np.median(sm)); sig=baseline-sm
+    # Remove slow drift with broad moving median approximation.
+    win=max(15,int(.06*w)); drift=np.zeros(w)
+    for x in range(w):
+        lo=max(0,x-win); hi=min(w,x+win+1); drift[x]=float(np.median(sig[lo:hi]))
+    z=sig-drift
+    dz=np.gradient(z); energy=np.abs(dz)
+    # QRS candidates from local energy + amplitude, with refractory distance.
+    ewin=max(3,int(.012*w)); env=np.convolve(energy,np.ones(ewin)/ewin,mode='same')
+    thr=float(np.median(env)+2.8*np.median(np.abs(env-np.median(env))))
+    cand=[]
+    for x in range(2,w-2):
+        if env[x]>=thr and env[x]>=env[x-1] and env[x]>=env[x+1]: cand.append(x)
+    refractory=max(18,int(.12*w))
+    chosen=[]
+    for x in sorted(cand,key=lambda q:env[q],reverse=True):
+        if all(abs(x-k)>=refractory for k in chosen): chosen.append(x)
+    chosen=sorted(chosen)
+    # Refine each energy center to strongest absolute deflection locally.
+    qrs=[]; rad=max(6,int(.025*w))
+    for c in chosen:
+        lo=max(0,c-rad); hi=min(w,c+rad+1)
+        k=lo+int(np.argmax(np.abs(z[lo:hi])))
+        qrs.append(int(k))
+    # QC metrics independent of clinical labels.
+    dark_support=[]
+    for x,yv in enumerate(sm.astype(int)):
+        cy=yv-by
+        if 0<=cy<h: dark_support.append(float(score[cy,x]))
+    support=float(np.mean(np.array(dark_support)>0.16)) if dark_support else 0.0
+    jumps=np.abs(np.diff(sm)); continuity=float(np.mean(jumps<=max(3,.04*h))) if len(jumps) else 0
+    qc='PASS' if support>=.62 and continuity>=.92 and len(qrs)>=2 else 'REVIEW'
+    return {'lead':region.get('lead'),'status':qc,'support':round(support,3),'continuity':round(continuity,3),
+            'x':xfull.tolist(),'trace_y':sm.tolist(),'signal':z.tolist(),'qrs_candidates_x':[int(xfull[k]) for k in qrs],
+            'threshold':round(thr,4),'width':W,'height':H}
+
+def v15_waveform_overlay(region,res):
+    from PIL import ImageDraw
+    img=_region_pil_image(region).copy(); d=ImageDraw.Draw(img)
+    xs=res.get('x') or []; ys=res.get('trace_y') or []
+    if len(xs)>1:
+        d.line([(int(x),int(y)) for x,y in zip(xs,ys)],fill=(0,110,255),width=2)
+    for x in res.get('qrs_candidates_x') or []:
+        d.line((x,0,x,img.height-1),fill=(255,90,0),width=2)
+    d.rectangle((0,0,min(img.width-1,390),28),fill=(255,255,255))
+    d.text((6,6),f"v15 trace {res.get('lead')} | {res.get('status')} | support {res.get('support')} | QRS {len(res.get('qrs_candidates_x') or [])}",fill=(0,0,0))
+    return img
+
+def v15_contact_sheet(single_leads,results):
+    from PIL import Image,ImageDraw
+    ims=[]
+    bylead={r.get('lead'):r for r in results}
+    for reg in single_leads:
+        rr=bylead.get(reg.get('lead'))
+        if rr: ims.append(v15_waveform_overlay(reg,rr))
+    if not ims:return None
+    target=900; scaled=[]
+    for im in ims:
+        h=max(1,int(im.height*target/im.width)); scaled.append(im.resize((target,h)))
+    total=sum(im.height+8 for im in scaled)
+    out=Image.new('RGB',(target,total),'white'); y=0
+    for im in scaled: out.paste(im,(0,y)); y+=im.height+8
+    return out
+
+
 def validate_landmark_cycle(item):
     """Beat-locked temporal QC; prevents mixing P/QRS/T from different beats."""
     issues=[]
@@ -4093,31 +4209,24 @@ def _morphology_components(morph):
 def _normalized_morphology(morph):
     return str(morph or "").replace("′","'").replace("’","'").replace(" ","").strip()
 
-def _refine_qrs_apex(region, pt, component, x_left_pct=None, x_right_pct=None):
-    """v14.11 order-preserving apex refinement.
-    Search the true local extremum but never cross the temporal corridor supplied
-    by neighboring semantic QRS components. This prevents a correct R apex from
-    being discarded merely because an unconstrained refinement crossed Q/S.
+def _refine_qrs_apex(region, pt, component):
+    """Refine an already-correct QRS component to the true local apex.
+    Image y decreases upward: R/R' -> minimum y; Q/S/QS -> maximum y.
     """
     import numpy as np
     if not isinstance(pt,dict): return pt,{"status":"REVIEW","reason":"missing_seed"}
     x=_pt_x(pt); y=_pt_y(pt)
     if x is None:return pt,{"status":"REVIEW","reason":"missing_seed_x"}
-    tr=_local_dark_trace(region,x,y,1.9,22.0)
+    tr=_local_dark_trace(region,x,y,1.15,18.0)
     ty=tr.get("trace_y")
     if ty is None:return pt,{"status":"REVIEW","reason":tr.get("reason"),"confidence":tr.get("confidence",0.0)}
     ty=np.asarray(ty,dtype=float); W=tr["width"]; H=tr["height"]
     gx=np.arange(len(ty))+tr["x0"]
     seed=x/100.0*(W-1)
-    # Wider than v14.10, but bounded by neighboring component midpoints.
-    left=seed-max(4.0,0.018*W); right=seed+max(4.0,0.018*W)
-    if x_left_pct is not None:
-        left=max(left,float(x_left_pct)/100.0*(W-1))
-    if x_right_pct is not None:
-        right=min(right,float(x_right_pct)/100.0*(W-1))
-    keep=(gx>=left)&(gx<=right)
-    if not np.any(keep):
-        return pt,{"status":"REVIEW","reason":"empty_order_corridor","confidence":tr.get("confidence",0.0)}
+    # Do not jump to a neighboring complex: apex search is intentionally tight.
+    dist=np.abs(gx-seed)
+    keep=dist<=max(3.0,0.010*W)
+    if not np.any(keep): keep=np.ones(len(ty),dtype=bool)
     inds=np.where(keep)[0]
     if component in ("r_peak","r_prime_peak"):
         k=int(inds[np.argmin(ty[inds])])
@@ -4126,33 +4235,7 @@ def _refine_qrs_apex(region, pt, component, x_left_pct=None, x_right_pct=None):
     out={"x_pct":round(100.0*float(gx[k])/max(1,W-1),3),
          "y_pct":round(100.0*float(ty[k])/max(1,H-1),3)}
     return out,{"status":tr.get("status"),"confidence":tr.get("confidence"),
-                "reason":tr.get("reason"),"apex_refined":True,
-                "order_corridor_pct":[round(100.0*left/max(1,W-1),3),round(100.0*right/max(1,W-1),3)]}
-
-def _snap_qs_dominant_negative(item,region):
-    """Dedicated QS detector: one dominant negative deflection inside the AI QRS corridor.
-    It does not require a raw S proposal and does not split QS into Q+S.
-    """
-    import numpy as np
-    raw_on=item.get("qrs_on"); raw_j=item.get("j_point")
-    seeds=[p for p in (item.get("q_peak"),item.get("s_peak"),raw_on,raw_j) if isinstance(p,dict)]
-    xs=[_pt_x(p) for p in seeds if _pt_x(p) is not None]
-    ys=[_pt_y(p) for p in seeds if _pt_y(p) is not None]
-    if not xs:return None,{"status":"REVIEW","reason":"qs_no_seed","confidence":0.0}
-    center=sum(xs)/len(xs); yhint=sum(ys)/len(ys) if ys else None
-    half=max(3.2,(max(xs)-min(xs))/2.0+2.2) if len(xs)>1 else 4.0
-    tr=_local_dark_trace(region,center,yhint,half,30.0)
-    ty=tr.get("trace_y")
-    if ty is None:return None,{"status":"REVIEW","reason":tr.get("reason"),"confidence":tr.get("confidence",0.0)}
-    ty=np.asarray(ty,dtype=float); W=tr["width"]; H=tr["height"]; gx=np.arange(len(ty))+tr["x0"]
-    # Negative ECG deflection is downward on image => maximum image y.
-    # Restrict to the central QRS corridor, excluding patch edges/baseline drift.
-    lo=(min(xs)-1.5)/100.0*(W-1); hi=(max(xs)+1.5)/100.0*(W-1)
-    keep=(gx>=lo)&(gx<=hi)
-    if not np.any(keep):keep=np.ones(len(ty),dtype=bool)
-    inds=np.where(keep)[0]; k=int(inds[np.argmax(ty[inds])])
-    pt={"x_pct":round(100.0*float(gx[k])/max(1,W-1),3),"y_pct":round(100.0*float(ty[k])/max(1,H-1),3)}
-    return pt,{"status":tr.get("status"),"confidence":tr.get("confidence"),"reason":tr.get("reason"),"qs_dominant_negative":True}
+                "reason":tr.get("reason"),"apex_refined":True}
 
 def _v1410_expected_qrs(item):
     """Return expected QRS components with a clinically safer QS special case."""
@@ -4199,56 +4282,41 @@ def _full_landmark_overlay_png(result, data):
 
 
 def _snap_qrs_morphology_aware(item,region):
-    """v14.11: morphology-aware QRS with order-preserving apex corridors."""
+    """Snap QRS extrema with morphology and temporal-order constraints."""
     raw={k:item.get(k) for k in V14_LANDMARK_KEYS}
+    morph=item.get("morphology_candidate")
     expected,morph_mode=_v1410_expected_qrs(item)
     result={k:None for k in ("q_peak","r_peak","s_peak","r_prime_peak")}
     details={"_morphology_mode":morph_mode}
-    if morph_mode=="QS_SINGLE_NEGATIVE":
-        pt,qc=_snap_qs_dominant_negative(item,region)
-        result["s_peak"]=pt
-        details["s_peak"]=qc
-        return result,details,["s_peak"]
+    # If morphology unavailable, use only components explicitly proposed by AI.
     if not expected:
         expected=[k for k in ("q_peak","r_peak","s_peak","r_prime_peak") if raw.get(k) is not None]
 
-    # Build semantic x order from raw AI. Neighbor midpoints define safe refinement corridors.
-    seeds=[]
+    last_x=-1e9
     for k in expected:
-        rp=raw.get(k); xx=_pt_x(rp)
-        if rp is not None and xx is not None: seeds.append((k,rp,xx))
-        else: details[k]={"status":"REVIEW","confidence":0.0,"reason":"morphology_expected_but_ai_missing"}
-    seeds.sort(key=lambda z:z[2])
-    refined=[]
-    for i,(k,rp,xx) in enumerate(seeds):
+        rp=raw.get(k)
+        if morph_mode=="QS_SINGLE_NEGATIVE" and k=="s_peak" and rp is None:
+            rp=raw.get("q_peak") or raw.get("s_peak")
+        if rp is None:
+            details[k]={"status":"REVIEW","confidence":0.0,"reason":"morphology_expected_but_ai_missing"}
+            continue
         pt,tr=_local_snap_point(region,rp,k)
         if pt is None:
-            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":tr.get("reason")};continue
-        left=None;right=None
-        if i>0:left=(seeds[i-1][2]+xx)/2.0
-        if i+1<len(seeds):right=(xx+seeds[i+1][2])/2.0
-        pt,aq=_refine_qrs_apex(region,pt,k,left,right)
-        refined.append((k,pt,xx,aq,tr))
-
-    # Preserve semantic component identity; reject only if final order is truly impossible.
-    last=-1e9
-    for k,pt,rawx,aq,tr in refined:
-        xx=_pt_x(pt)
-        if xx is None or xx<=last:
-            # Fall back to the raw semantic seed rather than deleting a plausible component.
-            rp=raw.get(k)
-            fallback,_=_local_snap_point(region,rp,k) if rp is not None else (None,{})
-            fx=_pt_x(fallback)
-            if fallback is not None and fx is not None and fx>last:
-                result[k]=fallback; last=fx
-                details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"apex_order_fallback_to_local_seed","apex_refined":False}
-            else:
-                details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"qrs_component_order_conflict"}
+            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":tr.get("reason")}
             continue
-        result[k]=pt; last=xx
-        details[k]={"status":aq.get("status") or tr.get("status"),"confidence":aq.get("confidence",tr.get("confidence")),
-                    "reason":aq.get("reason") or tr.get("reason"),"apex_refined":True,
-                    "order_corridor_pct":aq.get("order_corridor_pct")}
+        pt,apex_qc=_refine_qrs_apex(region,pt,k)
+        x=_pt_x(pt)
+        # Enforce temporal order; if local snap jumps backward, keep raw x neighborhood but REVIEW.
+        if x is not None and x <= last_x:
+            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"qrs_component_order_conflict"}
+            continue
+        result[k]=pt
+        last_x=x if x is not None else last_x
+        details[k]={"status":apex_qc.get("status") or tr.get("status"),
+                    "confidence":apex_qc.get("confidence",tr.get("confidence")),
+                    "reason":apex_qc.get("reason") or tr.get("reason"),"apex_refined":True}
+
+    # Components not expected by morphology must remain null.
     return result,details,expected
 
 def _snap_qrs_boundaries_from_components(item,region,qrs_components):
@@ -4340,7 +4408,7 @@ def morphology_boundary_snr_snap(item,region):
         x["quality"]="review"
         x.setdefault("snap_issues",[]).append("QRS_BOUNDARY_ORDER_REJECTED")
 
-    x["snap_method"]="order_preserving_qrs_qs_v14_11"
+    x["snap_method"]="qrs_apex_negative_boundary_v14_10"
     # Overall snap PASS now requires boundary + SNR + local trace.
     local_ok=x.get("snap_centerline_qc")=="PASS"
     boundary_ok=x.get("qrs_boundary_qc",{}).get("status")=="PASS"
@@ -4355,7 +4423,7 @@ def morphology_boundary_snr_snap_all(data,regions):
         region=byid.get(item.get("region_id"))
         if region is None:
             z=dict(item);z["quality"]="review";z["snap_applied"]=False
-            z["snap_method"]="order_preserving_qrs_qs_v14_11";z["snap_issues"]=["region_missing"]
+            z["snap_method"]="qrs_apex_negative_boundary_v14_10";z["snap_issues"]=["region_missing"]
             out.append(z);issues.append(item.get("lead","?")+":region_missing");continue
         z=morphology_boundary_snr_snap(item,region)
         cyc=validate_landmark_cycle(z)
@@ -4995,7 +5063,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · Order-Preserving QRS Apex + QS Negative Detector")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · QRS Apex Refinement + Negative-QRS Handling")
 st.caption("Nếu không thấy dòng PHIÊN BẢN v14.10-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
@@ -5271,6 +5339,39 @@ else:
                 for _j,_r in enumerate(_single_leads[_i:_i+3]):
                     with _cc[_j]:
                         st.image(_r["png"],caption=_r["lead"],width="stretch")
+
+        # v15.0 Waveform Lab: independent of Gemini landmark coordinates.
+        st.markdown("### v15.0 — Waveform Lab (signal-only)")
+        st.caption("Kiểm chứng kiến trúc mới: ảnh single-lead → trace 1-D → QRS candidates. Không dùng P/Q/R/S/J/T do Gemini đề xuất.")
+        _v15_results=[]
+        for _r in _single_leads:
+            try:
+                _v15_results.append(v15_extract_waveform(_r))
+            except Exception as _exc:
+                _v15_results.append({"lead":_r.get("lead"),"status":"ERROR","error":str(_exc)[:300],"qrs_candidates_x":[]})
+        _v15_by={x.get("lead"):x for x in _v15_results}
+        _v15_lead=st.selectbox("Lead kiểm tra waveform",[r["lead"] for r in _single_leads],key="v15_waveform_lead_"+frame_id)
+        _v15_reg=next(r for r in _single_leads if r["lead"]==_v15_lead)
+        _v15_res=_v15_by[_v15_lead]
+        if _v15_res.get("status")!="ERROR":
+            st.image(v15_waveform_overlay(_v15_reg,_v15_res),caption="Xanh = trace digitized; cam = QRS candidate. Đây là bằng chứng CV độc lập, chưa phải landmark PQRST.",width="stretch")
+        else:
+            st.error(_v15_res.get("error"))
+        st.dataframe([{k:v for k,v in x.items() if k in ("lead","status","support","continuity","qrs_candidates_x","error")} for x in _v15_results],hide_index=True,width="stretch")
+        try:
+            _v15_sheet=v15_contact_sheet(_single_leads,_v15_results)
+            _v15_buf=io.BytesIO(); _v15_sheet.save(_v15_buf,format="PNG") if _v15_sheet is not None else None
+            _v15_png=_v15_buf.getvalue() if _v15_sheet is not None else b""
+        except Exception as _exc:
+            _v15_png=b""; st.warning("Không dựng được v15 validation sheet: "+str(_exc))
+        _v15_json=json.dumps(_v15_results,ensure_ascii=False,indent=2).encode("utf-8")
+        _a,_b=st.columns(2)
+        with _a:
+            if _v15_png: st.download_button("Tải v15 Waveform Validation PNG",_v15_png,"ecg_v15_waveform_validation.png","image/png",key="v15_png_"+frame_id,width="stretch")
+        with _b:
+            st.download_button("Tải v15 Waveform JSON",_v15_json,"ecg_v15_waveform_validation.json","application/json",key="v15_json_"+frame_id,width="stretch")
+        _pass=sum(1 for x in _v15_results if x.get("status")=="PASS")
+        st.info(f"v15.0 waveform QC: PASS {_pass}/12. Chưa dùng kết quả này để chẩn đoán; mục tiêu hiện tại chỉ là xác minh trace/QRS trên ảnh.")
 
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     context = {"age":age,"sex":sex,"history":history.strip() or None,"user_confirmed_calibration":known}
