@@ -2615,8 +2615,8 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.4"
-PROMPT_VERSION = "ecg-landmark-stable-sequential-v14.4"
+APP_VERSION = "v14.4.1"
+PROMPT_VERSION = "ecg-landmark-stable-sequential-v14.4.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
 STREAM_BUDGET_SECONDS = 120
@@ -4255,7 +4255,7 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
 st.caption(f"PHIÊN BẢN {APP_VERSION} · 29/10/2026 · AI Landmark → Scale-safe Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.4 thì Streamlit đang chạy file/bản khác.")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.4.1 thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -4274,7 +4274,8 @@ with st.sidebar:
         provider = st.selectbox("Dịch vụ chính", ["Google Gemini", "OpenAI"], key="service_v9")
         model = st.text_input("Model chính", value=get_secret("GEMINI_MODEL", GEMINI_MODEL) if provider == "Google Gemini" else get_secret("OPENAI_MODEL", "gpt-4o"), key="model_v9_"+provider).strip()
         thinking = st.selectbox("Mức suy luận Gemini 3.6 Flash", ["medium", "high", "low"], key="thinking_v9")
-        auto_failover = st.checkbox("Tự chuyển sang nguồn dự phòng đã khai báo", value=True, key="failover_v9")
+        auto_failover = True
+        st.caption("Failover tuần tự: BẬT bắt buộc khi đã khai báo ECG_API_ROUTES.")
         allow_other_provider = st.checkbox("Cho phép gửi ảnh sang nhà cung cấp khác khi dự phòng", value=False, key="cross_provider_v9")
         manual_key = ""
         if not get_secret("ECG_API_ROUTES", []) and not get_secret("GEMINI_API_KEY" if provider == "Google Gemini" else "OPENAI_API_KEY", ""):
@@ -4283,10 +4284,10 @@ with st.sidebar:
             routes = configured_routes(provider, model, thinking, manual_key)
             if not allow_other_provider:
                 routes = [r for r in routes if r["provider"] == provider]
-            if not auto_failover:
-                routes = routes[:1]
-            st.caption("Thứ tự: " + (" → ".join(r["name"] + " (" + r["model"] + ")" for r in routes) or "Chưa có nguồn API"))
-            st.caption("Tối đa 3 lần gọi/lượt. Bỏ qua quota đang nghỉ; không đổi key cùng project để vượt quota. Không gửi lại khi báo cáo dở dang hoặc sai cấu trúc.")
+            # v14.4.1: never silently truncate configured backup routes.
+            st.caption(f"Loaded routes: {len(routes)}")
+            st.caption("Thứ tự failover: " + (" → ".join(r["name"] + " (" + r["model"] + ")" for r in routes) or "Chưa có nguồn API"))
+            st.caption("Mỗi route: lỗi tạm thời retry tối đa 3 lần; lỗi cố định chuyển ngay route kế. Thành công thì dừng. Không gọi song song.")
             runtime = api_runtime()
             with runtime["lock"]:
                 for r in routes:
@@ -4634,6 +4635,7 @@ else:
             st.warning("Cần thiết lập model và API key trong Thiết lập AI.")
         else:
             st.session_state.pop("last_report_v9",None)
+            st.caption(f"Routes sẵn sàng cho lượt này: {len(routes)} · " + " → ".join(r["name"] for r in routes))
             try:
                 outcome, selected = run_with_failover(routes, regions, prompt)
             except APIRoutesFailed as exc:
