@@ -2615,7 +2615,7 @@ def preprocess_ecg(pil_img, remove_shadow=True, apply_clahe=True, clahe_clip=2.0
     return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB))
 
 # ----------------- DỮ LIỆU VÀ CẤU TRÚC BÁO CÁO -----------------
-APP_VERSION = "v14.8-v13base"
+APP_VERSION = "v14.9-v13base"
 PROMPT_VERSION = "ecg-qrs-identity-schema-safe-sanitizer-v13.7.1"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT_SECONDS = 45
@@ -4051,6 +4051,195 @@ def _local_snap_point(region, point, kind):
              "y_pct":round(100.0*yy/max(1,H-1),3)}
     return snapped,tr
 
+
+def _pt_x(pt):
+    try:return float(pt["x_pct"]) if isinstance(pt,dict) else None
+    except Exception:return None
+
+def _pt_y(pt):
+    try:return float(pt["y_pct"]) if isinstance(pt,dict) else None
+    except Exception:return None
+
+def _local_signal_snr(region, center_x_pct, center_y_pct=None, half_width_pct=5.0):
+    """Robust local amplitude/noise proxy. Used only as a rejection gate."""
+    import numpy as np
+    tr=_local_dark_trace(region,center_x_pct,center_y_pct,half_width_pct,24.0)
+    y=tr.get("trace_y")
+    if y is None:return {"snr":0.0,"amplitude_px":0.0,"noise_px":999.0,"status":"REVIEW"}
+    y=np.asarray(y,dtype=float)
+    if len(y)<7:return {"snr":0.0,"amplitude_px":0.0,"noise_px":999.0,"status":"REVIEW"}
+    med=float(np.median(y))
+    amp=float(np.percentile(np.abs(y-med),95))
+    dy=np.diff(y)
+    mad=float(np.median(np.abs(dy-np.median(dy))))
+    noise=max(0.8,1.4826*mad)
+    snr=amp/noise
+    return {"snr":round(float(snr),3),"amplitude_px":round(amp,3),
+            "noise_px":round(noise,3),
+            "status":"PASS" if snr>=2.2 and amp>=2.0 else "REVIEW"}
+
+def _morphology_components(morph):
+    """Translate AI morphology string into expected QRS components/order."""
+    if not morph:return []
+    m=str(morph).replace("′","'").replace("’","'").strip()
+    out=[]
+    for ch in m:
+        if ch in "qQ": out.append("q_peak")
+        elif ch in "rR": out.append("r_peak" if "r_peak" not in out else "r_prime_peak")
+        elif ch in "sS": out.append("s_peak")
+    return out
+
+def _snap_qrs_morphology_aware(item,region):
+    """Snap QRS extrema with morphology and temporal-order constraints."""
+    raw={k:item.get(k) for k in V14_LANDMARK_KEYS}
+    morph=item.get("morphology_candidate")
+    expected=_morphology_components(morph)
+    result={k:None for k in ("q_peak","r_peak","s_peak","r_prime_peak")}
+    details={}
+    # If morphology unavailable, use only components explicitly proposed by AI.
+    if not expected:
+        expected=[k for k in ("q_peak","r_peak","s_peak","r_prime_peak") if raw.get(k) is not None]
+
+    last_x=-1e9
+    for k in expected:
+        rp=raw.get(k)
+        if rp is None:
+            details[k]={"status":"REVIEW","confidence":0.0,"reason":"morphology_expected_but_ai_missing"}
+            continue
+        pt,tr=_local_snap_point(region,rp,k)
+        if pt is None:
+            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":tr.get("reason")}
+            continue
+        x=_pt_x(pt)
+        # Enforce temporal order; if local snap jumps backward, keep raw x neighborhood but REVIEW.
+        if x is not None and x <= last_x:
+            details[k]={"status":"REVIEW","confidence":tr.get("confidence",0.0),"reason":"qrs_component_order_conflict"}
+            continue
+        result[k]=pt
+        last_x=x if x is not None else last_x
+        details[k]={"status":tr.get("status"),"confidence":tr.get("confidence"),"reason":tr.get("reason")}
+
+    # Components not expected by morphology must remain null.
+    return result,details,expected
+
+def _snap_qrs_boundaries_from_components(item,region,qrs_components):
+    """Find onset before first QRS extremum and J after last extremum, walking toward baseline."""
+    import numpy as np
+    xs=[_pt_x(qrs_components.get(k)) for k in ("q_peak","r_peak","s_peak","r_prime_peak")]
+    xs=[x for x in xs if x is not None]
+    if not xs:
+        return None,None,{"status":"REVIEW","reason":"no_qrs_components","confidence":0.0}
+
+    first=min(xs); last=max(xs)
+    raw_on=item.get("qrs_on"); raw_j=item.get("j_point")
+    yhint=_pt_y(raw_on) if raw_on else _pt_y(raw_j)
+    center=(first+last)/2.0
+    # Wide patch covering QRS plus margins.
+    half=max(3.5,(last-first)/2.0+3.0)
+    tr=_local_dark_trace(region,center,yhint,half,26.0)
+    ty=tr.get("trace_y")
+    if ty is None:
+        return None,None,{"status":"REVIEW","reason":tr.get("reason"),"confidence":tr.get("confidence",0.0)}
+
+    W=tr["width"]; H=tr["height"]; x0=tr["x0"]
+    ty=np.asarray(ty,dtype=float); gx=np.arange(len(ty))+x0
+    # Baseline from outer 20% of local patch.
+    edge=max(3,len(ty)//5)
+    baseline=float(np.median(np.r_[ty[:edge],ty[-edge:]]))
+    dev=np.abs(ty-baseline)
+    noise=max(1.0,1.4826*float(np.median(np.abs(np.diff(ty)-np.median(np.diff(ty))))))
+    threshold=max(1.5,2.2*noise)
+
+    fi=int(np.argmin(np.abs(gx-first/100.0*(W-1))))
+    li=int(np.argmin(np.abs(gx-last/100.0*(W-1))))
+
+    # Walk left from first component until signal returns near baseline.
+    oi=fi
+    for k in range(fi,max(-1,fi-edge*2),-1):
+        if dev[k] <= threshold:
+            oi=k; break
+    # Walk right from last component until signal returns near baseline.
+    ji=li
+    for k in range(li,min(len(ty),li+edge*2)):
+        if dev[k] <= threshold:
+            ji=k; break
+
+    onset={"x_pct":round(100.0*float(gx[oi])/max(1,W-1),3),
+           "y_pct":round(100.0*float(ty[oi])/max(1,H-1),3)}
+    jpt={"x_pct":round(100.0*float(gx[ji])/max(1,W-1),3),
+         "y_pct":round(100.0*float(ty[ji])/max(1,H-1),3)}
+    ok=(_pt_x(onset) < first <= last < _pt_x(jpt))
+    qc={"status":"PASS" if ok else "REVIEW",
+        "reason":None if ok else "boundary_order_failed",
+        "confidence":tr.get("confidence",0.0),
+        "baseline_y_px":round(baseline,2),"threshold_px":round(threshold,2)}
+    return onset,jpt,qc
+
+def morphology_boundary_snr_snap(item,region):
+    """v14.9: local trace + morphology-aware QRS + deterministic boundaries + low-SNR rejection."""
+    # Start with v14.8 P/T/local proposals.
+    x=local_snap_landmarks(item,region)
+    raw=x.get("ai_landmarks_raw") or {k:item.get(k) for k in V14_LANDMARK_KEYS}
+
+    qrs,qdet,expected=_snap_qrs_morphology_aware(item,region)
+    for k,v in qrs.items(): x[k]=v
+    x["qrs_expected_components"]=expected
+    x["qrs_snap_details"]=qdet
+
+    q_on,jpt,bqc=_snap_qrs_boundaries_from_components(item,region,qrs)
+    x["qrs_on"]=q_on
+    x["j_point"]=jpt
+    x["qrs_boundary_qc"]=bqc
+
+    # Low-SNR gate based around QRS. Do not invent subtle P/T when trace is too weak.
+    qrs_xs=[_pt_x(qrs.get(k)) for k in qrs if qrs.get(k) is not None]
+    qcenter=sum(qrs_xs)/len(qrs_xs) if qrs_xs else _pt_x(raw.get("qrs_on"))
+    snr=_local_signal_snr(region,qcenter,_pt_y(raw.get("qrs_on")),5.0) if qcenter is not None else {"snr":0,"status":"REVIEW"}
+    x["local_signal_qc"]=snr
+    if snr.get("status")!="PASS":
+        # Preserve QRS only if its own morphology/boundary evidence exists; reject subtle waves.
+        for k in ("p_on","p_peak","p_off","t_peak","t_end"):
+            x[k]=None
+        x["quality"]="review"
+        x.setdefault("snap_issues",[]).append("LOW_SNR_P_T_REJECTED")
+
+    # Hard QRS ordering gate.
+    compxs=[_pt_x(x.get(k)) for k in ("q_peak","r_peak","s_peak","r_prime_peak") if x.get(k) is not None]
+    onx=_pt_x(x.get("qrs_on")); jx=_pt_x(x.get("j_point"))
+    if compxs and (onx is None or jx is None or not (onx < min(compxs) <= max(compxs) < jx)):
+        x["qrs_on"]=None; x["j_point"]=None
+        x["quality"]="review"
+        x.setdefault("snap_issues",[]).append("QRS_BOUNDARY_ORDER_REJECTED")
+
+    x["snap_method"]="morphology_boundary_snr_v14_9"
+    # Overall snap PASS now requires boundary + SNR + local trace.
+    local_ok=x.get("snap_centerline_qc")=="PASS"
+    boundary_ok=x.get("qrs_boundary_qc",{}).get("status")=="PASS"
+    snr_ok=x.get("local_signal_qc",{}).get("status")=="PASS"
+    x["snap_centerline_qc"]="PASS" if local_ok and boundary_ok and snr_ok else "REVIEW"
+    return x
+
+def morphology_boundary_snr_snap_all(data,regions):
+    byid={r.get("id"):r for r in regions}
+    out=[];issues=[]
+    for item in data.get("lead_landmarks",[]):
+        region=byid.get(item.get("region_id"))
+        if region is None:
+            z=dict(item);z["quality"]="review";z["snap_applied"]=False
+            z["snap_method"]="morphology_boundary_snr_v14_9";z["snap_issues"]=["region_missing"]
+            out.append(z);issues.append(item.get("lead","?")+":region_missing");continue
+        z=morphology_boundary_snr_snap(item,region)
+        cyc=validate_landmark_cycle(z)
+        z["cycle_qc"]="PASS" if not cyc else "REVIEW"
+        z["cycle_issues"]=cyc
+        if cyc:z["quality"]="review"
+        issues.extend([item.get("lead","?")+":"+q for q in z.get("snap_issues",[])])
+        issues.extend([item.get("lead","?")+":"+q for q in cyc])
+        out.append(z)
+    d=dict(data);d["lead_landmarks"]=out
+    return d,issues
+
+
 def local_snap_landmarks(item,region):
     """v14.8 final landmark snapping: each point gets its own local trace patch."""
     snapped=dict(item)
@@ -4259,7 +4448,7 @@ def render_result(result):
         with st.expander("Lịch sử chọn nguồn API của lượt này"):
             st.dataframe(result.get("attempts",[]), hide_index=True, width="stretch")
 
-        st.info("v14.8: AI chỉ semantic-localize landmark. Python dựng trace cục bộ quanh từng landmark, snap điểm vào nét ECG thật rồi Measurement Core mới tính số đo.")
+        st.info("v14.9: Local trace giữ nguyên; QRS được snap theo morphology/polarity, QRS-on/J tìm từ biên QRS về baseline, và low-SNR gate từ chối P/T không đủ chắc.")
         tech=data.get("technical_review") or {}
         with st.expander("Technical review từ AI", expanded=False):
             st.json(tech)
@@ -4305,7 +4494,7 @@ def render_result(result):
                     annotated=_annotate_v14_landmarks(region,lm)
                     st.image(annotated,width="stretch")
                     if lm.get("snap_applied") is True:
-                        st.caption(f"Overlay SAU local-trace snapping · Snap QC: {lm.get('snap_centerline_qc')} · confidence: {lm.get('snap_centerline_confidence')} · required-pass: {lm.get('snap_local_required_pass_ratio')}. Raw AI proposal được giữ trong JSON.")
+                        st.caption(f"Overlay v14.9 · Snap QC: {lm.get('snap_centerline_qc')} · local conf: {lm.get('snap_centerline_confidence')} · QRS boundary: {(lm.get('qrs_boundary_qc') or {}).get('status')} · local SNR: {(lm.get('local_signal_qc') or {}).get('snr')}. Raw AI proposal được giữ trong JSON.")
                     else:
                         st.error("RAW AI LANDMARK — waveform snapping CHƯA chạy thành công cho lead này. Không coi overlay là measurement evidence.")
                 except Exception as exc:
@@ -4658,8 +4847,8 @@ def digitizer_group_proposals(result, image_size, padding_pct=1.5):
 
 # ----------------- GIAO DIỆN -----------------
 st.title("🫀 Phân tích ECG — by dr. Lai")
-st.caption(f"PHIÊN BẢN {APP_VERSION} · Local Trace Snapping → Deterministic Measurement")
-st.caption("Nếu không thấy dòng PHIÊN BẢN v14.8-v13base thì Streamlit đang chạy file/bản khác.")
+st.caption(f"PHIÊN BẢN {APP_VERSION} · Morphology-aware QRS + Boundary/SNR Gates")
+st.caption("Nếu không thấy dòng PHIÊN BẢN v14.9-v13base thì Streamlit đang chạy file/bản khác.")
 st.info("AI có thể đọc sai. Bác sĩ cần đối chiếu ECG gốc và lâm sàng trước khi sử dụng; ứng dụng chưa có bộ đo tín hiệu ECG đã được kiểm chứng.")
 
 with st.sidebar:
@@ -5085,7 +5274,7 @@ else:
                 # Stage 2 — waveform snapping. Failure must NOT discard valid AI landmarks.
                 if data is not None:
                     try:
-                        snapped_data, snap_issues = local_snap_all_landmarks(data,regions)
+                        snapped_data, snap_issues = morphology_boundary_snr_snap_all(data,regions)
                         data = snapped_data
                     except Exception as exc:
                         stage_errors.append({"stage":"waveform_snap","type":type(exc).__name__,"detail":str(exc)[:500]})
