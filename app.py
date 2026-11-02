@@ -4146,67 +4146,111 @@ def _v17_black_ink_probability(pil_img):
     return np.clip(prob,0,1)
 
 
+def _v171_grid_suppress(pil):
+    """Estimate periodic grid lines on color residual; retain dark neutral intersections."""
+    rgb=np.asarray(pil.convert('RGB'),dtype=np.float32)
+    h,w=rgb.shape[:2]
+    red=np.maximum(0,rgb[:,:,0]-.5*(rgb[:,:,1]+rgb[:,:,2]))
+    neutral=np.max(rgb,axis=2)-np.min(rgb,axis=2)
+    gray=np.mean(rgb,axis=2)
+    # Grid position from robust red-ink projection, never from dark waveform.
+    redmask=(red>8)&(rgb[:,:,0]>rgb[:,:,1]+5)&(gray>65)
+    row=np.mean(redmask,axis=1).astype(np.float32)
+    col=np.mean(redmask,axis=0).astype(np.float32)
+    def periodic_peaks(v):
+        v=cv2.GaussianBlur(v.reshape(-1,1),(1,5),0).ravel()
+        baseline=float(np.median(v)); spread=float(np.std(v))
+        ids=np.where(v>baseline+max(.018,.8*spread))[0]
+        if len(ids)==0:return []
+        groups=np.split(ids,np.where(np.diff(ids)>1)[0]+1)
+        return [int(np.mean(g)) for g in groups if len(g)<=max(9,int(len(v)*.025))]
+    ys=periodic_peaks(row);xs=periodic_peaks(col)
+    # Only suppress color-classified grid pixels, not neutral/dark waveform intersections.
+    grid=np.zeros((h,w),dtype=bool)
+    for y in ys:grid[max(0,y-2):min(h,y+3),:]=True
+    for x in xs:grid[:,max(0,x-2):min(w,x+3)]=True
+    dark=(gray<145)&(neutral<38)
+    grid_only=grid&redmask&(~dark)
+    return grid_only,{'grid_row_count':len(ys),'grid_col_count':len(xs),
+                       'grid_pixels_excluded':int(np.count_nonzero(grid_only))}
+
+
 def _v17_segment_region(region, expected_x=None):
-    """Segment ECG ink in one lead band; retain morphology, do not force a 1-D path."""
-    pil=_region_pil_image(region).convert('RGB'); arr=np.asarray(pil)
-    h,w=arr.shape[:2]
+    """v17.1: grid-color suppression plus conservative ink isolation, no invented 1-D trace."""
+    pil=_region_pil_image(region).convert('RGB'); rgb=np.asarray(pil,dtype=np.uint8)
+    h,w=rgb.shape[:2]
+    grid_only,gmeta=_v171_grid_suppress(pil)
     prob=_v17_black_ink_probability(pil)
-    # Adaptive but bounded threshold: low-voltage gray ink must survive.
-    central=prob[int(.08*h):max(int(.09*h),int(.92*h)), int(.04*w):max(int(.05*w),int(.96*w))]
-    q=float(np.percentile(central,82)) if central.size else .24
-    thr=float(np.clip(0.72*q,0.18,0.34))
-    mask=prob>=thr
-    # Exclude crop borders/lead labels; right calibration is handled component-wise below.
-    mask[:max(2,int(.025*h)),:]=False; mask[-max(2,int(.025*h)):,:]=False
+    # Do not use the 82nd percentile: in dense grids it selects the grid itself.
+    threshold=.29
+    mask=(prob>=threshold)&(~grid_only)
+    mask[:max(2,int(.025*h)),:]=False
+    mask[-max(2,int(.025*h)):,:]=False
     mask[:,:max(3,int(.035*w))]=False
-    # Remove red-grid residue / isolated dots, then reconnect thin black ECG strokes locally.
+    # Remove isolated speckles; no global closing that would join grid to ECG.
     u=(mask.astype(np.uint8)*255)
-    u=cv2.morphologyEx(u,cv2.MORPH_OPEN,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2,2)))
-    u=cv2.morphologyEx(u,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)))
-    # Connected-component selection. Keep horizontally useful ink and components supported at heartbeat windows.
-    n,labels,stats,cents=cv2.connectedComponentsWithStats((u>0).astype(np.uint8),8)
+    n,labels,stats,_=cv2.connectedComponentsWithStats(u,8)
+    keep=np.zeros(n,dtype=bool); comps=[]
     expected=[int(x) for x in (expected_x or []) if 0<=int(x)<w]
-    rad=max(7,int(.035*w)); keep=np.zeros(n,dtype=bool); component_meta=[]
     for k in range(1,n):
         x,y,ww,hh,area=[int(v) for v in stats[k]]
-        if area<max(8,int(.00008*w*h)): continue
-        hits=sum(1 for t in expected if x-rad<=t<=x+ww+rad)
-        span=ww/max(1,w); aspect=ww/max(1,hh)
-        # Text tends to be compact; ECG fragments are horizontally elongated or heartbeat-supported.
-        ok=(span>=.055 and aspect>=.55) or hits>=1 or (area>=.0012*w*h and span>=.025)
-        # Reject tall calibration-like blocks near the far right unless they also span useful waveform width.
-        cal_like=(x>.72*w and hh>.28*h and ww<.16*w)
-        if cal_like and hits==0: ok=False
-        if ok:
+        if area<max(12,int(.00007*w*h)):continue
+        span=ww/max(w,1)
+        # Reject components covering nearly the entire ROI height (grid bridges).
+        if hh>.83*h and area>.07*w*h:continue
+        if (span>=.025 and ww>=12) or (area>=35 and hh>=8):
             keep[k]=True
-            component_meta.append({'x':x,'y':y,'w':ww,'h':hh,'area':area,'heartbeat_hits':hits})
+            comps.append({'x':x,'y':y,'w':ww,'h':hh,'area':area})
     selected=keep[labels]
-    # A modest horizontal close joins waveform fragments across grid erasure without inventing long gaps.
-    sel=(selected.astype(np.uint8)*255)
-    sel=cv2.morphologyEx(sel,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(5,1)))
-    skeleton=_v17_morph_skeleton(sel>0)
-    # QC: heartbeat windows should contain skeleton/ink; skeleton must have meaningful horizontal coverage.
-    beat_hits=[]
+    skel=_v17_morph_skeleton(selected)
+    fraction=float(np.mean(selected));coverage=float(np.mean(np.any(skel,axis=0)))
+    # QC cannot be passed merely because grid crosses a heartbeat x.
+    beat=[]
     for t in expected:
-        a=max(0,t-rad); b=min(w,t+rad+1)
-        beat_hits.append(bool(np.any(skeleton[:,a:b])))
-    col_cov=float(np.mean(np.any(skeleton,axis=0))) if w else 0.0
-    ink_fraction=float(np.mean(sel>0))
-    beat_ratio=float(np.mean(beat_hits)) if beat_hits else 0.0
-    # Penalize implausibly dense masks (text/fold contamination) and nearly empty masks.
-    density_ok=.0005<=ink_fraction<=.16
-    status='PASS' if density_ok and col_cov>=.28 and (not expected or beat_ratio>=.75) else 'REVIEW'
-    reason=[]
-    if not density_ok: reason.append('mask_density')
-    if col_cov<.28: reason.append('skeleton_horizontal_coverage')
-    if expected and beat_ratio<.75: reason.append('heartbeat_anchor_coverage')
-    return {'lead':region.get('lead'),'status':status,'threshold':round(thr,3),
-            'mask_ink_fraction':round(ink_fraction,4),'skeleton_column_coverage':round(col_cov,3),
-            'heartbeat_anchor_hit_ratio':round(beat_ratio,3),'heartbeat_hits':beat_hits,
-            'heartbeat_clock_expected_x':expected,'review_reason':','.join(reason) or None,
-            'component_count':int(len(component_meta)),'components':component_meta,
-            '_mask':sel>0,'_skeleton':skeleton}
+        a=max(0,t-8);b=min(w,t+9)
+        # A heartbeat must contain meaningful vertical excursion of neutral ink.
+        yy=np.where(selected[:,a:b])[0]
+        beat.append(bool(len(yy)>4 and np.ptp(yy)>=max(9,int(.075*h))))
+    hit=float(np.mean(beat)) if beat else 0.
+    # Grid density is still a blocker; skeleton coverage is descriptive, not proof.
+    density_ok=.001<=fraction<=.13
+    status='PASS' if density_ok and coverage>=.25 and (not expected or hit>=.75) else 'REVIEW'
+    reasons=[]
+    if not density_ok:reasons.append('mask_density')
+    if coverage<.25:reasons.append('skeleton_coverage')
+    if expected and hit<.75:reasons.append('beat_excursion')
+    return {'lead':region.get('lead'),'status':status,'threshold':threshold,
+            'mask_ink_fraction':round(fraction,4),'skeleton_column_coverage':round(coverage,3),
+            'heartbeat_anchor_hit_ratio':round(hit,3),'heartbeat_hits':beat,
+            'heartbeat_clock_expected_x':expected,'review_reason':','.join(reasons) or None,
+            'component_count':len(comps),'components':comps[:30],
+            'grid_qc':gmeta,'_grid_only':grid_only,'_mask':selected,'_skeleton':skel}
 
+
+def _v171_fix_group_geometry(groups):
+    """Correct an abnormally broad group_3 using adjacent columns, not hard-coded pixels."""
+    by={g.get('id'):g for g in groups}
+    g=by.get('group_3');left=by.get('group_2');right=by.get('group_4')
+    if not (g and left and right):return groups,{'status':'NO_ADJACENT_GROUPS'}
+    boxes=[x.get('box_pixels') for x in (g,left,right)]
+    if any(not b or len(b)!=4 for b in boxes):return groups,{'status':'NO_BOXES'}
+    gb,lb,rb=boxes
+    widths=[lb[2]-lb[0],rb[2]-rb[0]]
+    target=float(np.median(widths))
+    if gb[2]-gb[0]<=1.35*target:return groups,{'status':'UNCHANGED'}
+    new_left=max(float(lb[2])-.035*target,float(gb[2])-1.10*target)
+    new_right=min(float(rb[0])+.035*target,float(gb[2]))
+    if new_right-new_left<.65*target:return groups,{'status':'REVIEW_GEOMETRY'}
+    old=_region_pil_image(g);scale=old.width/max(1.,float(gb[2]-gb[0]))
+    x0=int(round((new_left-gb[0])*scale));x1=int(round((new_right-gb[0])*scale))
+    x0=max(0,min(old.width-2,x0));x1=max(x0+2,min(old.width,x1))
+    ng=dict(g);crop=old.crop((x0,0,x1,old.height));ng['png']=image_to_png(crop)
+    ng.pop('image',None)
+    ng['sent_size']=[crop.width,crop.height]
+    ng['box_pixels']=[int(round(new_left)),gb[1],int(round(new_right)),gb[3]]
+    ng['geometry_v171']='adjacent_column_corrected'
+    out=[ng if z.get('id')=='group_3' else z for z in groups]
+    return out,{'status':'CORRECTED','old_box':gb,'new_box':ng['box_pixels']}
 
 def _v17_group_regions(selected_groups, rhythm_region, rr):
     """Use hard ordered thirds of each verified group; segmentation decides ink, not DP."""
@@ -6167,8 +6211,8 @@ else:
                         st.image(_r["png"],caption=_r["lead"],width="stretch")
 
         # v17.0 ECG Ink Segmentation — validate mask/skeleton before any 1-D waveform/PQRST.
-        st.markdown("### v17.0 — ECG Ink Segmentation Validation")
-        st.caption("Giữ heartbeat clock v16.1; bỏ DP waveform tracker. Pipeline mới: suppress grid đỏ → neutral-dark ECG ink mask → connected-component selection bằng heartbeat anchors → skeleton. Chưa nội suy waveform 1-D, chưa đo PQRST.")
+        st.markdown("### v17.1 — Geometry + Grid Suppression Validation")
+        st.caption("Giữ heartbeat clock v16.1; bỏ DP waveform tracker. Pipeline v17.1: sửa group_3 theo cột lân cận → grid-color suppression → neutral-dark mask → skeleton và QC excursion. Chưa nội suy waveform 1-D, chưa đo PQRST.")
 
         _v17_rhythm,_v17_rr,_v17_rmeta=v160_auto_rhythm_region(
             ecg,auto_rhythm_box,enhance,_normalize_paper_speed(speed))
@@ -6177,7 +6221,9 @@ else:
         else:
             st.error("v17 không tự dựng được Rhythm II.")
 
-        _v17_regions,_v17_results,_v17_meta=_v17_group_regions(_selected_groups,_v17_rhythm,_v17_rr)
+        _v171_groups,_v171_geom=_v171_fix_group_geometry(_selected_groups)
+        _v17_regions,_v17_results,_v17_meta=_v17_group_regions(_v171_groups,_v17_rhythm,_v17_rr)
+        _v17_meta["geometry_correction"]=_v171_geom
         _v17_by={x.get('lead'):x for x in _v17_results}
         _v17_lead=st.selectbox("Lead kiểm tra v17",[r['lead'] for r in _v17_regions],key="v17_seg_lead_"+frame_id)
         _v17_reg=next(r for r in _v17_regions if r['lead']==_v17_lead)
@@ -6195,7 +6241,7 @@ else:
             _v17_png=_v17_buf.getvalue() if _v17_sheet is not None else b''
         except Exception as _exc:
             _v17_png=b''; st.warning('Không dựng được v17 validation sheet: '+str(_exc))
-        _v17_payload={'version':'v17.0-ink-segmentation','rhythm_meta':_v17_rmeta,
+        _v17_payload={'version':'v17.1-geometry-grid-suppression','rhythm_meta':_v17_rmeta,
                       'heartbeat_clock':{k:_v17_rr.get(k) for k in (
                           'status','r_accepted','fiducials_x','predicted_x','median_rr_px','snapped_rr_cv',
                           'phase_coverage','morphology_score','reason','rhythm_box','rhythm_size')},
@@ -6203,12 +6249,12 @@ else:
         _v17_json=json.dumps(_v17_payload,ensure_ascii=False,indent=2).encode('utf-8')
         _a,_b=st.columns(2)
         with _a:
-            if _v17_png: st.download_button('Tải v17 Segmentation PNG',_v17_png,'ecg_v17_ink_segmentation_validation.png','image/png',key='v17_png_'+frame_id,width='stretch')
+            if _v17_png: st.download_button('Tải v17.1 Segmentation PNG',_v17_png,'ecg_v17_1_grid_segmentation_validation.png','image/png',key='v17_png_'+frame_id,width='stretch')
         with _b:
-            st.download_button('Tải v17 JSON',_v17_json,'ecg_v17_ink_segmentation_validation.json','application/json',key='v17_json_'+frame_id,width='stretch')
+            st.download_button('Tải v17.1 JSON',_v17_json,'ecg_v17_1_grid_segmentation_validation.json','application/json',key='v17_json_'+frame_id,width='stretch')
         _pass=sum(1 for x in _v17_results if x.get('status')=='PASS')
         _clock_ok=_v17_rr.get('status') in ('PASS','REVIEW') and len(_v17_rr.get('fiducials_x') or [])>=3
-        st.info(f"v17.0 QC: heartbeat clock {'OK' if _clock_ok else 'REVIEW'} · segmentation PASS {_pass}/12. Chưa dùng để chẩn đoán; chỉ khi mask+skeleton đúng 12 lead mới chuyển sang waveform 1-D/PQRST.")
+        st.info(f"v17.1 QC: heartbeat clock {'OK' if _clock_ok else 'REVIEW'} · segmentation PASS {_pass}/12. Chưa dùng để chẩn đoán; chỉ khi mask+skeleton đúng 12 lead mới chuyển sang waveform 1-D/PQRST.")
 
     known = {"speed_mm_s":speed,"limb_mm_mv":limb,"chest_mm_mv":chest}
     context = {"age":age,"sex":sex,"history":history.strip() or None,"user_confirmed_calibration":known}
