@@ -1,0 +1,1245 @@
+{
+  "version": "v17.1-geometry-grid-suppression",
+  "rhythm_meta": {
+    "factor": 1.25,
+    "x": [
+      1.9701086956521738,
+      98.5054347826087
+    ],
+    "y": [
+      77.86,
+      100.0
+    ],
+    "candidate_summary": [
+      {
+        "factor": 1.25,
+        "score": 28.89,
+        "status": "REVIEW"
+      },
+      {
+        "factor": 1.55,
+        "score": 28.86,
+        "status": "REVIEW"
+      },
+      {
+        "factor": 1.9,
+        "score": 28.84,
+        "status": "REVIEW"
+      },
+      {
+        "factor": 2.3,
+        "score": 28.84,
+        "status": "REVIEW"
+      }
+    ]
+  },
+  "heartbeat_clock": {
+    "status": "REVIEW",
+    "r_accepted": 9,
+    "fiducials_x": [
+      165,
+      281,
+      427,
+      580,
+      696,
+      835,
+      985,
+      1139,
+      1293
+    ],
+    "predicted_x": [
+      165,
+      281,
+      427,
+      580,
+      696,
+      846,
+      985,
+      1139,
+      1293
+    ],
+    "median_rr_px": 151.5,
+    "snapped_rr_cv": 0.036,
+    "phase_coverage": 1.0,
+    "morphology_score": 1.459,
+    "reason": null,
+    "rhythm_box": [
+      29,
+      538,
+      1450,
+      691
+    ],
+    "rhythm_size": [
+      1421,
+      153
+    ]
+  },
+  "group_projection": {
+    "clock_detected_global_x": [
+      194.0,
+      310.0,
+      456.0,
+      609.0,
+      725.0,
+      864.0,
+      1014.0,
+      1168.0,
+      1322.0
+    ],
+    "clock_global_x": [
+      42.5,
+      194.0,
+      310.0,
+      456.0,
+      609.0,
+      725.0,
+      864.0,
+      1014.0,
+      1168.0,
+      1322.0,
+      1473.5
+    ],
+    "clock_predicted_edge_global_x": [
+      42.5,
+      1473.5
+    ],
+    "groups": [
+      {
+        "group": "group_1",
+        "box_pixels": [
+          0,
+          68,
+          423,
+          527
+        ],
+        "clock_expected_x": [
+          42,
+          194,
+          309
+        ],
+        "clock_predicted_edge_x": [
+          42
+        ],
+        "lead_set": [
+          "I",
+          "II",
+          "III"
+        ],
+        "hard_third_bands": [
+          [
+            0,
+            147
+          ],
+          [
+            159,
+            300
+          ],
+          [
+            312,
+            459
+          ]
+        ]
+      },
+      {
+        "group": "group_2",
+        "box_pixels": [
+          375,
+          68,
+          756,
+          527
+        ],
+        "clock_expected_x": [
+          81,
+          233,
+          349
+        ],
+        "clock_predicted_edge_x": [],
+        "lead_set": [
+          "aVR",
+          "aVL",
+          "aVF"
+        ],
+        "hard_third_bands": [
+          [
+            0,
+            147
+          ],
+          [
+            159,
+            300
+          ],
+          [
+            312,
+            459
+          ]
+        ]
+      },
+      {
+        "group": "group_3",
+        "box_pixels": [
+          731,
+          68,
+          1111,
+          527
+        ],
+        "clock_expected_x": [
+          0,
+          133,
+          282
+        ],
+        "clock_predicted_edge_x": [],
+        "lead_set": [
+          "V1",
+          "V2",
+          "V3"
+        ],
+        "hard_third_bands": [
+          [
+            0,
+            147
+          ],
+          [
+            159,
+            300
+          ],
+          [
+            312,
+            459
+          ]
+        ]
+      },
+      {
+        "group": "group_4",
+        "box_pixels": [
+          1086,
+          68,
+          1467,
+          527
+        ],
+        "clock_expected_x": [
+          82,
+          235,
+          380
+        ],
+        "clock_predicted_edge_x": [
+          380
+        ],
+        "lead_set": [
+          "V4",
+          "V5",
+          "V6"
+        ],
+        "hard_third_bands": [
+          [
+            0,
+            147
+          ],
+          [
+            159,
+            300
+          ],
+          [
+            312,
+            459
+          ]
+        ]
+      }
+    ],
+    "rhythm_status": "REVIEW",
+    "rhythm_rr_px": 151.5,
+    "geometry_correction": {
+      "status": "UNCHANGED"
+    }
+  },
+  "leads": [
+    {
+      "lead": "I",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0369,
+      "skeleton_column_coverage": 0.927,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        42,
+        194,
+        309
+      ],
+      "review_reason": null,
+      "component_count": 5,
+      "components": [
+        {
+          "x": 14,
+          "y": 3,
+          "w": 409,
+          "h": 141,
+          "area": 2107
+        },
+        {
+          "x": 14,
+          "y": 23,
+          "w": 8,
+          "h": 12,
+          "area": 37
+        },
+        {
+          "x": 394,
+          "y": 22,
+          "w": 11,
+          "h": 12,
+          "area": 46
+        },
+        {
+          "x": 407,
+          "y": 22,
+          "w": 10,
+          "h": 12,
+          "area": 55
+        },
+        {
+          "x": 383,
+          "y": 25,
+          "w": 9,
+          "h": 9,
+          "area": 47
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_1",
+      "band_y": [
+        0,
+        147
+      ],
+      "heartbeat_clock_predicted_edge_x": [
+        42
+      ]
+    },
+    {
+      "lead": "II",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0452,
+      "skeleton_column_coverage": 0.939,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        42,
+        194,
+        309
+      ],
+      "review_reason": null,
+      "component_count": 7,
+      "components": [
+        {
+          "x": 14,
+          "y": 3,
+          "w": 409,
+          "h": 135,
+          "area": 2435
+        },
+        {
+          "x": 15,
+          "y": 11,
+          "w": 8,
+          "h": 13,
+          "area": 43
+        },
+        {
+          "x": 395,
+          "y": 11,
+          "w": 10,
+          "h": 11,
+          "area": 41
+        },
+        {
+          "x": 407,
+          "y": 11,
+          "w": 10,
+          "h": 12,
+          "area": 50
+        },
+        {
+          "x": 27,
+          "y": 12,
+          "w": 8,
+          "h": 11,
+          "area": 39
+        },
+        {
+          "x": 384,
+          "y": 14,
+          "w": 9,
+          "h": 9,
+          "area": 48
+        },
+        {
+          "x": 364,
+          "y": 36,
+          "w": 2,
+          "h": 19,
+          "area": 38
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_1",
+      "band_y": [
+        159,
+        300
+      ],
+      "heartbeat_clock_predicted_edge_x": [
+        42
+      ]
+    },
+    {
+      "lead": "III",
+      "status": "REVIEW",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0442,
+      "skeleton_column_coverage": 0.936,
+      "heartbeat_anchor_hit_ratio": 0.667,
+      "heartbeat_hits": [
+        false,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        42,
+        194,
+        309
+      ],
+      "review_reason": "beat_excursion",
+      "component_count": 5,
+      "components": [
+        {
+          "x": 14,
+          "y": 3,
+          "w": 409,
+          "h": 141,
+          "area": 2561
+        },
+        {
+          "x": 16,
+          "y": 7,
+          "w": 8,
+          "h": 11,
+          "area": 36
+        },
+        {
+          "x": 395,
+          "y": 6,
+          "w": 11,
+          "h": 12,
+          "area": 47
+        },
+        {
+          "x": 408,
+          "y": 6,
+          "w": 10,
+          "h": 12,
+          "area": 54
+        },
+        {
+          "x": 384,
+          "y": 8,
+          "w": 9,
+          "h": 10,
+          "area": 52
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_1",
+      "band_y": [
+        312,
+        459
+      ],
+      "heartbeat_clock_predicted_edge_x": [
+        42
+      ]
+    },
+    {
+      "lead": "aVR",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0375,
+      "skeleton_column_coverage": 0.908,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        81,
+        233,
+        349
+      ],
+      "review_reason": null,
+      "component_count": 3,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 368,
+          "h": 141,
+          "area": 2001
+        },
+        {
+          "x": 19,
+          "y": 22,
+          "w": 11,
+          "h": 12,
+          "area": 46
+        },
+        {
+          "x": 32,
+          "y": 22,
+          "w": 10,
+          "h": 12,
+          "area": 55
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_2",
+      "band_y": [
+        0,
+        147
+      ],
+      "heartbeat_clock_predicted_edge_x": []
+    },
+    {
+      "lead": "aVL",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0398,
+      "skeleton_column_coverage": 0.932,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        81,
+        233,
+        349
+      ],
+      "review_reason": null,
+      "component_count": 3,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 368,
+          "h": 135,
+          "area": 2048
+        },
+        {
+          "x": 20,
+          "y": 11,
+          "w": 10,
+          "h": 11,
+          "area": 41
+        },
+        {
+          "x": 32,
+          "y": 11,
+          "w": 10,
+          "h": 12,
+          "area": 50
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_2",
+      "band_y": [
+        159,
+        300
+      ],
+      "heartbeat_clock_predicted_edge_x": []
+    },
+    {
+      "lead": "aVF",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0388,
+      "skeleton_column_coverage": 0.927,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        81,
+        233,
+        349
+      ],
+      "review_reason": null,
+      "component_count": 3,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 368,
+          "h": 141,
+          "area": 2071
+        },
+        {
+          "x": 20,
+          "y": 6,
+          "w": 11,
+          "h": 12,
+          "area": 47
+        },
+        {
+          "x": 33,
+          "y": 6,
+          "w": 10,
+          "h": 12,
+          "area": 54
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_2",
+      "band_y": [
+        312,
+        459
+      ],
+      "heartbeat_clock_predicted_edge_x": []
+    },
+    {
+      "lead": "V1",
+      "status": "REVIEW",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.09,
+      "skeleton_column_coverage": 0.963,
+      "heartbeat_anchor_hit_ratio": 0.667,
+      "heartbeat_hits": [
+        false,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        0,
+        133,
+        282
+      ],
+      "review_reason": "beat_excursion",
+      "component_count": 14,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 363,
+          "h": 141,
+          "area": 3714
+        },
+        {
+          "x": 300,
+          "y": 3,
+          "w": 2,
+          "h": 26,
+          "area": 50
+        },
+        {
+          "x": 22,
+          "y": 23,
+          "w": 11,
+          "h": 12,
+          "area": 46
+        },
+        {
+          "x": 300,
+          "y": 30,
+          "w": 2,
+          "h": 22,
+          "area": 40
+        },
+        {
+          "x": 373,
+          "y": 88,
+          "w": 7,
+          "h": 20,
+          "area": 37
+        },
+        {
+          "x": 213,
+          "y": 98,
+          "w": 8,
+          "h": 46,
+          "area": 152
+        },
+        {
+          "x": 281,
+          "y": 102,
+          "w": 8,
+          "h": 42,
+          "area": 161
+        },
+        {
+          "x": 361,
+          "y": 105,
+          "w": 9,
+          "h": 39,
+          "area": 152
+        },
+        {
+          "x": 247,
+          "y": 108,
+          "w": 7,
+          "h": 36,
+          "area": 122
+        },
+        {
+          "x": 319,
+          "y": 108,
+          "w": 8,
+          "h": 36,
+          "area": 145
+        },
+        {
+          "x": 33,
+          "y": 111,
+          "w": 7,
+          "h": 33,
+          "area": 110
+        },
+        {
+          "x": 130,
+          "y": 110,
+          "w": 8,
+          "h": 34,
+          "area": 116
+        },
+        {
+          "x": 175,
+          "y": 113,
+          "w": 8,
+          "h": 31,
+          "area": 107
+        },
+        {
+          "x": 81,
+          "y": 123,
+          "w": 6,
+          "h": 21,
+          "area": 75
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_3",
+      "band_y": [
+        0,
+        147
+      ],
+      "heartbeat_clock_predicted_edge_x": []
+    },
+    {
+      "lead": "V2",
+      "status": "REVIEW",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.108,
+      "skeleton_column_coverage": 0.903,
+      "heartbeat_anchor_hit_ratio": 0.667,
+      "heartbeat_hits": [
+        false,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        0,
+        133,
+        282
+      ],
+      "review_reason": "beat_excursion",
+      "component_count": 20,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 20,
+          "h": 129,
+          "area": 288
+        },
+        {
+          "x": 35,
+          "y": 3,
+          "w": 46,
+          "h": 133,
+          "area": 523
+        },
+        {
+          "x": 87,
+          "y": 3,
+          "w": 44,
+          "h": 133,
+          "area": 516
+        },
+        {
+          "x": 137,
+          "y": 3,
+          "w": 39,
+          "h": 135,
+          "area": 756
+        },
+        {
+          "x": 184,
+          "y": 3,
+          "w": 29,
+          "h": 123,
+          "area": 440
+        },
+        {
+          "x": 221,
+          "y": 3,
+          "w": 14,
+          "h": 135,
+          "area": 230
+        },
+        {
+          "x": 238,
+          "y": 3,
+          "w": 10,
+          "h": 135,
+          "area": 235
+        },
+        {
+          "x": 254,
+          "y": 3,
+          "w": 15,
+          "h": 135,
+          "area": 238
+        },
+        {
+          "x": 271,
+          "y": 3,
+          "w": 11,
+          "h": 135,
+          "area": 282
+        },
+        {
+          "x": 288,
+          "y": 3,
+          "w": 31,
+          "h": 135,
+          "area": 747
+        },
+        {
+          "x": 327,
+          "y": 3,
+          "w": 35,
+          "h": 129,
+          "area": 574
+        },
+        {
+          "x": 370,
+          "y": 3,
+          "w": 10,
+          "h": 101,
+          "area": 260
+        },
+        {
+          "x": 131,
+          "y": 107,
+          "w": 6,
+          "h": 31,
+          "area": 99
+        },
+        {
+          "x": 176,
+          "y": 111,
+          "w": 6,
+          "h": 27,
+          "area": 88
+        },
+        {
+          "x": 214,
+          "y": 111,
+          "w": 5,
+          "h": 27,
+          "area": 90
+        },
+        {
+          "x": 282,
+          "y": 111,
+          "w": 6,
+          "h": 27,
+          "area": 98
+        },
+        {
+          "x": 320,
+          "y": 110,
+          "w": 6,
+          "h": 28,
+          "area": 110
+        },
+        {
+          "x": 363,
+          "y": 112,
+          "w": 5,
+          "h": 26,
+          "area": 95
+        },
+        {
+          "x": 248,
+          "y": 115,
+          "w": 4,
+          "h": 23,
+          "area": 64
+        },
+        {
+          "x": 34,
+          "y": 121,
+          "w": 5,
+          "h": 17,
+          "area": 53
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_3",
+      "band_y": [
+        159,
+        300
+      ],
+      "heartbeat_clock_predicted_edge_x": []
+    },
+    {
+      "lead": "V3",
+      "status": "REVIEW",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0748,
+      "skeleton_column_coverage": 0.889,
+      "heartbeat_anchor_hit_ratio": 0.667,
+      "heartbeat_hits": [
+        false,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        0,
+        133,
+        282
+      ],
+      "review_reason": "beat_excursion",
+      "component_count": 11,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 22,
+          "h": 92,
+          "area": 221
+        },
+        {
+          "x": 35,
+          "y": 3,
+          "w": 47,
+          "h": 97,
+          "area": 401
+        },
+        {
+          "x": 85,
+          "y": 3,
+          "w": 47,
+          "h": 107,
+          "area": 398
+        },
+        {
+          "x": 135,
+          "y": 3,
+          "w": 42,
+          "h": 141,
+          "area": 667
+        },
+        {
+          "x": 181,
+          "y": 3,
+          "w": 34,
+          "h": 96,
+          "area": 364
+        },
+        {
+          "x": 218,
+          "y": 3,
+          "w": 31,
+          "h": 104,
+          "area": 380
+        },
+        {
+          "x": 251,
+          "y": 3,
+          "w": 32,
+          "h": 111,
+          "area": 430
+        },
+        {
+          "x": 286,
+          "y": 3,
+          "w": 35,
+          "h": 108,
+          "area": 561
+        },
+        {
+          "x": 324,
+          "y": 3,
+          "w": 39,
+          "h": 105,
+          "area": 483
+        },
+        {
+          "x": 367,
+          "y": 3,
+          "w": 13,
+          "h": 89,
+          "area": 240
+        },
+        {
+          "x": 300,
+          "y": 108,
+          "w": 1,
+          "h": 36,
+          "area": 36
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_3",
+      "band_y": [
+        312,
+        459
+      ],
+      "heartbeat_clock_predicted_edge_x": []
+    },
+    {
+      "lead": "V4",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.059,
+      "skeleton_column_coverage": 0.934,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        82,
+        235,
+        380
+      ],
+      "review_reason": null,
+      "component_count": 4,
+      "components": [
+        {
+          "x": 18,
+          "y": 3,
+          "w": 363,
+          "h": 141,
+          "area": 3082
+        },
+        {
+          "x": 241,
+          "y": 3,
+          "w": 2,
+          "h": 53,
+          "area": 68
+        },
+        {
+          "x": 38,
+          "y": 23,
+          "w": 10,
+          "h": 12,
+          "area": 50
+        },
+        {
+          "x": 13,
+          "y": 29,
+          "w": 8,
+          "h": 50,
+          "area": 107
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_4",
+      "band_y": [
+        0,
+        147
+      ],
+      "heartbeat_clock_predicted_edge_x": [
+        380
+      ]
+    },
+    {
+      "lead": "V5",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.0517,
+      "skeleton_column_coverage": 0.942,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        82,
+        235,
+        380
+      ],
+      "review_reason": null,
+      "component_count": 5,
+      "components": [
+        {
+          "x": 15,
+          "y": 3,
+          "w": 366,
+          "h": 135,
+          "area": 2565
+        },
+        {
+          "x": 241,
+          "y": 3,
+          "w": 2,
+          "h": 33,
+          "area": 58
+        },
+        {
+          "x": 51,
+          "y": 11,
+          "w": 8,
+          "h": 13,
+          "area": 52
+        },
+        {
+          "x": 38,
+          "y": 12,
+          "w": 10,
+          "h": 11,
+          "area": 49
+        },
+        {
+          "x": 241,
+          "y": 38,
+          "w": 2,
+          "h": 30,
+          "area": 51
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_4",
+      "band_y": [
+        159,
+        300
+      ],
+      "heartbeat_clock_predicted_edge_x": [
+        380
+      ]
+    },
+    {
+      "lead": "V6",
+      "status": "PASS",
+      "threshold": 0.29,
+      "mask_ink_fraction": 0.052,
+      "skeleton_column_coverage": 0.966,
+      "heartbeat_anchor_hit_ratio": 1.0,
+      "heartbeat_hits": [
+        true,
+        true,
+        true
+      ],
+      "heartbeat_clock_expected_x": [
+        82,
+        235,
+        380
+      ],
+      "review_reason": null,
+      "component_count": 3,
+      "components": [
+        {
+          "x": 13,
+          "y": 3,
+          "w": 368,
+          "h": 141,
+          "area": 2804
+        },
+        {
+          "x": 37,
+          "y": 7,
+          "w": 11,
+          "h": 12,
+          "area": 51
+        },
+        {
+          "x": 51,
+          "y": 6,
+          "w": 8,
+          "h": 13,
+          "area": 58
+        }
+      ],
+      "grid_qc": {
+        "grid_row_count": 0,
+        "grid_col_count": 0,
+        "grid_pixels_excluded": 0
+      },
+      "source_group": "group_4",
+      "band_y": [
+        312,
+        459
+      ],
+      "heartbeat_clock_predicted_edge_x": [
+        380
+      ]
+    }
+  ]
+}
