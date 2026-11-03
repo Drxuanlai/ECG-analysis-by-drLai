@@ -4,5 +4,10 @@
   "uploaded_requirements": "requirements(1).txt",
   "digitizer_py_provided": false,
   "project_status": "compatibility_scaffold",
-  "algorithm_refactor_completed": false
+  "algorithm_refactor_completed": false,
+  "release": "v1.3-adaptive-layout",
+  "new_modules": [
+    "core/lead_layout.py",
+    "ui/layout_panel.py"
+  ]
 }

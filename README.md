@@ -29,3 +29,7 @@ A Streamlit browser smoke test and fixed-ECG regression set are required before 
 6. Add irregular rhythm + broad QRS benchmarks, not regular-RR filtering.
 
 **Security:** never commit API keys, patient-identifiable photos, or secret files.
+
+
+## v1.3 Adaptive Layout QA
+Run `app.py`; expand **ECG Core v1.3 | Adaptive Layout & Lead ROI QA**. See `LAYOUT_V1_3_GUIDE_VI.md`. OCR and calibration-like stroke boundaries are unverified candidates; manual row/column edits are supported. Legacy AI/failover preserved.
