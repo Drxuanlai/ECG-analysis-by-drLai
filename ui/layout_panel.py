@@ -39,9 +39,9 @@ def _cached_layout(raw, enabled):
 
 
 def render():
-    with st.expander('ECG Core v1.3.2 | Layout + Lead Isolation Review',expanded=False):
+    with st.expander('LEGACY v1.3.2 | Chỉ ảnh 3×4 (không hỗ trợ 6×2)',expanded=False):
         st.caption('Research QA độc lập. KHÔNG thay ROI hay kết quả của app AI cũ; không đo PQRST.')
-        upload=st.file_uploader('Chọn ảnh ECG gốc 3×4 (PNG/JPG/HEIC)',type=['png','jpg','jpeg','webp','heic','heif'],key='layout_v13_upload')
+        upload=st.file_uploader('Chỉ ảnh ECG gốc bố cục 3×4 (PNG/JPG/HEIC)',type=['png','jpg','jpeg','webp','heic','heif'],key='layout_v13_upload')
         if upload is None:return
         try: im=_read(upload)
         except Exception as exc:st.error('Không mở được ảnh: '+str(exc));return
