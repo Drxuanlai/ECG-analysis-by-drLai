@@ -10,6 +10,7 @@ from PIL import Image, ImageOps
 from core.lead_layout import detect_layout,resolve_layout,render_overlay,VERSION
 from core.waveform_roi import refine_waveform_rois,render_dual_overlay,VERSION as ROI_VERSION
 from core.grid_aware_segmentation import segment_grid_aware,diagnostic_sheet
+from core.lead_isolation import isolate_leads,isolation_overlay,VERSION as ISOLATION_VERSION
 
 
 def _read(upload):
@@ -38,7 +39,7 @@ def _cached_layout(raw, enabled):
 
 
 def render():
-    with st.expander('ECG Core v1.3.1 | Layout + Waveform ROI Review',expanded=False):
+    with st.expander('ECG Core v1.3.2 | Layout + Lead Isolation Review',expanded=False):
         st.caption('Research QA độc lập. KHÔNG thay ROI hay kết quả của app AI cũ; không đo PQRST.')
         upload=st.file_uploader('Chọn ảnh ECG gốc 3×4 (PNG/JPG/HEIC)',type=['png','jpg','jpeg','webp','heic','heif'],key='layout_v13_upload')
         if upload is None:return
@@ -94,6 +95,13 @@ def render():
         flagged=[v['lead'] for v in wave_rois if any(z.get('possible_trace_collision') for z in v.get('waveform_overlaps',[]))]
         if flagged:st.warning('Waveform ROI chồng lên lead cùng cột: '+', '.join(flagged)+'. Cần kiểm tra nét sóng thực, đặc biệt V1–V3.')
         st.caption('Waveform ROI là đề xuất kỹ thuật. Nếu hai lead chồng sóng, không tự nhận rằng tín hiệu thuộc lead nào; phải REVIEW.')
+        st.markdown('**Lead Isolation v1.3.2 — pixel ownership an toàn**')
+        st.caption('Xanh ngọc: nét mực ứng viên chỉ được gán vào 1 lead. Cam: nét mực chưa rõ thuộc lead nào; không đo hoặc điền vào waveform. Không phải QRS detector.')
+        margin=st.slider('Biên REVIEW tại ranh giới hàng (%)',1,12,4,1,key='isolation_v132_margin_'+file_tag)
+        isolation=isolate_leads(im,wave_rois,ambiguous_margin_ratio=margin/100)
+        st.image(isolation_overlay(im,isolation,wave_rois),caption='CYAN: ứng viên 1 lead · CAM: AMBIGUOUS · Khung: bố cục',width='stretch')
+        st.dataframe([{'Lead':lead,**info} for lead,info in isolation['diagnostics'].items()],hide_index=True,width='stretch')
+        st.warning('Tất cả kết quả isolation ở mức REVIEW. Nét thuộc 1 lead vẫn có thể là lưới/chữ; chưa xác minh waveform hoặc QRS.')
         st.caption('Vạch ROI có thể chứa calibration và chữ; v1.3 chưa loại hoàn toàn các cấu trúc này. Dữ liệu tọa độ luôn trong hệ ảnh đã EXIF-corrected.')
         proceed=st.checkbox('Kiểm tra thêm segmentation v1.2 trong 12 ROI vừa chọn',value=False,key='layout_v13_seg')
         data={'version':ROI_VERSION,'image_name':upload.name,'layout':layout,
@@ -101,6 +109,12 @@ def render():
               'warning':'ROI hypotheses only. No clinical measurements authorized.'}
         buf=io.BytesIO()
         with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
+            z.writestr('lead_isolation_overlay_v132.png',_png(isolation_overlay(im,isolation,wave_rois)))
+            z.writestr('lead_isolation_v132.json',json.dumps({'version':ISOLATION_VERSION,'image_name':upload.name,'diagnostics':isolation['diagnostics']},ensure_ascii=False,indent=2))
+            z.writestr('ambiguous_ink_mask_v132.png',_png(Image.fromarray(isolation['ambiguous_mask'])))
+            for lead,mask in isolation['lead_masks'].items():
+                name=re.sub('[^A-Za-z0-9]','_',lead)
+                z.writestr('isolated_'+name+'_candidate_mask.png',_png(Image.fromarray(mask)))
             z.writestr('layout_waveform_v131.json',json.dumps(data,ensure_ascii=False,indent=2))
             z.writestr('layout_waveform_overlay_v131.png',_png(overlay))
             if proceed:
@@ -114,6 +128,6 @@ def render():
                     z.writestr('lead_'+name+'_segmentation.png',_png(comparison))
                     data.setdefault('segmentation',[]).append({'lead':v['lead'],'status':ev['status'],'metrics':ev['metrics']})
                 z.writestr('segmentation_v12_metrics.json',json.dumps(data['segmentation'],ensure_ascii=False,indent=2))
-        st.download_button('Tải validation Layout + Waveform v1.3.1 (.zip)',buf.getvalue(),
-          'ecg_core_v1_3_1_waveform_roi_validation.zip','application/zip',key='layout_v13_zip')
+        st.download_button('Tải validation Lead Isolation v1.3.2 (.zip)',buf.getvalue(),
+          'ecg_core_v1_3_2_lead_isolation_validation.zip','application/zip',key='layout_v13_zip')
         with st.expander('Xem tọa độ JSON và nhãn OCR',expanded=False):st.json(data)
