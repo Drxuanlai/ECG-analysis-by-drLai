@@ -5,6 +5,7 @@ import streamlit as st
 from PIL import Image,ImageOps
 from core.multi_layout import suggest_layout,propose_boxes,overlay,VERSION
 from core.signal_artifact import separate,sheet
+from core.row_boundary import propose_row_refinement, mask_qc, qc_overlay, VERSION as ROW_VERSION
 
 
 def _image(data):
@@ -24,7 +25,7 @@ def _suggest(raw,enabled):
     return suggest_layout(_image(raw),ocr=enabled)
 
 def render():
-    with st.expander('ECG Core v1.3.3 | Multi-Layout + Signal/Artifact QA',expanded=False):
+    with st.expander('ECG Core v1.3.4 | Row Boundary + Mask QC',expanded=False):
         st.caption('QA nghiên cứu; không thay thế kết quả AI/Streamlit legacy, không định lượng PQRST.')
         up=st.file_uploader('ECG 3×4 hoặc 6×2 (PNG/JPEG/HEIC)',type=['png','jpg','jpeg','webp','heic','heif'],key='ml133_upload')
         if not up:return
@@ -48,6 +49,13 @@ def render():
             rhythm=st.checkbox('Có một dải Rhythm II dài riêng phía dưới',value=True,key='ml133_rhythm_'+tag)
         st.warning('Ảnh overlay chỉ là đề xuất ROI. Chữ/xung chuẩn và hình thái QRS có thể làm lệch ranh giới.')
         initial=propose_boxes(im,chosen,has_rhythm=rhythm)
+        row_review=propose_row_refinement(im,initial)
+        st.caption('Ranh giới hàng gợi ý từ hoạt động nét tối; không áp tự động khi chưa xác nhận.')
+        with st.expander('Đề xuất ranh giới hàng / độ tin cậy',expanded=False):
+            st.json(row_review)
+        apply_row=st.checkbox('Thử các ranh giới hàng được đề xuất (vẫn cần kiểm tra bằng mắt)',False,key='ml134_rows_'+tag)
+        if apply_row:
+            initial=propose_boxes(im,chosen,has_rhythm=rhythm,row_boundaries=row_review['row_boundaries_suggested'])
         xs=initial['column_boundaries'];ys=initial['row_boundaries']
         ncol=len(xs)-1;nrow=len(ys)-1
         st.markdown('**Ranh giới cột** — chỉnh theo vạch chia lead thực, không theo xung chuẩn')
@@ -81,18 +89,23 @@ def render():
         with zipfile.ZipFile(filebuf,'w',zipfile.ZIP_DEFLATED) as z:
             z.writestr('multi_layout_overlay_v133.png',_png(image_overlay))
             z.writestr('multi_layout_v133.json',json.dumps({'image_name':up.name,'image_size':im.size,'proposal':proposal,
-                'layout_evidence':evidence,'disclaimer':'ROI REVIEW. Not clinically verified.'},ensure_ascii=False,indent=2))
+                'layout_evidence':evidence,'row_refinement':row_review,'row_refinement_applied':apply_row,
+                'disclaimer':'ROI REVIEW. Not clinically verified.'},ensure_ascii=False,indent=2))
             if do_masks:
                 for item in proposal['rois']:
                     if item['lead']=='II-rhythm':continue
                     name=re.sub('[^A-Za-z0-9]','_',item['lead']);roi=im.crop(tuple(item['box']))
                     ev=separate(roi)
-                    met={'lead':item['lead'],'box':item['box'],'status':'REVIEW','metrics':ev['metrics'],'reasons':ev['reasons']}
+                    mq=mask_qc(roi,ev,lead=item['lead'])
+                    met={'lead':item['lead'],'box':item['box'],'status':'REVIEW','signal_artifact':ev['metrics'],
+                         'mask_qc':mq,'metrics':ev['metrics'],'reasons':list(dict.fromkeys(ev['reasons']+mq['reasons']))}
                     metrics.append(met)
                     z.writestr(f'masks/{name}_signal_artifact_panel.png',_png(sheet(roi,ev)))
+                    z.writestr(f'masks/{name}_qc_edge_overlay.png',_png(qc_overlay(roi,ev,mq)))
                     for mask_name,arr in ev['masks'].items():
                         z.writestr(f'masks/{name}_{mask_name}.png',_png(Image.fromarray(arr)))
                 z.writestr('signal_artifact_v133_metrics.json',json.dumps(metrics,ensure_ascii=False,indent=2))
+                z.writestr('mask_qc_v134.json',json.dumps([x['mask_qc'] for x in metrics],ensure_ascii=False,indent=2))
         if metrics:
             st.dataframe(metrics,hide_index=True,width='stretch')
             for q in metrics:
@@ -100,5 +113,8 @@ def render():
                     roi=im.crop(tuple(q['box']));ev=separate(roi)
                     st.caption('6 ô: original | raw dark | colored grid | suspected text/calibration | uncertain | candidate overlay')
                     st.image(sheet(roi,ev),width='stretch')
-        st.download_button('Tải validation v1.3.3 (.zip)',filebuf.getvalue(),
-                           'ecg_core_v1_3_3_multilayout_validation.zip','application/zip',key='ml133_download_'+tag)
+                    st.caption('Mask QC v1.3.4: xanh ứng viên mực, cam uncertain, đỏ dải sát rìa ROI.')
+                    st.image(qc_overlay(roi,ev,q['mask_qc']),width='stretch')
+                    st.json(q['mask_qc'])
+        st.download_button('Tải validation v1.3.4 (.zip)',filebuf.getvalue(),
+                           'ecg_core_v1_3_4_row_mask_qc_validation.zip','application/zip',key='ml133_download_'+tag)

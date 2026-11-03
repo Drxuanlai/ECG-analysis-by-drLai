@@ -12,5 +12,5 @@ render_grid_aware()
 from ui.layout_panel import render as render_adaptive_layout
 render_adaptive_layout()
 
-from ui.multi_layout_panel import render as render_multi_layout_v133
-render_multi_layout_v133()
+from ui.multi_layout_panel import render as render_multi_layout_v134
+render_multi_layout_v134()
