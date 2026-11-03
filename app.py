@@ -5,3 +5,6 @@ ROOT=Path(__file__).resolve().parent
 runpy.run_path(str(ROOT/'legacy'/'app_v17_1_original.py'),run_name='__main__')
 from ui.adaptive_panel import render
 render()
+
+from ui.grid_aware_panel import render as render_grid_aware
+render_grid_aware()
