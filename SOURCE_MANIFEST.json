@@ -5,9 +5,11 @@
   "digitizer_py_provided": false,
   "project_status": "compatibility_scaffold",
   "algorithm_refactor_completed": false,
-  "release": "v1.3-adaptive-layout",
+  "release": "v1.3.1",
   "new_modules": [
     "core/lead_layout.py",
     "ui/layout_panel.py"
-  ]
+  ],
+  "new_module": "core/waveform_roi.py",
+  "legacy_app_sha256": "83620bae15f52f67f2b0a908f50f1e53e0ca5f93dbf28af8ef4720762815585e"
 }

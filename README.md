@@ -1,3 +1,9 @@
+# ECG Core v1.3.1 — Lead-Aware ROI Refinement
+
+**Giữ nguyên AI/failover legacy, QA riêng.**
+
+Xem `ROI_REFINEMENT_V1_3_1_GUIDE_VI.md` để dùng hai lớp ROI và kiểm thử.
+
 # ECG Core v1.0 — compatibility scaffold
 
 **Status: structural refactor stage, not validated clinical software.**

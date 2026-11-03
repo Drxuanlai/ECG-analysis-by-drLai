@@ -1,4 +1,4 @@
-"""ECG Core v1.1: legacy app, followed by isolated adaptive QA panel."""
+"""ECG Core v1.3.1: unchanged legacy app and independent research QA panels."""
 from pathlib import Path
 import runpy
 ROOT=Path(__file__).resolve().parent
