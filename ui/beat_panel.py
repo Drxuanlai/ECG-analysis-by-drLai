@@ -9,6 +9,8 @@ import streamlit as st
 from core.multi_layout import propose_boxes, overlay as layout_overlay
 from core.beat_candidates import detect_candidates, evidence_panel, public_report
 from core.beat_validation import cluster_validate, attach_review, validation_overlay, REVIEW_LABELS
+from core.rpeak_review import (independent_rpeak_proposals, add_reference_point,
+                               match_references, mark_overlay, event_rpeak_localization)
 
 
 def _load(raw: bytes):
@@ -106,6 +108,8 @@ def render():
         st.divider()
         st.subheader('v1.5.1 · Nhóm ứng viên & kiểm tra nhiễu (QA)')
         st.caption('Không ép RR đều. Màu xanh dương: ứng viên hình thái; màu cam: vùng chưa phân giải. Bác sĩ có thể đánh dấu QRS/Artifact và bổ sung QRS bị bỏ sót.')
+        # Persist case identity in the event report (v1.5.1 previously lost it).
+        result.update({'lead': selected, 'image_name': upload.name, 'roi_box': box})
         grouped = cluster_validate(roi, result)
         st.write(f"{grouped['source_candidate_count']} nét ứng viên → "
                  f"{grouped['event_count']} sự kiện, "
@@ -146,6 +150,92 @@ def render():
         with st.expander('Bảng sự kiện và lý do QC', expanded=False):
             st.dataframe(reviewed['events'], hide_index=True, width='stretch')
         st.warning('Máy không xác minh QRS. Những sự kiện UNRESOLVED không được tự loại bỏ vì có thể là nhịp bệnh lý thực.')
+        st.divider()
+        st.subheader('v1.5.2 · Đánh dấu đỉnh R tham chiếu độc lập (QA)')
+        st.caption('Chấm xanh lá = vị trí bác sĩ đặt; chấm tím = gợi ý ảnh độc lập (không phải R xác minh). Không ép RR đều. Nhãn ARTIFACT đã lưu không bị thay đổi.')
+        hint_report = independent_rpeak_proposals(roi)
+        reference_key = 'v152_reference_' + tag + '_' + selected + '_' + hashlib.sha256(str(box).encode()).hexdigest()[:8]
+        if reference_key not in st.session_state:
+            st.session_state[reference_key] = []
+        references = st.session_state[reference_key]
+        can_click = False
+        try:
+            from streamlit_image_coordinates import streamlit_image_coordinates
+            can_click = True
+        except ImportError:
+            st.info('Chưa có streamlit-image-coordinates. Vẫn có thể nhập x/y; thêm dependency theo PATCH để bấm trực tiếp trên ảnh.')
+        img_click = mark_overlay(roi, reviewed['events'], references, hint_report['hints'])
+        if can_click:
+            coords = streamlit_image_coordinates(img_click, width=roi.width,
+                        key='v152_click_'+tag+selected+hashlib.sha256(str(box).encode()).hexdigest()[:8])
+            if coords and 'x' in coords and 'y' in coords:
+                st.caption(f"Điểm vừa bấm: x={coords['x']} px, y={coords['y']} px. Nhấn 'Thêm điểm R' để lưu.")
+                clicked_x, clicked_y = float(coords['x']), float(coords['y'])
+            else:
+                clicked_x, clicked_y = None, None
+        else:
+            st.image(img_click, caption='Overlay nhãn và gợi ý ảnh', width='stretch')
+            clicked_x, clicked_y = None, None
+        cx,cy = st.columns(2)
+        with cx:
+            ref_x=st.number_input('Đỉnh R tham chiếu x (pixel trong ROI)', 0., float(roi.width-1),
+                                  value=float(clicked_x) if clicked_x is not None else 0., step=1.,
+                                  key='v152_manual_x_'+tag+selected)
+        with cy:
+            ref_y=st.number_input('Đỉnh R tham chiếu y (pixel trong ROI)', 0., float(roi.height-1),
+                                  value=float(clicked_y) if clicked_y is not None else float(roi.height/2), step=1.,
+                                  key='v152_manual_y_'+tag+selected)
+        # Click coordinates are preferred when a new point is clicked; the numeric
+        # fields remain a fallback and can be used when clicking is unavailable.
+        mark_source=st.radio('Lấy tọa độ từ', ['Điểm bấm trên ảnh', 'Ô nhập x/y'], horizontal=True,
+             index=0 if clicked_x is not None else 1, key='v152_coord_source_'+tag+selected)
+        ax,bx,cx=st.columns(3)
+        with ax:
+            if st.button('Thêm điểm R tham chiếu', key='v152_add_'+tag+selected):
+                x_add=clicked_x if mark_source=='Điểm bấm trên ảnh' and clicked_x is not None else ref_x
+                y_add=clicked_y if mark_source=='Điểm bấm trên ảnh' and clicked_y is not None else ref_y
+                try:
+                    st.session_state[reference_key]=add_reference_point(references,x_add,y_add,
+                                                  width=roi.width,height=roi.height)
+                    st.rerun()
+                except ValueError as exc:
+                    st.warning(str(exc))
+        with bx:
+            if st.button('Hoàn tác điểm cuối', disabled=not bool(references), key='v152_undo_'+tag+selected):
+                st.session_state[reference_key] = references[:-1]
+                st.rerun()
+        with cx:
+            if st.button('Xóa điểm tham chiếu', disabled=not bool(references), key='v152_clear_'+tag+selected):
+                st.session_state[reference_key] = []
+                st.rerun()
+        references = st.session_state[reference_key]
+        with st.expander('Danh sách điểm R bác sĩ đã đặt', expanded=bool(references)):
+            st.dataframe(references, hide_index=True, width='stretch')
+        st.caption(f"{len(hint_report['hints'])} gợi ý ảnh độc lập (chưa xác minh); {len(references)} điểm R bác sĩ đã đánh dấu.")
+        localized = event_rpeak_localization(roi, reviewed['events'])
+        with st.expander('So sánh x của sự kiện và gợi ý đỉnh R tại chỗ', expanded=False):
+            st.dataframe(localized, hide_index=True, width='stretch')
+        completed_reference = st.checkbox('Tôi đã đánh dấu ĐẦY ĐỦ mọi đỉnh R thấy được trong ROI này',
+                                           value=False,key='v152_complete_'+tag+selected)
+        tolerance = st.slider('Dung sai so khớp vị trí (pixel; QA)', 3, 30, 10,
+                              key='v152_tolerance_'+tag+selected)
+        comparison = match_references(reviewed['events'], references,
+                                      tolerance_px=tolerance,review_complete=completed_reference)
+        st.json({'counts':comparison['counts'],
+                 'reference_complete':comparison['reference_complete'],
+                 'performance_metrics':comparison['performance_metrics'],
+                 'artifact_label_conflicts':comparison['artifact_label_conflicts']})
+        if not comparison['exhaustive_scoring_allowed']:
+            st.warning('Chưa đủ nhãn tham chiếu để tính sensitivity/precision. Gợi ý ảnh và ứng viên máy vẫn chỉ là CANDIDATE.')
+        else:
+            st.info('Các chỉ số hiện tại chỉ phản ánh khớp tọa độ theo pixel trên ROI đã đánh dấu đầy đủ; không phải xác minh QRS lâm sàng.')
+        mark_img = mark_overlay(roi, reviewed['events'], references, hint_report['hints'])
+        reference_payload = {'version':'ecg-core-v1.5.2', 'image_name':upload.name,
+             'image_sha256_12':tag, 'lead':selected,'layout':layout,'roi_box':box,
+             'reference_points':references, 'reference_complete':completed_reference,
+             'reference_source':'HUMAN_DIRECT_MARK',
+             'candidate_event_labels':[{ 'event_id':e['event_id'], 'label':e['review_label']} for e in reviewed['events']],
+             'comparison':comparison, 'note':'Do not convert px to ms without verified time calibration.'}
         payload = public_report(result)
         payload.update({'lead': selected, 'roi_box': box, 'layout_confirmed_by_user': layout,
                         'image_name': upload.name, 'review_status': 'UNVERIFIED'})
@@ -157,6 +247,10 @@ def render():
             z.writestr('roi_original_v15.png', _png(roi))
             z.writestr('beat_events_v151.json', json.dumps(reviewed, ensure_ascii=False, indent=2))
             z.writestr('beat_events_overlay_v151.png', _png(validation_overlay(roi, reviewed)))
-        st.download_button('Tải validation v1.5.1 (ZIP)', buf.getvalue(),
-                           'ecg_core_v1_5_1_beat_validation.zip',
+            z.writestr('rpeak_image_hints_v152.json', json.dumps(hint_report, ensure_ascii=False, indent=2))
+            z.writestr('event_rpeak_localization_v152.json', json.dumps(localized, ensure_ascii=False, indent=2))
+            z.writestr('rpeak_reference_v152.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
+            z.writestr('rpeak_reference_overlay_v152.png', _png(mark_img))
+        st.download_button('Tải validation v1.5.2 (ZIP)', buf.getvalue(),
+                           'ecg_core_v1_5_2_rpeak_validation.zip',
                            'application/zip', key='beat15_download_' + tag)

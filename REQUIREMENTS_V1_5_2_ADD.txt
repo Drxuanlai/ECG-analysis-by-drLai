@@ -1,0 +1,4 @@
+Append the following line to the EXISTING requirements.txt on GitHub.
+Do not replace the current requirements.txt.
+
+streamlit-image-coordinates>=0.1.9,<1
