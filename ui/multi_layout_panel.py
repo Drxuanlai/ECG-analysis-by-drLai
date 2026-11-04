@@ -8,6 +8,7 @@ from core.signal_artifact import separate,sheet
 from core.row_boundary import propose_row_refinement, mask_qc, qc_overlay, VERSION as ROW_VERSION
 from core.waveform_reconstruction import reconstruct, overlay as waveform_overlay, panel as waveform_panel, exportable as waveform_exportable
 from core.spike_preservation import reconstruct_spike_aware, comparison_panel, export_comparison
+from core.qrs_segment_reconstruction import reconstruct_segments, compare_panel as qrs_segment_panel, exportable as qrs_segment_export
 
 
 def _image(data):
@@ -163,6 +164,20 @@ def render():
                             z.writestr('waveform_compare_v141.png',_png(comparison_panel(crop,comparison)))
                         st.download_button('Tải validation v1.4.1 · '+rec_lead+' (.zip)',z141.getvalue(),
                             'ecg_core_v1_4_1_spike_validation.zip','application/zip',key='wf141_dl_'+tag+rec_lead)
+                    st.markdown('**ECG Core v1.4.2 | QRS Segment Reconstruction QA**')
+                    st.caption('Chỉ tái dựng đoạn ứng viên có bằng chứng mực trên cả hai sườn. Điểm thiếu bằng chứng giữ nguyên null. Không dùng kết quả để chẩn đoán hoặc đo QRS.')
+                    if st.checkbox('So sánh đường gốc và QRS segment candidate',value=False,key='wf142_run_'+tag+rec_lead):
+                        segments=reconstruct_segments(crop,min_evidence=conf_threshold)
+                        st.image(qrs_segment_panel(crop,segments),caption='Trên: ROI | mask ứng viên. Dưới: waveform v1.4 | đề xuất v1.4.2; xanh lá = ứng viên đoạn, đỏ = bị từ chối.',width='stretch')
+                        st.json({'status':'REVIEW','metrics':segments['segment']['metrics'],
+                                 'segments':segments['segment']['segments']})
+                        z142=io.BytesIO()
+                        with zipfile.ZipFile(z142,'w',zipfile.ZIP_DEFLATED) as z:
+                            z.writestr('qrs_segments_v142.json',json.dumps({'lead':rec_lead,'roi_box':roi_item['box'],'image_name':up.name,'comparison':qrs_segment_export(segments)},ensure_ascii=False,indent=2,allow_nan=False))
+                            z.writestr('qrs_segment_comparison_v142.png',_png(qrs_segment_panel(crop,segments)))
+                        st.download_button('Tải QRS segment validation v1.4.2 (.zip)',z142.getvalue(),
+                            'ecg_core_v1_4_2_qrs_segments_validation.zip','application/zip',key='wf142_dl_'+tag+rec_lead)
+
                 except Exception as exc:
                     st.error('Không dựng được waveform: '+str(exc))
         
