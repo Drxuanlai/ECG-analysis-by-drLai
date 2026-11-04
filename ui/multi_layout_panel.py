@@ -27,7 +27,7 @@ def _png(im):
 def _suggest(raw,enabled):
     return suggest_layout(_image(raw),ocr=enabled)
 
-def render():
+def render_legacy_qa():
     with st.expander('ECG Core v1.3.4 | Row Boundary + Mask QC',expanded=False):
         st.caption('QA nghiên cứu; không thay thế kết quả AI/Streamlit legacy, không định lượng PQRST.')
         up=st.file_uploader('ECG 3×4 hoặc 6×2 (PNG/JPEG/HEIC)',type=['png','jpg','jpeg','webp','heic','heif'],key='ml133_upload')
@@ -183,3 +183,14 @@ def render():
         
         st.download_button('Tải validation v1.3.4 (.zip)',filebuf.getvalue(),
                            'ecg_core_v1_3_4_row_mask_qc_validation.zip','application/zip',key='ml133_download_'+tag)
+
+
+def render():
+    """One visible ECG Core research entry, instead of many simultaneously rendered QA panels."""
+    from ui.beat_panel import render as render_candidates
+    import streamlit as st
+    st.markdown('### ECG Core v1.5 · Nghiên cứu / QA')
+    st.caption('Giao diện đọc ECG bằng AI vẫn ở phía trên. Các engine legacy không được dùng làm nguồn đo lâm sàng.')
+    render_candidates()
+    if st.checkbox('Mở công cụ QA chuyên sâu v1.3.4–v1.4.2 (legacy)', value=False, key='core15_show_legacy_qa'):
+        render_legacy_qa()

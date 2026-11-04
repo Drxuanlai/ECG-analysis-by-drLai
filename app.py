@@ -1,16 +1,10 @@
-"""ECG Core v1.4.0: unchanged legacy app and independent research QA panels."""
+"""ECG Core v1.5: original clinical reader + one consolidated research QA entry.
+
+Legacy clinical code and API/failover are untouched. Old QA is opt-in.
+"""
 from pathlib import Path
 import runpy
-ROOT=Path(__file__).resolve().parent
-runpy.run_path(str(ROOT/'legacy'/'app_v17_1_original.py'),run_name='__main__')
-from ui.adaptive_panel import render
-render()
-
-from ui.grid_aware_panel import render as render_grid_aware
-render_grid_aware()
-
-from ui.layout_panel import render as render_adaptive_layout
-render_adaptive_layout()
-
-from ui.multi_layout_panel import render as render_multi_layout_v134
-render_multi_layout_v134()
+ROOT = Path(__file__).resolve().parent
+runpy.run_path(str(ROOT / 'legacy' / 'app_v17_1_original.py'), run_name='__main__')
+from ui.multi_layout_panel import render as render_ecg_core_qa
+render_ecg_core_qa()
