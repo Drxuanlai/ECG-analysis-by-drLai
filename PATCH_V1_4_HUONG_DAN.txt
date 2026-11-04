@@ -1,0 +1,11 @@
+ECG Core v1.4 PATCH ONLY (tu v1.3.4)
+
+CHI CAP NHAT BRANCH refactor/ecg-core-v1.
+
+1. Giai nen zip nay.
+2. Sao chep cac file dung duong dan (core/, ui/, tests/ va app.py) vao thu muc goc repository tren branch refactor/ecg-core-v1.
+3. GitHub web: neu upload file trung ten bi loi, sua/thay the file do qua GitHub Desktop (commit + push), hoac dung editor GitHub.
+4. Khong xoa thu muc legacy, benchmark, cac module v1.3.4 cu.
+5. Deploy app.py. Vao panel v1.3.4, tim muc Waveform Reconstruction v1.4.
+
+Luu y: Quan sat ROI va waveform, chua duoc dung dinh luong lam sang.

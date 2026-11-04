@@ -39,3 +39,8 @@ A Streamlit browser smoke test and fixed-ECG regression set are required before 
 
 ## v1.3 Adaptive Layout QA
 Run `app.py`; expand **ECG Core v1.3 | Adaptive Layout & Lead ROI QA**. See `LAYOUT_V1_3_GUIDE_VI.md`. OCR and calibration-like stroke boundaries are unverified candidates; manual row/column edits are supported. Legacy AI/failover preserved.
+
+
+## v1.4 — Waveform reconstruction QA
+
+Panel v1.3.4 now includes a **research-only** 1-D trace candidate for the selected, manually reviewed lead ROI. Export overlay, 4-panel image, per-column CSV and JSON, retaining null values for missing support. No QRS/PQRST or physical-unit measurements. See `WAVEFORM_V1_4_GUIDE_VI.md`.

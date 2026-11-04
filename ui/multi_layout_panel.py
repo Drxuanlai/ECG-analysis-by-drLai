@@ -6,6 +6,7 @@ from PIL import Image,ImageOps
 from core.multi_layout import suggest_layout,propose_boxes,overlay,VERSION
 from core.signal_artifact import separate,sheet
 from core.row_boundary import propose_row_refinement, mask_qc, qc_overlay, VERSION as ROW_VERSION
+from core.waveform_reconstruction import reconstruct, overlay as waveform_overlay, panel as waveform_panel, exportable as waveform_exportable
 
 
 def _image(data):
@@ -116,5 +117,37 @@ def render():
                     st.caption('Mask QC v1.3.4: xanh ứng viên mực, cam uncertain, đỏ dải sát rìa ROI.')
                     st.image(qc_overlay(roi,ev,q['mask_qc']),width='stretch')
                     st.json(q['mask_qc'])
+        with st.expander('ECG Core v1.4 | Waveform Reconstruction Foundation (nghiên cứu)',expanded=True):
+            st.caption('Sử dụng ROI đang hiển thị phía trên, bao gồm mọi chỉnh tay. Chỉ dựng centerline candidate; chưa QRS/PQRST, chưa ms/mV.')
+            options=[v['lead'] for v in proposal['rois'] if v['lead']!='II-rhythm']
+            rec_lead=st.selectbox('Chọn chuyển đạo kiểm chứng 1-D',options,index=options.index('II') if 'II' in options else 0,key='wf14_lead_'+tag)
+            conf_threshold=st.slider('Ngưỡng bằng chứng pixel (cao hơn = bỏ nhiều cột chưa chắc)',0.25,0.75,0.42,0.01,key='wf14_thr_'+tag)
+            st.info('Màu xanh: điểm ứng viên có bằng chứng. Màu cam: cột có nhiều mực cạnh tranh. Đoạn đứt: KHÔNG xác định, không được tự nối.')
+            run_recon=st.checkbox('Dựng tín hiệu 1-D từ ROI này (QA)',value=False,key='wf14_run_'+tag)
+            if run_recon:
+                roi_item=next(v for v in proposal['rois'] if v['lead']==rec_lead)
+                crop=im.crop(tuple(roi_item['box']))
+                try:
+                    traced=reconstruct(crop,min_evidence=conf_threshold)
+                    st.image(waveform_panel(crop,traced),caption='Trên: ảnh ROI | ảnh tăng tương phản. Dưới: pixel ứng viên | đường centerline candidate (có gaps).',width='stretch')
+                    st.write('**Trạng thái: REVIEW — chưa xác minh bằng ground truth.**')
+                    st.json({'lead':rec_lead,'box':roi_item['box'],'metrics':traced['metrics'],'reasons':traced['reason_codes']})
+                    # Null values stay null in export: not measured, not interpolated.
+                    report={'lead':rec_lead,'roi_box':roi_item['box'],'image_name':up.name,
+                            'version':'ECG Core v1.4', 'waveform':waveform_exportable(traced),
+                            'clinical_use':'RESEARCH_ONLY; NOT CALIBRATED; NOT PQRST'}
+                    z14=io.BytesIO()
+                    with zipfile.ZipFile(z14,'w',zipfile.ZIP_DEFLATED) as z:
+                        z.writestr('waveform_v14.json',json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False))
+                        z.writestr('waveform_overlay_v14.png',_png(waveform_overlay(crop,traced)))
+                        z.writestr('waveform_evidence_panel_v14.png',_png(waveform_panel(crop,traced)))
+                        z.writestr('waveform_columns_v14.csv','x_pixel,y_pixel,confidence,supported,ambiguous\n'+''.join(
+                            f"{x:.2f},{'' if y is None else round(y,2)},{c:.3f},{int(s)},{int(a)}\n"
+                            for x,y,c,s,a in zip(traced['x_src'],traced['y_src'],traced['confidence'],traced['supported'],traced['ambiguous'])))
+                    st.download_button(f'Tải waveform validation v1.4 · {rec_lead} (.zip)',z14.getvalue(),
+                                       'ecg_core_v1_4_waveform_validation.zip','application/zip',key='wf14_dl_'+tag+rec_lead)
+                except Exception as exc:
+                    st.error('Không dựng được waveform: '+str(exc))
+        
         st.download_button('Tải validation v1.3.4 (.zip)',filebuf.getvalue(),
                            'ecg_core_v1_3_4_row_mask_qc_validation.zip','application/zip',key='ml133_download_'+tag)
