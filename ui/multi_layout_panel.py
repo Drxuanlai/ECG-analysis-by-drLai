@@ -7,6 +7,7 @@ from core.multi_layout import suggest_layout,propose_boxes,overlay,VERSION
 from core.signal_artifact import separate,sheet
 from core.row_boundary import propose_row_refinement, mask_qc, qc_overlay, VERSION as ROW_VERSION
 from core.waveform_reconstruction import reconstruct, overlay as waveform_overlay, panel as waveform_panel, exportable as waveform_exportable
+from core.spike_preservation import reconstruct_spike_aware, comparison_panel, export_comparison
 
 
 def _image(data):
@@ -146,6 +147,22 @@ def render():
                             for x,y,c,s,a in zip(traced['x_src'],traced['y_src'],traced['confidence'],traced['supported'],traced['ambiguous'])))
                     st.download_button(f'Tải waveform validation v1.4 · {rec_lead} (.zip)',z14.getvalue(),
                                        'ecg_core_v1_4_waveform_validation.zip','application/zip',key='wf14_dl_'+tag+rec_lead)
+                    st.markdown('**ECG Core v1.4.1 | Vertical-Stroke / QRS Spike Preservation QA**')
+                    st.caption('Dấu tròn đỏ chỉ nét dốc đứng ứng viên, không khẳng định R/QRS. Không ép đường đi qua chỗ thiếu mực.')
+                    run_spike=st.checkbox('So sánh trước/sau bảo toàn nét dốc đứng',value=False,key='wf141_run_'+tag+rec_lead)
+                    if run_spike:
+                        comparison=reconstruct_spike_aware(crop,min_evidence=conf_threshold)
+                        st.image(comparison_panel(crop,comparison),caption='Trên: ROI | mask nét đứng. Dưới: đường v1.4 | đường v1.4.1 + dấu đỏ nét ứng viên.',width='stretch')
+                        st.json({'status':'REVIEW','lead':rec_lead,'metrics':comparison['refined']['metrics'],
+                                 'spike_candidates':comparison['refined']['spike_candidates']})
+                        z141=io.BytesIO()
+                        with zipfile.ZipFile(z141,'w',zipfile.ZIP_DEFLATED) as z:
+                            z.writestr('waveform_v141.json',json.dumps({'lead':rec_lead,'roi_box':roi_item['box'],
+                                'image_name':up.name,'comparison':export_comparison(comparison)},
+                                ensure_ascii=False,indent=2,allow_nan=False))
+                            z.writestr('waveform_compare_v141.png',_png(comparison_panel(crop,comparison)))
+                        st.download_button('Tải validation v1.4.1 · '+rec_lead+' (.zip)',z141.getvalue(),
+                            'ecg_core_v1_4_1_spike_validation.zip','application/zip',key='wf141_dl_'+tag+rec_lead)
                 except Exception as exc:
                     st.error('Không dựng được waveform: '+str(exc))
         
