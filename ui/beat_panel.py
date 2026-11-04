@@ -8,6 +8,7 @@ from PIL import Image, ImageOps
 import streamlit as st
 from core.multi_layout import propose_boxes, overlay as layout_overlay
 from core.beat_candidates import detect_candidates, evidence_panel, public_report
+from core.beat_validation import cluster_validate, attach_review, validation_overlay, REVIEW_LABELS
 
 
 def _load(raw: bytes):
@@ -102,6 +103,49 @@ def render():
             st.json({'metrics': result['metrics'], 'reason_codes': result['reason_codes']})
         st.dataframe(result['candidates'], hide_index=True, width='stretch')
         st.warning('Mọi dấu cam đều cần đối chiếu ECG gốc. Không dùng số ứng viên để tính tần số tim hoặc nhận định loạn nhịp.')
+        st.divider()
+        st.subheader('v1.5.1 · Nhóm ứng viên & kiểm tra nhiễu (QA)')
+        st.caption('Không ép RR đều. Màu xanh dương: ứng viên hình thái; màu cam: vùng chưa phân giải. Bác sĩ có thể đánh dấu QRS/Artifact và bổ sung QRS bị bỏ sót.')
+        grouped = cluster_validate(roi, result)
+        st.write(f"{grouped['source_candidate_count']} nét ứng viên → "
+                 f"{grouped['event_count']} sự kiện, "
+                 f"{grouped['machine_status_counts']['UNRESOLVED']} vùng UNRESOLVED")
+        # A reviewer label is NOT inferred from the machine's heuristic score.
+        labels = {}
+        with st.expander('Gán nhãn từng sự kiện (tùy chọn)', expanded=False):
+            st.caption('QRS = bác sĩ xác nhận từ ảnh; ARTIFACT = nhiễu; UNCERTAIN = chưa thể phân định. Mặc định UNREVIEWED.')
+            for e in grouped['events']:
+                c1, c2, c3 = st.columns([1, 3, 2])
+                with c1:
+                    st.write(e['event_id'])
+                with c2:
+                    reasons = ', '.join(e['reason_codes']) if e['reason_codes'] else 'no_specific_flag'
+                    st.caption(f"x={e['x_pixel']:.1f}px · {e['machine_status']} · {reasons}")
+                with c3:
+                    labels[e['event_id']] = st.selectbox(
+                        'Nhãn người đọc', REVIEW_LABELS,
+                        key='beat151_label_' + tag + selected + '_' + e['event_id'],
+                        label_visibility='collapsed')
+        missed_text = st.text_input(
+            'QRS bị bỏ sót: tọa độ x (pixel tính từ trái ROI), cách nhau bằng dấu phẩy',
+            value='', key='beat151_missed_' + tag + selected,
+            help='Chỉ ghi sau khi đã kiểm tra ảnh ECG gốc. Để trống nếu chưa rà soát đầy đủ.')
+        missed = []
+        if missed_text.strip():
+            try:
+                missed = [float(t.strip()) for t in missed_text.split(',') if t.strip()]
+                if any(not 0 <= x < roi.width for x in missed):
+                    raise ValueError('Tọa độ nằm ngoài ROI')
+            except ValueError as exc:
+                st.error('Tọa độ QRS bỏ sót chưa hợp lệ: ' + str(exc))
+                return
+        reviewed = attach_review(grouped, labels, missed)
+        st.image(validation_overlay(roi, reviewed),
+                 caption='Đường màu: sự kiện ứng viên; chấm tím dưới: QRS bác sĩ bổ sung. Không phải ECG đã đo.',
+                 width='stretch')
+        with st.expander('Bảng sự kiện và lý do QC', expanded=False):
+            st.dataframe(reviewed['events'], hide_index=True, width='stretch')
+        st.warning('Máy không xác minh QRS. Những sự kiện UNRESOLVED không được tự loại bỏ vì có thể là nhịp bệnh lý thực.')
         payload = public_report(result)
         payload.update({'lead': selected, 'roi_box': box, 'layout_confirmed_by_user': layout,
                         'image_name': upload.name, 'review_status': 'UNVERIFIED'})
@@ -111,6 +155,8 @@ def render():
             z.writestr('beat_candidates_overlay_v15.png', _png(panel))
             z.writestr('candidate_ink_mask_v15.png', _png(ink))
             z.writestr('roi_original_v15.png', _png(roi))
-        st.download_button('Tải validation v1.5 (ZIP)', buf.getvalue(),
-                           'ecg_core_v1_5_beat_candidate_validation.zip',
+            z.writestr('beat_events_v151.json', json.dumps(reviewed, ensure_ascii=False, indent=2))
+            z.writestr('beat_events_overlay_v151.png', _png(validation_overlay(roi, reviewed)))
+        st.download_button('Tải validation v1.5.1 (ZIP)', buf.getvalue(),
+                           'ecg_core_v1_5_1_beat_validation.zip',
                            'application/zip', key='beat15_download_' + tag)
