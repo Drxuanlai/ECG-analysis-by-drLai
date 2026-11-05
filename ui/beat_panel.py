@@ -422,7 +422,7 @@ def render():
             st.json({'metrics':report_2d['metrics'],
                      'unmatched_in_2d':report_2d['no_xy_match_reference_ids'],
                      'notes':report_2d['notes']})
-        st.subheader('v1.5.7 · Thành phần QRS: r nhỏ / S sâu (QA)')
+        st.subheader('v1.5.8 · Thành phần QRS: loại xung chuẩn / phục hồi r nhỏ (QA)')
         st.caption('Dò thành phần âm sâu từ ảnh mực, tìm r nhỏ phía trước nếu có bằng chứng. '
                    'Không ép QS khi chưa thấy r; không dùng nhãn bác sĩ để tạo ứng viên. '
                    'Các ứng viên ở đây chưa xác minh hình thái hay chẩn đoán.')
@@ -430,11 +430,12 @@ def render():
         component_comparison=compare_components_to_references(
             component_report,references,tolerance_x_px=float(tolerance),
             tolerance_y_px=float(tol_y))
-        st.write(f"{component_report['candidate_count']} vùng âm sâu được đề xuất · "
-                 'tất cả giữ REVIEW; không phải số phức bộ QRS đã xác minh.')
+        st.write(f"{component_report['candidate_count']} vùng âm sâu ứng viên · "
+                 f"{len(component_report.get('excluded_candidates', []))} vùng nghi xung chuẩn được loại khỏi ứng viên · "
+                 'các mốc QRS vẫn REVIEW, chưa xác minh.')
         st.image(component_overlay(roi,component_report,references),
                  caption='Xanh lam: đáy S ứng viên; ô tím: r nhỏ ứng viên; '
-                         'xanh lá: mốc bác sĩ; ngang cam: đường nền ước lượng.',
+                         'xanh lá: mốc bác sĩ; dấu X đỏ: nghi xung chuẩn; ngang cam: đường nền toàn ROI (r được tìm theo đường nền cục bộ).' ,
                  width='stretch')
         with st.expander('Bảng thành phần r/S và sai số 2D so với mốc bác sĩ',expanded=False):
             flattened=[]
@@ -444,10 +445,13 @@ def render():
                     'S_x':c['S_nadir']['x_pixel'],'S_y':c['S_nadir']['y_pixel'],
                     'r_x':c['r_apex']['x_pixel'] if c['r_apex'] else None,
                     'r_y':c['r_apex']['y_pixel'] if c['r_apex'] else None,
+                    'local_baseline_y':c.get('local_baseline_y_estimate'),
                     'morphology_proposal':c['morphology_proposal'],
                     'reason_codes':','.join(c['reason_codes']), 'qc':'REVIEW'})
             st.dataframe(flattened,hide_index=True,width='stretch')
             st.dataframe(component_comparison['matches'],hide_index=True,width='stretch')
+            st.write('Ứng viên nghi xung chuẩn được loại khỏi danh sách QRS:')
+            st.dataframe(component_report.get('excluded_candidates', []),hide_index=True,width='stretch')
             st.warning('So khớp 2D chỉ đánh giá tọa độ, không chứng minh rS/QS; '
                        'các mốc S tham chiếu không được dùng để tìm S.')
         with st.expander('v1.5.5 · Đối chiếu danh sách ưu tiên với R bác sĩ',expanded=False):
@@ -495,9 +499,9 @@ def render():
             z.writestr('rpeak_ranked_v155.json',json.dumps(filter_report,ensure_ascii=False,indent=2))
             z.writestr('rpeak_ranked_comparison_v155.json',json.dumps(filtered_comparison,ensure_ascii=False,indent=2))
             z.writestr('rpeak_ranked_overlay_v155.png',_png(filter_overlay(roi,filter_report,references)))
-            z.writestr('qrs_components_v157.json',json.dumps(component_report,ensure_ascii=False,indent=2))
-            z.writestr('qrs_components_vs_reference_v157.json',json.dumps(component_comparison,ensure_ascii=False,indent=2))
-            z.writestr('qrs_components_overlay_v157.png',_png(component_overlay(roi,component_report,references)))
+            z.writestr('qrs_components_v158.json',json.dumps(component_report,ensure_ascii=False,indent=2))
+            z.writestr('qrs_components_vs_reference_v158.json',json.dumps(component_comparison,ensure_ascii=False,indent=2))
+            z.writestr('qrs_components_overlay_v158.png',_png(component_overlay(roi,component_report,references)))
             z.writestr('qrs_fiducial_2d_v156.json',json.dumps(report_2d,ensure_ascii=False,indent=2))
             z.writestr('qrs_fiducial_2d_overlay_v156.png',_png(
                        fiducial_2d_overlay(roi,filter_report,references,report_2d)))
@@ -505,6 +509,6 @@ def render():
             z.writestr('rpeak_reference_v152.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_v153.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_overlay_v152.png', _png(mark_img))
-        st.download_button('Tải validation v1.5.7 (ZIP)', buf.getvalue(),
-                           'ecg_core_v1_5_7_qrs_components_validation.zip',
+        st.download_button('Tải validation v1.5.8 (ZIP)', buf.getvalue(),
+                           'ecg_core_v1_5_8_qrs_components_validation.zip',
                            'application/zip', key='beat15_download_' + tag)
