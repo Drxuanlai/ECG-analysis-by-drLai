@@ -12,6 +12,7 @@ from core.beat_validation import cluster_validate, attach_review, validation_ove
 from core.rpeak_review import (independent_rpeak_proposals, add_reference_point,
                                match_references, mark_overlay, event_rpeak_localization)
 from core.rpeak_filter import (filter_rpeak_hints, filter_overlay, compare_with_references)
+from core.rpeak_filter_v155 import rank_rpeak_hints
 from core.rpeak_windows import (make_windows, local_to_global, global_to_local_markers,
                                 review_summary, VERSION as WINDOW_VERSION)
 
@@ -157,11 +158,11 @@ def render():
         st.subheader('v1.5.3 · Đánh dấu đỉnh R theo từng đoạn (QA)')
         st.caption('Chấm xanh lá = vị trí bác sĩ đặt; chấm tím = gợi ý ảnh độc lập (không phải R xác minh). Không ép RR đều. Nhãn ARTIFACT đã lưu không bị thay đổi.')
         hint_report = independent_rpeak_proposals(roi)
-        st.caption('v1.5.4: xếp ưu tiên gợi ý R theo hình thái; không dùng RR đều hoặc nhãn bác sĩ để lọc.')
+        st.caption('v1.5.5: ưu tiên cực trị và nét mực tại đỉnh; không dùng RR đều hoặc nhãn bác sĩ để xếp hạng.')
         fraction = st.slider('Tỷ lệ gợi ý đưa vào nhóm xem trước (QA)',
                              min_value=.20, max_value=.80, value=.35, step=.05,
                              key='v154_fraction_'+tag+selected)
-        filter_report = filter_rpeak_hints(roi, hint_report['hints'],
+        filter_report = rank_rpeak_hints(roi, hint_report['hints'],
                                           shortlist_fraction=fraction)
         st.caption(f"{filter_report['raw_hint_count']} gợi ý gốc → "
                    f"{filter_report['priority_count']} cần xem trước; "
@@ -330,7 +331,7 @@ def render():
         with st.expander('Danh sách điểm R bác sĩ đã đặt', expanded=bool(references)):
             st.dataframe(references, hide_index=True, width='stretch')
         st.caption(f"{len(hint_report['hints'])} gợi ý ảnh độc lập (chưa xác minh); {len(references)} điểm R bác sĩ đã đánh dấu.")
-        with st.expander('v1.5.4 · So sánh gợi ý tím gốc và gợi ý ưu tiên (QA)', expanded=False):
+        with st.expander('v1.5.5 · So sánh gợi ý tím và thứ tự ưu tiên (QA)', expanded=False):
             st.image(filter_overlay(roi, filter_report, references),
                      caption='Xanh lam = ưu tiên xem; tím = chưa giải quyết; xanh lá = R bác sĩ. KHÔNG phải QRS xác minh.',
                      width='stretch')
@@ -355,7 +356,7 @@ def render():
                                       tolerance_px=tolerance,review_complete=completed_reference)
         filtered_comparison = compare_with_references(filter_report, references,
                     tolerance_px=tolerance, reference_complete=completed_reference)
-        with st.expander('v1.5.4 · Đối chiếu danh sách ưu tiên với R bác sĩ',expanded=False):
+        with st.expander('v1.5.5 · Đối chiếu danh sách ưu tiên với R bác sĩ',expanded=False):
             st.json({'raw_hints':filter_report['raw_hint_count'],
                 'priority_review':filter_report['priority_count'],
                 'references':len(references),
@@ -392,13 +393,18 @@ def render():
             z.writestr('beat_events_v151.json', json.dumps(reviewed, ensure_ascii=False, indent=2))
             z.writestr('beat_events_overlay_v151.png', _png(validation_overlay(roi, reviewed)))
             z.writestr('rpeak_image_hints_v152.json', json.dumps(hint_report, ensure_ascii=False, indent=2))
-            z.writestr('rpeak_filtered_v154.json', json.dumps(filter_report, ensure_ascii=False, indent=2))
-            z.writestr('rpeak_filtered_comparison_v154.json', json.dumps(filtered_comparison, ensure_ascii=False, indent=2))
-            z.writestr('rpeak_filtered_overlay_v154.png',_png(filter_overlay(roi,filter_report,references)))
+            old_filter_report=filter_rpeak_hints(roi,hint_report['hints'],shortlist_fraction=fraction)
+            old_comp=compare_with_references(old_filter_report,references,tolerance_px=tolerance,reference_complete=completed_reference)
+            z.writestr('rpeak_filtered_v154.json', json.dumps(old_filter_report, ensure_ascii=False, indent=2))
+            z.writestr('rpeak_filtered_comparison_v154.json', json.dumps(old_comp, ensure_ascii=False, indent=2))
+            z.writestr('rpeak_filtered_overlay_v154.png',_png(filter_overlay(roi,old_filter_report,references)))
+            z.writestr('rpeak_ranked_v155.json',json.dumps(filter_report,ensure_ascii=False,indent=2))
+            z.writestr('rpeak_ranked_comparison_v155.json',json.dumps(filtered_comparison,ensure_ascii=False,indent=2))
+            z.writestr('rpeak_ranked_overlay_v155.png',_png(filter_overlay(roi,filter_report,references)))
             z.writestr('event_rpeak_localization_v152.json', json.dumps(localized, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_v152.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_v153.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_overlay_v152.png', _png(mark_img))
-        st.download_button('Tải validation v1.5.4 (ZIP)', buf.getvalue(),
-                           'ecg_core_v1_5_4_rpeak_filter_validation.zip',
+        st.download_button('Tải validation v1.5.5 (ZIP)', buf.getvalue(),
+                           'ecg_core_v1_5_5_rpeak_ranking_validation.zip',
                            'application/zip', key='beat15_download_' + tag)
