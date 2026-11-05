@@ -6,3 +6,4 @@ pillow-heif>=0.16.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 streamlit-image-coordinates>=0.1.9,<1
+scipy>=1.11,<2
