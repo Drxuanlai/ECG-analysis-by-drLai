@@ -13,6 +13,8 @@ from core.rpeak_review import (independent_rpeak_proposals, add_reference_point,
                                match_references, mark_overlay, event_rpeak_localization)
 from core.rpeak_filter import (filter_rpeak_hints, filter_overlay, compare_with_references)
 from core.rpeak_filter_v155 import rank_rpeak_hints
+from core.fiducial_2d import (REFERENCE_KINDS, VERSION as FIDUCIAL_VERSION,
+    normalize_references, evaluate_fiducial_2d, fiducial_2d_overlay)
 from core.rpeak_windows import (make_windows, local_to_global, global_to_local_markers,
                                 review_summary, VERSION as WINDOW_VERSION)
 
@@ -198,7 +200,11 @@ def render():
                                                      width=roi.width,height=roi.height)
                     if references:
                         raise ValueError('Đang có điểm R trong phiên này; hãy dùng vùng hiện tại để tránh ghi đè.')
-                    st.session_state[reference_key]=imported
+                    # Existing reference types are preserved; old v1.5.2/3 data
+                    # defaults to R_PEAK and can be corrected manually below.
+                    for old, new in zip(payload_restore.get('reference_points',[]),imported):
+                        new['fiducial_type'] = old.get('fiducial_type','R_PEAK')
+                    st.session_state[reference_key]=normalize_references(imported)
                     st.session_state[reference_key+'_reviewed_windows']={}
                     st.session_state[reference_key+'_confirm_complete']=False
                     st.success(f'Đã khôi phục {len(imported)} điểm. Cần rà soát lại từng đoạn trước khi khóa bộ tham chiếu.')
@@ -278,6 +284,14 @@ def render():
             ref_y=st.number_input('Y của đỉnh R (pixel)', 0., float(roi.height-1),
                 value=float(roi.height/2), step=1.,
                 key=reference_key+'_manual_y_w'+str(win_idx))
+        st.caption('Loại mốc: R là đỉnh dương thực; S/ QS là đáy âm; QRS fiducial là mốc sự kiện, không phải đỉnh R.')
+        chosen_kind = st.selectbox('Loại mốc bác sĩ đang đánh dấu', REFERENCE_KINDS,
+                      format_func=lambda k: {
+                         'R_PEAK':'R-peak (đỉnh R dương)',
+                         'S_NADIR':'S-nadir (đáy S)',
+                         'QS_NADIR':'QS-nadir (phức bộ QS, không có R dương)',
+                         'QRS_FIDUCIAL':'QRS fiducial (mốc sự kiện, chưa xác định R/S)'
+                      }[k], key=reference_key+'_kind_window_'+str(win_idx))
         mark_source=st.radio('Lấy tọa độ từ',
             ['Điểm bấm trên ảnh', 'Ô nhập x/y'],horizontal=True,
             index=0 if can_click else 1,key=reference_key+'_coord_source_w'+str(win_idx))
@@ -290,8 +304,11 @@ def render():
                     x_add=clicked_x if mark_source=='Điểm bấm trên ảnh' else ref_x
                     y_add=clicked_y if mark_source=='Điểm bấm trên ảnh' else ref_y
                     try:
-                        st.session_state[reference_key]=add_reference_point(references,x_add,y_add,
+                        updated=add_reference_point(references,x_add,y_add,
                                                     width=roi.width,height=roi.height)
+                        # Attach the human-defined type to the newly added marker only.
+                        updated[-1]['fiducial_type'] = chosen_kind
+                        st.session_state[reference_key]=normalize_references(updated)
                         # Any edit makes current window require a fresh review confirmation.
                         st.session_state[review_key][str(win_idx)]=False
                         st.session_state[confirm_key]=False
@@ -330,7 +347,28 @@ def render():
         references = st.session_state[reference_key]
         with st.expander('Danh sách điểm R bác sĩ đã đặt', expanded=bool(references)):
             st.dataframe(references, hide_index=True, width='stretch')
-        st.caption(f"{len(hint_report['hints'])} gợi ý ảnh độc lập (chưa xác minh); {len(references)} điểm R bác sĩ đã đánh dấu.")
+        # Re-type a previously marked point without changing x/y (important for V1 QS).
+        if references:
+            with st.expander('v1.5.6 · Sửa loại mốc đã đánh dấu (không đổi tọa độ)',expanded=False):
+                ids=[r['reference_id'] for r in references]
+                change_id=st.selectbox('Chọn điểm tham chiếu',ids,key=reference_key+'_edit_kind_id')
+                target=next(r for r in references if r['reference_id']==change_id)
+                current=target.get('fiducial_type','R_PEAK')
+                new_kind=st.selectbox('Loại mốc mới',REFERENCE_KINDS,
+                    index=REFERENCE_KINDS.index(current),key=reference_key+'_edit_kind_value')
+                if st.button('Cập nhật loại mốc',key=reference_key+'_edit_kind_btn'):
+                    for r in st.session_state[reference_key]:
+                        if r['reference_id']==change_id:
+                            r['fiducial_type']=new_kind
+                    affected=next((ww['index'] for ww in windows if
+                          ww['x_start']<=target['x_pixel']<ww['x_end']),None)
+                    if affected is not None:
+                        st.session_state[review_key][str(affected)]=False
+                    st.session_state[confirm_key]=False
+                    st.rerun()
+        references=normalize_references(st.session_state[reference_key])
+        st.session_state[reference_key]=references
+        st.caption(f"{len(hint_report['hints'])} gợi ý ảnh độc lập (chưa xác minh); {len(references)} mốc bác sĩ đã đánh dấu.")
         with st.expander('v1.5.5 · So sánh gợi ý tím và thứ tự ưu tiên (QA)', expanded=False):
             st.image(filter_overlay(roi, filter_report, references),
                      caption='Xanh lam = ưu tiên xem; tím = chưa giải quyết; xanh lá = R bác sĩ. KHÔNG phải QRS xác minh.',
@@ -356,6 +394,32 @@ def render():
                                       tolerance_px=tolerance,review_complete=completed_reference)
         filtered_comparison = compare_with_references(filter_report, references,
                     tolerance_px=tolerance, reference_complete=completed_reference)
+        st.subheader('v1.5.6 · QRS fiducial + kiểm tra 2D (X và Y)')
+        st.caption('X đúng nhưng Y lệch không được tính là định vị 2D đúng. '
+                   'Loại R / S / QS do bác sĩ xác nhận; máy chưa tự phân loại PQRST.')
+        tol_y=st.slider('Dung sai vị trí Y (pixel; QA)',3,30,8,
+                         key='v156_tolerance_y_'+tag+selected)
+        report_2d=evaluate_fiducial_2d(filter_report,references,
+                    tolerance_x_px=tolerance,tolerance_y_px=tol_y,
+                    reference_complete=completed_reference)
+        qa_left,qa_mid,qa_right=st.columns(3)
+        qa_left.metric('Khớp X và Y',report_2d['xy_within_tolerance_count'])
+        qa_mid.metric('Khớp ưu tiên X và Y',report_2d['priority_xy_within_tolerance_count'])
+        qa_right.metric('X khớp nhưng Y lệch',report_2d['x_only_y_mismatch_count'])
+        if report_2d['x_only_y_mismatch_count']:
+            st.warning('Có ứng viên trùng thời điểm nhưng lệch độ cao trên ảnh. '
+                       'Không được đánh giá là R-peak đã định vị đúng.')
+        if selected in ('V1','V2','V3'):
+            st.info('V1–V3 có thể xuất hiện QS hoặc S âm sâu. Chỉ chọn R_PEAK '
+                    'khi thực sự có sóng R dương; không đổi tên đáy S thành đỉnh R.')
+        with st.expander('Bằng chứng định vị 2D và bảng sai số',expanded=True):
+            st.image(fiducial_2d_overlay(roi,filter_report,references,report_2d),
+                caption='Dấu xanh lá: R bác sĩ. Dấu cam: S/QS/fiducial bác sĩ. '
+                        'Vòng xanh/tím: máy. Đường đỏ: X gần nhưng Y sai.',width='stretch')
+            st.dataframe(report_2d['matches'],hide_index=True,width='stretch')
+            st.json({'metrics':report_2d['metrics'],
+                     'unmatched_in_2d':report_2d['no_xy_match_reference_ids'],
+                     'notes':report_2d['notes']})
         with st.expander('v1.5.5 · Đối chiếu danh sách ưu tiên với R bác sĩ',expanded=False):
             st.json({'raw_hints':filter_report['raw_hint_count'],
                 'priority_review':filter_report['priority_count'],
@@ -374,7 +438,7 @@ def render():
         else:
             st.info('Các chỉ số hiện tại chỉ phản ánh khớp tọa độ theo pixel trên ROI đã đánh dấu đầy đủ; không phải xác minh QRS lâm sàng.')
         mark_img = mark_overlay(roi, reviewed['events'], references, hint_report['hints'])
-        reference_payload = {'version':'ecg-core-v1.5.3', 'image_name':upload.name,
+        reference_payload = {'version':'ecg-core-v1.5.6', 'image_name':upload.name,
              'image_sha256_12':tag, 'lead':selected,'layout':layout,'roi_box':box,
              'reference_points':references, 'reference_complete':completed_reference,
              'annotation_windows':state, 'window_annotation_version':WINDOW_VERSION,
@@ -401,10 +465,13 @@ def render():
             z.writestr('rpeak_ranked_v155.json',json.dumps(filter_report,ensure_ascii=False,indent=2))
             z.writestr('rpeak_ranked_comparison_v155.json',json.dumps(filtered_comparison,ensure_ascii=False,indent=2))
             z.writestr('rpeak_ranked_overlay_v155.png',_png(filter_overlay(roi,filter_report,references)))
+            z.writestr('qrs_fiducial_2d_v156.json',json.dumps(report_2d,ensure_ascii=False,indent=2))
+            z.writestr('qrs_fiducial_2d_overlay_v156.png',_png(
+                       fiducial_2d_overlay(roi,filter_report,references,report_2d)))
             z.writestr('event_rpeak_localization_v152.json', json.dumps(localized, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_v152.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_v153.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_overlay_v152.png', _png(mark_img))
-        st.download_button('Tải validation v1.5.5 (ZIP)', buf.getvalue(),
-                           'ecg_core_v1_5_5_rpeak_ranking_validation.zip',
+        st.download_button('Tải validation v1.5.6 (ZIP)', buf.getvalue(),
+                           'ecg_core_v1_5_6_fiducial_2d_validation.zip',
                            'application/zip', key='beat15_download_' + tag)
