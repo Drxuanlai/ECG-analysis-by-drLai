@@ -17,6 +17,8 @@ from core.fiducial_2d import (REFERENCE_KINDS, VERSION as FIDUCIAL_VERSION,
     normalize_references, evaluate_fiducial_2d, fiducial_2d_overlay)
 from core.rpeak_windows import (make_windows, local_to_global, global_to_local_markers,
                                 review_summary, VERSION as WINDOW_VERSION)
+from core.qrs_polarity import (detect_polarity_components, polarity_overlay,
+                               compare_polarity_to_references)
 from core.qrs_components import (detect_qrs_components, compare_components_to_references,
                                  component_overlay)
 
@@ -422,6 +424,28 @@ def render():
             st.json({'metrics':report_2d['metrics'],
                      'unmatched_in_2d':report_2d['no_xy_match_reference_ids'],
                      'notes':report_2d['notes']})
+        st.subheader('v1.5.9 · QRS hai cực tính: R dương / S âm (QA)')
+        st.caption('Ứng viên dương và âm được phát hiện độc lập trên ảnh. '
+                   'Không dùng RR đều; không tự suy ra nhịp, khoảng QRS hoặc chẩn đoán. '
+                   'Nghi xung chuẩn và QRS cắt biên vẫn được lưu để kiểm tra.')
+        polarity_report=detect_polarity_components(roi)
+        polarity_comparison=compare_polarity_to_references(
+            polarity_report,references,tol_x=float(tolerance),tol_y=float(tol_y))
+        st.write(f"{polarity_report['positive_count']} ứng viên R dương · "
+                 f"{polarity_report['negative_count']} ứng viên S âm · "
+                 f"{polarity_report['positive_unresolved_count']} dấu dương chưa phân định; tất cả REVIEW.")
+        st.image(polarity_overlay(roi,polarity_report),
+                 caption='Ô tím: R dương ứng viên; vòng xanh: S âm ứng viên; '
+                         'ô vàng: cực trị nghi xung chuẩn/mép ảnh; X đỏ: nghi xung chuẩn cũ, KHÔNG loại tín hiệu vĩnh viễn.',
+                 width='stretch')
+        with st.expander('v1.5.9 · Chi tiết từng cực tính / so sánh mốc tham chiếu'):
+            st.json({'polarity_proposal':polarity_report['polarity_proposal'],
+                     'notes':polarity_report['notes']})
+            st.dataframe(polarity_report['positive_components'],hide_index=True,width='stretch')
+            st.dataframe(polarity_report['negative_components'],hide_index=True,width='stretch')
+            st.dataframe(polarity_report['positive_unresolved'],hide_index=True,width='stretch')
+            st.dataframe(polarity_comparison['matches'],hide_index=True,width='stretch')
+        st.caption('Các vùng gần mép và xung chuẩn là UNRESOLVED; không dùng để khẳng định không có QRS.')
         st.subheader('v1.5.8 · Thành phần QRS: loại xung chuẩn / phục hồi r nhỏ (QA)')
         st.caption('Dò thành phần âm sâu từ ảnh mực, tìm r nhỏ phía trước nếu có bằng chứng. '
                    'Không ép QS khi chưa thấy r; không dùng nhãn bác sĩ để tạo ứng viên. '
@@ -499,6 +523,9 @@ def render():
             z.writestr('rpeak_ranked_v155.json',json.dumps(filter_report,ensure_ascii=False,indent=2))
             z.writestr('rpeak_ranked_comparison_v155.json',json.dumps(filtered_comparison,ensure_ascii=False,indent=2))
             z.writestr('rpeak_ranked_overlay_v155.png',_png(filter_overlay(roi,filter_report,references)))
+            z.writestr('qrs_polarity_v159.json',json.dumps(polarity_report,ensure_ascii=False,indent=2))
+            z.writestr('qrs_polarity_vs_reference_v159.json',json.dumps(polarity_comparison,ensure_ascii=False,indent=2))
+            z.writestr('qrs_polarity_overlay_v159.png',_png(polarity_overlay(roi,polarity_report)))
             z.writestr('qrs_components_v158.json',json.dumps(component_report,ensure_ascii=False,indent=2))
             z.writestr('qrs_components_vs_reference_v158.json',json.dumps(component_comparison,ensure_ascii=False,indent=2))
             z.writestr('qrs_components_overlay_v158.png',_png(component_overlay(roi,component_report,references)))
@@ -509,6 +536,6 @@ def render():
             z.writestr('rpeak_reference_v152.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_v153.json', json.dumps(reference_payload, ensure_ascii=False, indent=2))
             z.writestr('rpeak_reference_overlay_v152.png', _png(mark_img))
-        st.download_button('Tải validation v1.5.8 (ZIP)', buf.getvalue(),
-                           'ecg_core_v1_5_8_qrs_components_validation.zip',
+        st.download_button('Tải validation v1.5.9 (ZIP)', buf.getvalue(),
+                           'ecg_core_v1_5_9_polarity_qrs_validation.zip',
                            'application/zip', key='beat15_download_' + tag)
