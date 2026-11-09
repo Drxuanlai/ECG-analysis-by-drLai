@@ -1,4 +1,4 @@
-"""ECG Core v2.1 — AI Visual Reader + Adaptive Cropping. Research prototype.
+"""ECG Core v2.2 — AI Visual Reader + Adaptive Cropping. Research prototype.
 
 Separate Streamlit entrypoint, preserving app.py, legacy Gemini/failover, Benchmark v2.0.
 """
@@ -12,10 +12,11 @@ from core.visual_reader_v21 import (LEADS,FIRST_PASS_PROMPT,SECOND_PASS_PROMPT,
     image_from_bytes,image_identity,image_for_model,layout_boxes,crop_images,extract_json,
     sanitized_observations,normalize_second,choose_leads,reconciliation,report_export)
 from core.gemini_visual_v21 import routes_from_secrets, analyze_with_routes
+from core.group_crops_v22 import all_panels, panel_as_jpeg, v22_report, GROUPS
 
-st.set_page_config(page_title='ECG Core v2.1 | AI Visual Evidence',layout='wide')
-st.title('ECG Core v2.1 · AI Visual Evidence Lab')
-st.caption('Một ảnh gốc → AI đọc 12 lead → crop thích ứng → đọc lại độc lập → đối chiếu. NGHIÊN CỨU, bác sĩ phải duyệt.')
+st.set_page_config(page_title='ECG Core v2.2 | AI Visual Evidence',layout='wide')
+st.title('ECG Core v2.2 · AI Visual Evidence Lab')
+st.caption('Một ảnh gốc → AI đọc đủ 12 lead → 4 nhóm cố định + DII rhythm nếu có → AI đọc lại → rà soát bằng chứng. NGHIÊN CỨU.')
 st.warning('Bản nghiên cứu. Không dùng làm công cụ duy nhất để loại trừ nhồi máu cơ tim, rối loạn nhịp nguy hiểm hoặc quyết định điều trị. Chưa có phép đo định lượng ECG đã xác minh.')
 
 try:
@@ -43,7 +44,7 @@ st.subheader('1 · Tải một ảnh ECG gốc')
 upload=st.file_uploader('Ảnh 12 chuyển đạo',type=['jpg','jpeg','png','webp']+(['heic','heif'] if heic_ready else []))
 if not heic_ready: st.caption('Ảnh HEIC: cần pillow-heif; nếu không có hãy chuyển sang JPG/PNG.')
 if upload is None:
-    st.info('Tải một ảnh ECG để bắt đầu. Chưa cần chuẩn bị 5 ảnh crop.')
+    st.info('Tải một ảnh ECG để bắt đầu. Ứng dụng tự tạo 4 hoặc 5 ảnh nhóm từ ROI.')
     st.stop()
 try:
     photo=image_from_bytes(upload.getvalue())
@@ -52,7 +53,7 @@ except Exception as exc:
     st.stop()
 image_hash=image_identity(photo)
 if st.session_state.get('v21_image_hash')!=image_hash:
-    for state_key in ('v21_first','v21_second','v21_selected','v21_completed_layout'):
+    for state_key in ('v21_first','v21_second','v21_selected','v21_completed_layout','v22_second','v22_config_hash'):
         st.session_state.pop(state_key,None)
     st.session_state['v21_image_hash']=image_hash
 st.image(photo,caption=f'Ảnh gốc · {photo.width}×{photo.height} pixel',width='stretch')
@@ -88,102 +89,119 @@ if first['hypotheses']:
 else:
     st.info('AI chưa đưa ra giả thuyết. Vẫn phải rà soát các lead cơ bản; không suy ra ECG bình thường.')
 
-st.subheader('3 · Bố cục và crop thích ứng (bác sĩ xác nhận)')
+st.subheader('3 · Xác nhận bố cục và 5 nhóm ảnh ECG')
 col1,col2,col3=st.columns(3)
 with col1: layout=st.selectbox('Bố cục trên ảnh gốc',['3x4','6x2'])
-with col2: rhythm=st.checkbox('Có dải II kéo dài riêng',value=(layout=='3x4'))
-with col3: margin=st.slider('Lề tránh nhiễm lead liền kề',0.0,.07,.02,.005)
+with col2: rhythm=st.checkbox('Ảnh thật có dải DII rhythm riêng',value=(layout=='3x4'))
+with col3: margin=st.slider('Lề tránh tín hiệu liền kề',0.0,.06,.02,.005)
 if rhythm:
-    rhythm_start=st.slider('Ranh giới bắt đầu dải nhịp (%)',65,90,78)/100
+    rhythm_start=st.slider('Ranh giới bắt đầu dải rhythm (%)',65,92,78)/100
 else: rhythm_start=.78
+if layout=='6x2' and not rhythm:
+    st.info('Bố cục 6×2 không có dải rhythm dài: chỉ tạo 4 nhóm. DII ngắn không thể thay cho DII rhythm.')
 try:
     boxes=layout_boxes(photo.size,layout,rhythm=rhythm,rhythm_start=rhythm_start,margin=margin)
 except ValueError as exc:
     st.error(str(exc)); st.stop()
-# Per-lead ROI overrides are bound to the source image and selected layout.
-override_identity=f'{image_hash}:{layout}:{rhythm}'
-if st.session_state.get('v21_override_identity')!=override_identity:
-    st.session_state['v21_override_identity']=override_identity
-    st.session_state['v21_roi_overrides']={}
-for lead, box in st.session_state['v21_roi_overrides'].items():
+
+# Keep manually confirmed overrides separated by image + layout + rhythm parameters.
+import hashlib
+config_tag=f'{image_hash}:{layout}:{rhythm}:{rhythm_start:.4f}:{margin:.4f}'
+if st.session_state.get('v22_overrides_for')!=config_tag:
+    st.session_state['v22_overrides_for']=config_tag
+    st.session_state['v22_boxes_override']={}
+    st.session_state.pop('v22_second',None)
+for lead,box in st.session_state['v22_boxes_override'].items():
     if lead in boxes: boxes[lead]=tuple(box)
-with st.expander('Sửa ROI riêng khi S âm sâu / QRS cao bị cắt (tùy chọn)'):
-    edit_lead=st.selectbox('Chuyển đạo muốn chỉnh',list(boxes),key='v21_edit_lead')
-    bx=boxes[edit_lead]
-    st.caption(f'Khung hiện tại của {edit_lead}: {bx}. Có thể mở rộng Y khi thấy đỉnh/đáy QRS bị cắt.')
-    ed_cols=st.columns(4)
-    x0=ed_cols[0].number_input('X trái',0,photo.width-2,value=int(bx[0]),step=5,key=f'v21_x0_{override_identity}_{edit_lead}')
-    y0=ed_cols[1].number_input('Y trên',0,photo.height-2,value=int(bx[1]),step=5,key=f'v21_y0_{override_identity}_{edit_lead}')
-    x1=ed_cols[2].number_input('X phải',1,photo.width,value=int(bx[2]),step=5,key=f'v21_x1_{override_identity}_{edit_lead}')
-    y1=ed_cols[3].number_input('Y dưới',1,photo.height,value=int(bx[3]),step=5,key=f'v21_y1_{override_identity}_{edit_lead}')
-    if st.button('Áp dụng ROI cho chuyển đạo này'):
-        if x0>=x1 or y0>=y1:
-            st.error('Khung phải có chiều rộng và chiều cao dương.')
-        else:
-            st.session_state['v21_roi_overrides'][edit_lead]=(int(x0),int(y0),int(x1),int(y1))
-            st.session_state.pop('v21_second',None)
+
+with st.expander('Chỉnh ROI từng chuyển đạo nếu sóng bị cắt',expanded=False):
+    edit_lead=st.selectbox('Chuyển đạo cần chỉnh',list(boxes),key='v22_edit_lead')
+    curr=boxes[edit_lead]
+    ed=st.columns(4)
+    vals=[]
+    for i,(label,lower,upper) in enumerate(zip(('X trái','Y trên','X phải','Y dưới'),(0,0,1,1),(photo.width-1,photo.height-1,photo.width,photo.height))):
+        vals.append(ed[i].number_input(label,min_value=lower,max_value=upper,value=int(curr[i]),step=5,key=f'v22_{i}_{config_tag}_{edit_lead}'))
+    if st.button('Áp dụng ROI'):
+        try:
+            from core.group_crops_v22 import validate_roi
+            valid=validate_roi(tuple(vals),photo.size)
+            st.session_state['v22_boxes_override'][edit_lead]=valid
+            st.session_state.pop('v22_second',None)
             st.rerun()
-    if st.button('Khôi phục tất cả ROI theo bố cục'):
-        st.session_state['v21_roi_overrides']={}
-        st.session_state.pop('v21_second',None)
-        for coord in ('x0','y0','x1','y1'):
-            st.session_state.pop(f'v21_{coord}_{override_identity}_{edit_lead}',None)
+        except ValueError as exc: st.error(str(exc))
+    if st.button('Đặt lại ROI mặc định'):
+        st.session_state['v22_boxes_override']={}
+        st.session_state.pop('v22_second',None)
         st.rerun()
-preview=photo.copy();draw=ImageDraw.Draw(preview)
+
+preview=photo.copy(); draw=ImageDraw.Draw(preview)
 for lead,(x0,y0,x1,y1) in boxes.items():
-    color='#9C27B0' if lead=='II-rhythm' else '#04A5D6'
-    draw.rectangle((x0,y0,x1,y1),outline=color,width=max(2,photo.width//750))
-    draw.text((x0+6,y0+5),lead,fill=color,stroke_width=1,stroke_fill='#ffffff')
-st.image(preview,caption='Khung ROI chỉ là đề xuất hình học. Nếu sai nhãn, cắt QRS hoặc chồng lead, KHÔNG dùng crop để kết luận.',width='stretch')
+    color='#a034a0' if lead=='II-rhythm' else '#06a7d8'
+    draw.rectangle((x0,y0,x1,y1),outline=color,width=max(2,photo.width//800))
+    draw.text((x0+5,y0+4),lead,fill=color,stroke_width=1,stroke_fill='#ffffff')
+st.image(preview,caption='ROI là đề xuất hình học, không chứng minh đã bao trọn hình thái. Bác sĩ kiểm tra trước khi gửi AI.',width='stretch')
+try:
+    panels=all_panels(photo,boxes)
+except ValueError as exc:
+    st.error('Không thể tạo đủ các nhóm: '+str(exc));st.stop()
 
-available=set(boxes)
-proposed=choose_leads(first,available,max_leads=6)
-selected=st.multiselect('Lead gửi đọc kỹ (tối đa 6 ảnh, có checklist cố định)',options=list(boxes),default=proposed)
-if len(selected)>6:
-    st.error('Chỉ chọn tối đa 6 ảnh trong một lượt; phân tích thêm ở lượt khác.')
-    st.stop()
-if not selected:
-    st.warning('Chọn ít nhất một chuyển đạo trước khi đọc lại.');st.stop()
-with st.expander('Xem các ảnh crop thực tế trước khi gửi AI',expanded=True):
-    cropped=crop_images(photo,boxes,selected)
-    columns=st.columns(3)
-    for i,(lead,buf) in enumerate(cropped):
-        with columns[i%3]:
-            st.image(buf,caption=f'{lead} · {boxes[lead]}',width='stretch')
-    st.warning('Nếu crop bị lệch nhãn, mất đỉnh R/S hoặc chứa lead khác: dừng tại đây, chỉnh ROI ở công cụ layout v1 trước khi đọc lại.')
+st.markdown('**Nhóm gửi lượt 2 (đủ 12 lead, không chọn lọc theo kết luận AI):**')
+for p in panels:
+    st.caption(f"{p.group_id}: {', '.join(p.leads)}")
+if len(panels)==4:
+    st.warning('Không có dải DII rhythm riêng. Không thể đánh giá nhịp kéo dài từ nhóm DII ngắn; báo cáo sẽ ghi giới hạn này.')
+with st.expander('Xem trước 4/5 ảnh nhóm thật sẽ gửi Gemini',expanded=True):
+    cols=st.columns(2)
+    for i,p in enumerate(panels):
+        with cols[i%2]:
+            st.image(p.image,caption=f"{p.group_id} · {', '.join(p.leads)}",width='stretch')
+    st.warning('Nếu bất kỳ ảnh nhóm nào mất R/S, chứa lead khác hoặc sai nhãn, hãy sửa ROI và xem lại. Không gửi AI khi crop chưa đúng.')
 
-confirmed=st.checkbox('Tôi đã kiểm tra: bố cục, nhãn lead và các vùng crop phù hợp để AI xem lại',value=False)
-if st.button('AI xem lại các lead đã chọn (lượt 2)',disabled=not confirmed):
+confirmed=st.checkbox('Tôi xác nhận các nhóm crop có đúng chuyển đạo và không cắt mất nét sóng quan trọng',value=False)
+second_prompt="""Đọc các ảnh NHÓM ECG được cung cấp theo tên nhóm và nhãn từng hàng trong ảnh. Mỗi nhóm chứa ba chuyển đạo riêng (hoặc một dải II rhythm); KHÔNG giả định chúng được ghi đồng thời hoặc là cùng một nhịp. Đây là lượt mô tả độc lập; không có kết luận lượt 1. Đối với từng lead nhìn thấy, ghi visibility, mô tả quan sát, P, hình thái QRS, J/ST và T; nếu không chắc hãy ghi UNKNOWN, không tự suy từ chẩn đoán in trên ảnh. Nếu có II-rhythm, mô tả nhịp và chuỗi P-QRS. Bắt buộc ghi riêng TẤT CẢ các lead được gửi và không tự tạo lead thiếu. Không xuất độ chênh ST hoặc khoảng QRS chính xác khi chưa có đo lường đã xác minh. Trả JSON duy nhất: {"lead_observations":[{"lead":"I","visibility":"CLEAR|LIMITED|UNKNOWN","observation":"...","p":"...","qrs":"...","st_t":"..."}],"conflicts_or_limits":"..."}"""
+config_fingerprint=hashlib.sha256(json.dumps({'layout':layout,'boxes':boxes,'groups':[p.group_id for p in panels]},sort_keys=True).encode()).hexdigest()[:20]
+if st.button('AI đọc chi tiết toàn bộ nhóm (lượt 2)',disabled=not confirmed,type='primary'):
     try:
-        with st.spinner('Đang đọc lại các ROI theo bằng chứng hình ảnh...'):
-            # No initial AI hypotheses supplied: limits confirmation bias.
-            raw, used_route=analyze_with_routes(routes,SECOND_PASS_PROMPT,cropped)
-            second=normalize_second(extract_json(raw),selected)
-        st.session_state['v21_second']=second
-        st.session_state['v21_selected']=list(selected)
-        st.session_state['v21_completed_layout']={'layout':layout,'rhythm':rhythm,'boxes':boxes}
-        st.success(f'Đã có lượt đọc lại qua {used_route}. Đây vẫn là AI quan sát hình ảnh, không phải đo độc lập.')
+        with st.spinner('Gemini đang quan sát 4/5 nhóm ECG độc lập...'):
+            images=[(f"{p.group_id}: {', '.join(p.leads)}",panel_as_jpeg(p)) for p in panels]
+            raw,used_route=analyze_with_routes(routes,second_prompt,images)
+            expected=[lead for p in panels for lead in p.leads]
+            second=normalize_second(extract_json(raw),expected)
+        st.session_state['v22_second']=second
+        st.session_state['v22_config_hash']=config_fingerprint
+        st.success(f'AI lượt 2 đã chạy qua {used_route}; các nhận xét vẫn cần bác sĩ xác minh.')
     except Exception as exc:
-        st.error(f'Không đọc được AI lượt 2: {exc}')
+        st.error(f'Không đọc được lượt 2: {exc}')
 
-second=st.session_state.get('v21_second')
+second=st.session_state.get('v22_second')
 if second:
-    st.subheader('4 · Đối chiếu hai lượt đọc')
-    prev=st.session_state.get('v21_completed_layout',{})
-    if prev.get('boxes')!=boxes or st.session_state.get('v21_selected')!=list(selected):
-        st.warning('ROI/lựa chọn lead đã đổi sau khi chạy lượt 2. Kết quả bên dưới thuộc cấu hình cũ; cần chạy lại lượt 2.')
-        st.stop()
-    rows=reconciliation(first,second,selected)
+    if st.session_state.get('v22_config_hash')!=config_fingerprint:
+        st.warning('Bố cục/ROI đã thay đổi: lượt đọc 2 không còn khớp với ảnh đang xem. Hãy chạy lại.');st.stop()
+    st.subheader('4 · Đối chiếu bằng chứng và cảnh báo logic')
+    rows=[]
+    for p in panels:
+        for lead in p.leads:
+            first_ob=first.get('rhythm_observation','UNKNOWN') if lead=='II-rhythm' else first.get('lead_observations',{}).get(lead,{}).get('observation','UNKNOWN')
+            second_ob=second.get('lead_observations',{}).get(lead,{}).get('observation','NOT_REVIEWED')
+            rows.append({'group':p.group_id,'lead':lead,'AI_original':first_ob,'AI_group_crop':second_ob,'status':'AI_VISUAL_ONLY_NOT_QUANTITATIVE_VERIFICATION'})
     st.dataframe(rows,width='stretch',hide_index=True)
-    st.caption('Hai lượt AI đồng ý nhau KHÔNG đồng nghĩa đã xác minh bằng thuật toán đo ECG độc lập.')
-    st.warning('Xác minh định lượng: NOT_AVAILABLE. Không xuất QRS duration, QTc, độ chênh ST hoặc kết luận bệnh lý được máy đo xác nhận.')
-    if second.get('conflicts_or_limits'):st.write('Giới hạn lượt 2:',second['conflicts_or_limits'])
-    report=report_export(first,second,rows,boxes,layout,selected,image_hash)
+    report=v22_report(first,second,panels,boxes,layout,image_hash)
+    flags=report['consistency_flags']
+    if flags:
+        st.warning(f'{len(flags)} mục cần rà soát logic hoặc thiếu quan sát ở lượt 2:')
+        st.dataframe(flags,width='stretch',hide_index=True)
+    else:
+        st.info('Không phát hiện mâu thuẫn theo bộ quy tắc hiện có. Điều này KHÔNG xác nhận kết luận AI là đúng.')
+    st.warning('ĐỊNH LƯỢNG: NOT_AVAILABLE. Chưa có bộ đo độc lập được nghiệm thu để xác minh QRS, RR, ST hoặc QTc.')
+    if second.get('conflicts_or_limits'): st.caption('Giới hạn lượt 2: '+second['conflicts_or_limits'])
+    include_crops=st.checkbox('Kèm ảnh crop trong ZIP validation (chỉ khi đã khử định danh)',value=False)
     with io.BytesIO() as stream:
         with zipfile.ZipFile(stream,'w',zipfile.ZIP_DEFLATED) as z:
-            z.writestr('evidence_report_v21.json',json.dumps(report,ensure_ascii=False,indent=2))
-            z.writestr('README.txt','ECG v2.1 AI Visual QA prototype. Research only. No verified quantitative measurements. Do not publish patient identifiers.\n')
-            # No original image in export by default, reduces accidental personal-data leaks.
+            z.writestr('evidence_report_v22.json',json.dumps(report,ensure_ascii=False,indent=2))
+            z.writestr('README.txt','ECG v2.2 AI Visual QA. Research only. No independent ECG measurements. Original image omitted.\n')
+            if include_crops:
+                for p in panels:
+                    z.writestr(f'groups/{p.group_id}.jpg',panel_as_jpeg(p))
         data=stream.getvalue()
-    st.download_button('Tải ZIP báo cáo AI Visual v2.1 (không kèm ảnh gốc)',data=data,
-                       file_name='ecg_core_v2_1_visual_validation.zip',mime='application/zip')
+    st.download_button('Xuất ZIP validation v2.2',data=data,
+        file_name='ecg_core_v2_2_group_visual_validation.zip',mime='application/zip')
