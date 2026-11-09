@@ -11,7 +11,7 @@ import streamlit as st
 from core.visual_reader_v21 import (LEADS,FIRST_PASS_PROMPT,SECOND_PASS_PROMPT,
     image_from_bytes,image_identity,image_for_model,layout_boxes,crop_images,extract_json,
     sanitized_observations,normalize_second,choose_leads,reconciliation,report_export)
-from core.gemini_visual_v21 import analyze_images
+from core.gemini_visual_v21 import routes_from_secrets, analyze_with_routes
 
 st.set_page_config(page_title='ECG Core v2.1 | AI Visual Evidence',layout='wide')
 st.title('ECG Core v2.1 · AI Visual Evidence Lab')
@@ -28,11 +28,14 @@ except ImportError:
 with st.sidebar:
     st.subheader('Thiết lập AI')
     try:
-        key=st.secrets.get('GEMINI_API_KEY') or st.secrets.get('GOOGLE_API_KEY') or ''
-        model_default=st.secrets.get('GEMINI_MODEL','gemini-2.5-flash')
+        routes = routes_from_secrets(st.secrets)
     except Exception:
-        key='';model_default='gemini-2.5-flash'
-    model=st.text_input('Model Gemini',value=model_default,help='Có thể chọn model Gemini đã được cấp quyền trong tài khoản API.')
+        routes = []
+    st.caption(f'Đã nhận {len(routes)} route Gemini từ Secrets.' if routes else
+               'Chưa nhận được ECG_API_ROUTES hoặc GEMINI_API_KEY từ Secrets của app này.')
+    if routes:
+        st.caption('Route ưu tiên: ' + str(routes[0]['name']) + ' · ' + str(routes[0]['model']))
+    st.caption('Chuyển route khi API lỗi. Không ghi API key vào báo cáo.')
     st.caption('API key đặt trong Streamlit Secrets; không đưa vào GitHub.')
     st.caption('Các ảnh gửi đến dịch vụ AI của Google. Chỉ dùng dữ liệu đã khử định danh và có quyền xử lý.')
 
@@ -52,17 +55,17 @@ if st.session_state.get('v21_image_hash')!=image_hash:
     for state_key in ('v21_first','v21_second','v21_selected','v21_completed_layout'):
         st.session_state.pop(state_key,None)
     st.session_state['v21_image_hash']=image_hash
-st.image(photo,caption=f'Ảnh gốc · {photo.width}×{photo.height} pixel',use_container_width=True)
+st.image(photo,caption=f'Ảnh gốc · {photo.width}×{photo.height} pixel',width='stretch')
 
 st.subheader('2 · Đọc toàn cảnh bằng AI (lượt 1)')
 if st.button('AI đọc cấu trúc 12 chuyển đạo',type='primary'):
     try:
         with st.spinner('AI đang mô tả hình ảnh ECG gốc...'):
-            raw=analyze_images(key,model,FIRST_PASS_PROMPT,[('ECG gốc, 12 chuyển đạo',image_for_model(photo,max_side=3200))])
+            raw, used_route=analyze_with_routes(routes,FIRST_PASS_PROMPT,[('ECG gốc, 12 chuyển đạo',image_for_model(photo,max_side=3200))])
             first=sanitized_observations(extract_json(raw))
         st.session_state['v21_first']=first
         st.session_state.pop('v21_second',None)
-        st.success('Đã nhận mô tả AI lượt 1. Đây là giả thuyết, chưa kiểm chứng định lượng.')
+        st.success(f'Đã nhận mô tả AI lượt 1 qua {used_route}. Đây là giả thuyết, chưa kiểm chứng định lượng.')
     except Exception as exc:
         st.error(f'Không đọc được AI lượt 1: {exc}')
 first=st.session_state.get('v21_first')
@@ -131,7 +134,7 @@ for lead,(x0,y0,x1,y1) in boxes.items():
     color='#9C27B0' if lead=='II-rhythm' else '#04A5D6'
     draw.rectangle((x0,y0,x1,y1),outline=color,width=max(2,photo.width//750))
     draw.text((x0+6,y0+5),lead,fill=color,stroke_width=1,stroke_fill='#ffffff')
-st.image(preview,caption='Khung ROI chỉ là đề xuất hình học. Nếu sai nhãn, cắt QRS hoặc chồng lead, KHÔNG dùng crop để kết luận.',use_container_width=True)
+st.image(preview,caption='Khung ROI chỉ là đề xuất hình học. Nếu sai nhãn, cắt QRS hoặc chồng lead, KHÔNG dùng crop để kết luận.',width='stretch')
 
 available=set(boxes)
 proposed=choose_leads(first,available,max_leads=6)
@@ -146,7 +149,7 @@ with st.expander('Xem các ảnh crop thực tế trước khi gửi AI',expande
     columns=st.columns(3)
     for i,(lead,buf) in enumerate(cropped):
         with columns[i%3]:
-            st.image(buf,caption=f'{lead} · {boxes[lead]}',use_container_width=True)
+            st.image(buf,caption=f'{lead} · {boxes[lead]}',width='stretch')
     st.warning('Nếu crop bị lệch nhãn, mất đỉnh R/S hoặc chứa lead khác: dừng tại đây, chỉnh ROI ở công cụ layout v1 trước khi đọc lại.')
 
 confirmed=st.checkbox('Tôi đã kiểm tra: bố cục, nhãn lead và các vùng crop phù hợp để AI xem lại',value=False)
@@ -154,12 +157,12 @@ if st.button('AI xem lại các lead đã chọn (lượt 2)',disabled=not confi
     try:
         with st.spinner('Đang đọc lại các ROI theo bằng chứng hình ảnh...'):
             # No initial AI hypotheses supplied: limits confirmation bias.
-            raw=analyze_images(key,model,SECOND_PASS_PROMPT,cropped)
+            raw, used_route=analyze_with_routes(routes,SECOND_PASS_PROMPT,cropped)
             second=normalize_second(extract_json(raw),selected)
         st.session_state['v21_second']=second
         st.session_state['v21_selected']=list(selected)
         st.session_state['v21_completed_layout']={'layout':layout,'rhythm':rhythm,'boxes':boxes}
-        st.success('Đã có lượt đọc lại. Lượt này vẫn là AI quan sát hình ảnh, không phải đo độc lập.')
+        st.success(f'Đã có lượt đọc lại qua {used_route}. Đây vẫn là AI quan sát hình ảnh, không phải đo độc lập.')
     except Exception as exc:
         st.error(f'Không đọc được AI lượt 2: {exc}')
 
@@ -171,7 +174,7 @@ if second:
         st.warning('ROI/lựa chọn lead đã đổi sau khi chạy lượt 2. Kết quả bên dưới thuộc cấu hình cũ; cần chạy lại lượt 2.')
         st.stop()
     rows=reconciliation(first,second,selected)
-    st.dataframe(rows,use_container_width=True,hide_index=True)
+    st.dataframe(rows,width='stretch',hide_index=True)
     st.caption('Hai lượt AI đồng ý nhau KHÔNG đồng nghĩa đã xác minh bằng thuật toán đo ECG độc lập.')
     st.warning('Xác minh định lượng: NOT_AVAILABLE. Không xuất QRS duration, QTc, độ chênh ST hoặc kết luận bệnh lý được máy đo xác nhận.')
     if second.get('conflicts_or_limits'):st.write('Giới hạn lượt 2:',second['conflicts_or_limits'])
