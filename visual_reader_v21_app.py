@@ -1,4 +1,4 @@
-"""ECG Core v2.2 — AI Visual Reader + Adaptive Cropping. Research prototype.
+"""ECG Core v2.3 — AI Visual Reader + Adaptive Cropping. Research prototype.
 
 Separate Streamlit entrypoint, preserving app.py, legacy Gemini/failover, Benchmark v2.0.
 """
@@ -13,9 +13,10 @@ from core.visual_reader_v21 import (LEADS,FIRST_PASS_PROMPT,SECOND_PASS_PROMPT,
     sanitized_observations,normalize_second,choose_leads,reconciliation,report_export)
 from core.gemini_visual_v21 import routes_from_secrets, analyze_with_routes
 from core.group_crops_v22 import all_panels, panel_as_jpeg, v22_report, GROUPS
+from ui.grid_measurement_panel_v23 import render as render_grid_measurement_v23
 
-st.set_page_config(page_title='ECG Core v2.2 | AI Visual Evidence',layout='wide')
-st.title('ECG Core v2.2 · AI Visual Evidence Lab')
+st.set_page_config(page_title='ECG Core v2.3 | AI Visual Evidence',layout='wide')
+st.title('ECG Core v2.3 · AI Visual Evidence Lab')
 st.caption('Một ảnh gốc → AI đọc đủ 12 lead → 4 nhóm cố định + DII rhythm nếu có → AI đọc lại → rà soát bằng chứng. NGHIÊN CỨU.')
 st.warning('Bản nghiên cứu. Không dùng làm công cụ duy nhất để loại trừ nhồi máu cơ tim, rối loạn nhịp nguy hiểm hoặc quyết định điều trị. Chưa có phép đo định lượng ECG đã xác minh.')
 
@@ -205,3 +206,7 @@ if second:
         data=stream.getvalue()
     st.download_button('Xuất ZIP validation v2.2',data=data,
         file_name='ecg_core_v2_2_group_visual_validation.zip',mime='application/zip')
+
+
+st.divider()
+render_grid_measurement_v23(photo,boxes,layout,image_hash,routes)
