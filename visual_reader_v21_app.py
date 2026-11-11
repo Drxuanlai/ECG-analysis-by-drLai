@@ -12,11 +12,12 @@ from core.visual_reader_v21 import (LEADS,FIRST_PASS_PROMPT,SECOND_PASS_PROMPT,
     image_from_bytes,image_identity,image_for_model,layout_boxes,crop_images,extract_json,
     sanitized_observations,normalize_second,choose_leads,reconciliation,report_export)
 from core.gemini_visual_v21 import routes_from_secrets, analyze_with_routes
-from core.group_crops_v22 import all_panels, panel_as_jpeg, v22_report, GROUPS
+from core.group_crops_v22 import panel_as_jpeg, v22_report, GROUPS
+from core.group_crops_v231 import default_direct_boxes, direct_panels, validate_direct_group_boxes
 from ui.grid_measurement_panel_v23 import render as render_grid_measurement_v23
 
-st.set_page_config(page_title='ECG Core v2.3 | AI Visual Evidence',layout='wide')
-st.title('ECG Core v2.3 · AI Visual Evidence Lab')
+st.set_page_config(page_title='ECG Core v2.3.1 | AI Visual Evidence',layout='wide')
+st.title('ECG Core v2.3.1 · AI Visual Evidence Lab')
 st.caption('Một ảnh gốc → AI đọc đủ 12 lead → 4 nhóm cố định + DII rhythm nếu có → AI đọc lại → rà soát bằng chứng. NGHIÊN CỨU.')
 st.warning('Bản nghiên cứu. Không dùng làm công cụ duy nhất để loại trừ nhồi máu cơ tim, rối loạn nhịp nguy hiểm hoặc quyết định điều trị. Chưa có phép đo định lượng ECG đã xác minh.')
 
@@ -105,46 +106,83 @@ try:
 except ValueError as exc:
     st.error(str(exc)); st.stop()
 
-# Keep manually confirmed overrides separated by image + layout + rhythm parameters.
+# Group crop and per-lead measurement ROI are intentionally separate.
 import hashlib
 config_tag=f'{image_hash}:{layout}:{rhythm}:{rhythm_start:.4f}:{margin:.4f}'
-if st.session_state.get('v22_overrides_for')!=config_tag:
-    st.session_state['v22_overrides_for']=config_tag
-    st.session_state['v22_boxes_override']={}
+if st.session_state.get('v231_for')!=config_tag:
+    st.session_state['v231_for']=config_tag
+    st.session_state['v231_group_override']={}
+    st.session_state['v231_lead_override']={}
     st.session_state.pop('v22_second',None)
-for lead,box in st.session_state['v22_boxes_override'].items():
-    if lead in boxes: boxes[lead]=tuple(box)
+    st.session_state.pop('v22_config_hash',None)
 
-with st.expander('Chỉnh ROI từng chuyển đạo nếu sóng bị cắt',expanded=False):
-    edit_lead=st.selectbox('Chuyển đạo cần chỉnh',list(boxes),key='v22_edit_lead')
-    curr=boxes[edit_lead]
-    ed=st.columns(4)
-    vals=[]
-    for i,(label,lower,upper) in enumerate(zip(('X trái','Y trên','X phải','Y dưới'),(0,0,1,1),(photo.width-1,photo.height-1,photo.width,photo.height))):
-        vals.append(ed[i].number_input(label,min_value=lower,max_value=upper,value=int(curr[i]),step=5,key=f'v22_{i}_{config_tag}_{edit_lead}'))
-    if st.button('Áp dụng ROI'):
+# Existing lead boxes continue to serve the optional v2.3 measurement QA.
+for lead,box in st.session_state['v231_lead_override'].items():
+    if lead in boxes: boxes[lead]=tuple(box)
+group_boxes=default_direct_boxes(photo.size,layout,rhythm,rhythm_start,margin)
+for name,box in st.session_state['v231_group_override'].items():
+    if name in group_boxes:group_boxes[name]=tuple(box)
+
+with st.expander('Chỉnh trực tiếp 4/5 KHUNG NHÓM (không phải 12 lead)',expanded=False):
+    group_id=st.selectbox('Nhóm muốn điều chỉnh',list(group_boxes),
+                          format_func=lambda k:f"{k} · {', '.join(GROUPS[k])}",key='v231_edit_group')
+    current=group_boxes[group_id]
+    editor=st.columns(4)
+    coords=[]
+    for j,(label,minimum,maximum) in enumerate(zip(('X trái','Y trên','X phải','Y dưới'),
+                                                  (0,0,1,1),
+                                                  (photo.width-1,photo.height-1,photo.width,photo.height))):
+        coords.append(editor[j].number_input(label,min_value=minimum,max_value=maximum,
+                     value=int(current[j]),step=5,key=f'v231_{config_tag}_{group_id}_{j}'))
+    if st.button('Lưu vùng NHÓM',key='v231_save_group'):
         try:
-            from core.group_crops_v22 import validate_roi
-            valid=validate_roi(tuple(vals),photo.size)
-            st.session_state['v22_boxes_override'][edit_lead]=valid
+            trial=dict(group_boxes)
+            trial[group_id]=tuple(coords)
+            validate_direct_group_boxes(trial,photo.size,layout,rhythm)
+            st.session_state['v231_group_override'][group_id]=tuple(coords)
             st.session_state.pop('v22_second',None)
             st.rerun()
-        except ValueError as exc: st.error(str(exc))
-    if st.button('Đặt lại ROI mặc định'):
-        st.session_state['v22_boxes_override']={}
+        except ValueError as exc:
+            st.error(str(exc))
+    if st.button('Khôi phục 5 khung mặc định',key='v231_reset_group'):
+        st.session_state['v231_group_override']={}
         st.session_state.pop('v22_second',None)
         st.rerun()
+    st.caption('Mỗi nhóm được lấy trực tiếp từ một hình chữ nhật trong ảnh gốc. Không cắt/ghép riêng ba hàng.')
 
-preview=photo.copy(); draw=ImageDraw.Draw(preview)
-for lead,(x0,y0,x1,y1) in boxes.items():
-    color='#a034a0' if lead=='II-rhythm' else '#06a7d8'
-    draw.rectangle((x0,y0,x1,y1),outline=color,width=max(2,photo.width//800))
-    draw.text((x0+5,y0+4),lead,fill=color,stroke_width=1,stroke_fill='#ffffff')
-st.image(preview,caption='ROI là đề xuất hình học, không chứng minh đã bao trọn hình thái. Bác sĩ kiểm tra trước khi gửi AI.',width='stretch')
+with st.expander('Chỉnh ROI TỪNG LEAD chỉ dành cho Measurement QA v2.3 (nâng cao)',expanded=False):
+    lead=st.selectbox('Lead để đo',list(boxes),key='v231_lead')
+    old=boxes[lead]
+    editor=st.columns(4)
+    xy=[]
+    for j,(label,lo,hi) in enumerate(zip(('X trái','Y trên','X phải','Y dưới'),
+                                         (0,0,1,1),(photo.width-1,photo.height-1,photo.width,photo.height))):
+        xy.append(editor[j].number_input(label,min_value=lo,max_value=hi,value=int(old[j]),
+                     step=5,key=f'v231_lead_{config_tag}_{lead}_{j}'))
+    if st.button('Lưu ROI lead đo',key='v231_save_lead'):
+        from core.group_crops_v22 import validate_roi
+        try:
+            st.session_state['v231_lead_override'][lead]=validate_roi(tuple(xy),photo.size)
+            st.rerun()
+        except ValueError as exc:st.error(str(exc))
+    st.caption('Chỉnh lead QA KHÔNG thay đổi năm ảnh nhóm gửi AI.')
+
 try:
-    panels=all_panels(photo,boxes)
+    group_boxes=validate_direct_group_boxes(group_boxes,photo.size,layout,rhythm)
+    panels=direct_panels(photo,group_boxes,boxes)
 except ValueError as exc:
-    st.error('Không thể tạo đủ các nhóm: '+str(exc));st.stop()
+    st.error('Khung nhóm không hợp lệ: '+str(exc))
+    st.stop()
+
+preview=photo.copy()
+draw=ImageDraw.Draw(preview)
+colors=('#dc3535','#2dae5c','#246de3','#a06a42','#9f4db2')
+for index,(name,(x0,y0,x1,y1)) in enumerate(group_boxes.items()):
+    color=colors[index]
+    draw.rectangle((x0,y0,x1,y1),outline=color,width=max(3,photo.width//400))
+    draw.text((x0+5,y0+4),name,fill=color,stroke_width=2,stroke_fill='white')
+st.image(preview,caption='Chỉ 4/5 khung NHÓM trực tiếp. Ranh giới là đề xuất hình học; kiểm tra không cắt R/S, P/T và nhãn.',width='stretch')
+st.caption('Measurement QA v2.3 vẫn giữ 12 ROI riêng bên trong; chúng KHÔNG được dùng để tạo ảnh nhóm.')
 
 st.markdown('**Nhóm gửi lượt 2 (đủ 12 lead, không chọn lọc theo kết luận AI):**')
 for p in panels:
@@ -160,7 +198,7 @@ with st.expander('Xem trước 4/5 ảnh nhóm thật sẽ gửi Gemini',expande
 
 confirmed=st.checkbox('Tôi xác nhận các nhóm crop có đúng chuyển đạo và không cắt mất nét sóng quan trọng',value=False)
 second_prompt="""Đọc các ảnh NHÓM ECG được cung cấp theo tên nhóm và nhãn từng hàng trong ảnh. Mỗi nhóm chứa ba chuyển đạo riêng (hoặc một dải II rhythm); KHÔNG giả định chúng được ghi đồng thời hoặc là cùng một nhịp. Đây là lượt mô tả độc lập; không có kết luận lượt 1. Đối với từng lead nhìn thấy, ghi visibility, mô tả quan sát, P, hình thái QRS, J/ST và T; nếu không chắc hãy ghi UNKNOWN, không tự suy từ chẩn đoán in trên ảnh. Nếu có II-rhythm, mô tả nhịp và chuỗi P-QRS. Bắt buộc ghi riêng TẤT CẢ các lead được gửi và không tự tạo lead thiếu. Không xuất độ chênh ST hoặc khoảng QRS chính xác khi chưa có đo lường đã xác minh. Trả JSON duy nhất: {"lead_observations":[{"lead":"I","visibility":"CLEAR|LIMITED|UNKNOWN","observation":"...","p":"...","qrs":"...","st_t":"..."}],"conflicts_or_limits":"..."}"""
-config_fingerprint=hashlib.sha256(json.dumps({'layout':layout,'boxes':boxes,'groups':[p.group_id for p in panels]},sort_keys=True).encode()).hexdigest()[:20]
+config_fingerprint=hashlib.sha256(json.dumps({'layout':layout,'group_boxes':group_boxes,'groups':[p.group_id for p in panels]},sort_keys=True).encode()).hexdigest()[:20]
 if st.button('AI đọc chi tiết toàn bộ nhóm (lượt 2)',disabled=not confirmed,type='primary'):
     try:
         with st.spinner('Gemini đang quan sát 4/5 nhóm ECG độc lập...'):
@@ -187,6 +225,11 @@ if second:
             rows.append({'group':p.group_id,'lead':lead,'AI_original':first_ob,'AI_group_crop':second_ob,'status':'AI_VISUAL_ONLY_NOT_QUANTITATIVE_VERIFICATION'})
     st.dataframe(rows,width='stretch',hide_index=True)
     report=v22_report(first,second,panels,boxes,layout,image_hash)
+    report['schema_version']='2.3.1'
+    report['group_crop_method']='DIRECT_SINGLE_RECTANGLE_FROM_ORIGINAL'
+    report['direct_group_boxes']={k:list(v) for k,v in group_boxes.items()}
+    for entry,panel in zip(report['group_crops'],panels):
+        entry['group_box']=list(panel.group_box)
     flags=report['consistency_flags']
     if flags:
         st.warning(f'{len(flags)} mục cần rà soát logic hoặc thiếu quan sát ở lượt 2:')
@@ -198,14 +241,14 @@ if second:
     include_crops=st.checkbox('Kèm ảnh crop trong ZIP validation (chỉ khi đã khử định danh)',value=False)
     with io.BytesIO() as stream:
         with zipfile.ZipFile(stream,'w',zipfile.ZIP_DEFLATED) as z:
-            z.writestr('evidence_report_v22.json',json.dumps(report,ensure_ascii=False,indent=2))
-            z.writestr('README.txt','ECG v2.2 AI Visual QA. Research only. No independent ECG measurements. Original image omitted.\n')
+            z.writestr('evidence_report_v231.json',json.dumps(report,ensure_ascii=False,indent=2))
+            z.writestr('README.txt','ECG v2.3.1 direct-group visual QA; measurement QA remains separate. Research only. Original image omitted.\n')
             if include_crops:
                 for p in panels:
                     z.writestr(f'groups/{p.group_id}.jpg',panel_as_jpeg(p))
         data=stream.getvalue()
-    st.download_button('Xuất ZIP validation v2.2',data=data,
-        file_name='ecg_core_v2_2_group_visual_validation.zip',mime='application/zip')
+    st.download_button('Xuất ZIP validation v2.3.1',data=data,
+        file_name='ecg_core_v2_3_1_direct_group_visual_validation.zip',mime='application/zip')
 
 
 st.divider()
