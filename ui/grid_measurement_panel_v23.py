@@ -5,10 +5,11 @@ import io
 import json
 import zipfile
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from core.grid_evidence_v23 import (GridCalibration,LANDMARKS,overlay,paper_values,
     sanitize_ai_landmarks,measure_points,validated_roi)
+from core.click_coordinates_v232 import window_bounds, display_to_roi
 from core.gemini_visual_v21 import analyze_with_routes
 from core.visual_reader_v21 import image_for_model,extract_json
 
@@ -16,6 +17,55 @@ from core.visual_reader_v21 import image_for_model,extract_json
 def _state(slot:str,default):
     if slot not in st.session_state:st.session_state[slot]=default
     return st.session_state[slot]
+
+
+
+def _windowed_click(roi, img, prefix, segment, window_px=520, display_width=1040):
+    """Clickable zoomed image, returning an absolute coordinate in the full lead ROI.
+
+    Only concrete click events produce coordinates. No (0,0) fallback.
+    """
+    x0, x1 = window_bounds(roi.width, segment, window_px)
+    view = img.crop((x0, 0, x1, roi.height))
+    shown_w = min(display_width, max(1, view.width * 2))
+    shown_h = max(1, round(view.height * shown_w / view.width))
+    view = view.resize((shown_w, shown_h), Image.Resampling.NEAREST)
+    try:
+        from streamlit_image_coordinates import streamlit_image_coordinates
+    except ImportError:
+        st.error('Thiếu streamlit-image-coordinates trong requirements.txt. Chức năng bấm trực tiếp chưa khả dụng.')
+        st.image(view, width='stretch')
+        return None
+    click = streamlit_image_coordinates(view, width=shown_w, key=prefix)
+    if not isinstance(click, dict):
+        return None
+    px, py = click.get('x'), click.get('y')
+    if not isinstance(px, (int,float)) or isinstance(px,bool) or not isinstance(py, (int,float)) or isinstance(py,bool):
+        return None
+    if not (0 <= px < shown_w and 0 <= py < shown_h):
+        return None
+    return display_to_roi(px, py, roi.width, roi.height, segment, shown_w, shown_h, window_px)
+
+
+def _page(roi, prefix, window_px=520):
+    total=max(1, (roi.width + window_px-1)//window_px)
+    idx=st.selectbox('Cửa sổ phóng to', range(total),
+                     format_func=lambda n:f'Đoạn {n+1}/{total} · x={n*window_px}–{min(roi.width,(n+1)*window_px)-1} px',
+                     key=prefix)
+    return idx
+
+
+def _grid_marks_image(roi, marks):
+    img=roi.convert('RGB').copy()
+    d=ImageDraw.Draw(img)
+    for name, value in marks.items():
+        if not isinstance(value, (int,float)):
+            continue
+        if name.startswith('X'):
+            d.line((int(value),0,int(value),roi.height-1),fill=(20,150,255),width=2)
+        else:
+            d.line((0,int(value),roi.width-1,int(value)),fill=(20,150,255),width=2)
+    return img
 
 
 def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[dict]):
@@ -40,24 +90,43 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
     with b:
         gain=st.selectbox('Độ nhạy (mm/mV) — theo chữ in/xung chuẩn', [10.0,5.0,20.0],key='v23_gain')
     st.caption(f"Theo thông số chọn: 1 ô nhỏ = {paper_values(speed,gain)['small_box_ms']:g} ms theo ngang và {paper_values(speed,gain)['small_box_mv']:g} mV theo dọc. Không đồng nghĩa đã xác nhận khoảng px/ô.")
-    with st.expander('Chọn 2 đường lưới ĐẬM liên tiếp cách nhau đúng 5 mm',expanded=True):
-        st.caption('Các tọa độ sau tương đối so với góc trái trên của ảnh ROI; không phải tọa độ màn hình. Chỉ nhập khi nhìn rõ cả bốn đường lưới lớn.')
-        c=st.columns(4)
-        max_x=max(1,roi.width-1);max_y=max(1,roi.height-1)
-        x0=c[0].number_input('Đường dọc 1: X',min_value=0,max_value=max_x,value=min(20,max_x),key=f'v23_x0_{fingerprint}')
-        x5=c[1].number_input('Đường dọc 2: X',min_value=0,max_value=max_x,value=min(70,max_x),key=f'v23_x5_{fingerprint}')
-        y0=c[2].number_input('Đường ngang 1: Y',min_value=0,max_value=max_y,value=min(20,max_y),key=f'v23_y0_{fingerprint}')
-        y5=c[3].number_input('Đường ngang 2: Y',min_value=0,max_value=max_y,value=min(70,max_y),key=f'v23_y5_{fingerprint}')
-        st.caption('Ví dụ x=20 và x=70 chỉ là GIÁ TRỊ NHẬP MẪU, không phải lưới đã tự phát hiện. Hãy chỉnh theo ảnh.')
-        accept_grid=st.checkbox('Tôi đã kiểm tra hai cặp đường lưới lớn liên tiếp (mỗi cặp 5 mm) và hiệu chuẩn giấy.',key=f'v23_confirm_{fingerprint}')
-    cal=None
-    if accept_grid:
+    st.markdown('**Chọn 4 đường lưới bằng cách bấm trên ảnh phóng to**')
+    st.caption('Bấm X1 và X2 lên hai đường ĐẬM đứng liên tiếp (5 mm); Y1 và Y2 lên hai đường ĐẬM ngang liên tiếp (5 mm). Không chọn các đường nhỏ cách nhau 1 mm. Có thể chuyển đoạn khi cần.')
+    marks_key=f'v232_gridmarks_{fingerprint}'
+    marks=_state(marks_key,{'X1':None,'X2':None,'Y1':None,'Y2':None})
+    target=st.radio('Đang chọn đường nào?', ['X1','X2','Y1','Y2'], horizontal=True,
+                    key=f'v232_grid_target_{fingerprint}')
+    seg=_page(roi,f'v232_grid_seg_{fingerprint}')
+    calib_click=_windowed_click(roi, _grid_marks_image(roi,marks),
+                     f'v232_gridclick_{fingerprint}_{target}_{seg}',seg)
+    if calib_click is not None:
+        value=calib_click[0] if target.startswith('X') else calib_click[1]
+        if marks[target] != value:
+            marks[target]=value
+            st.session_state[marks_key]=marks
+            st.rerun()
+    st.caption('Các đường đã chọn: '+', '.join(f'{k}={v if v is not None else "chưa chọn"}' for k,v in marks.items()))
+    if st.button('Xóa 4 điểm hiệu chuẩn',key=f'v232_cleargrid_{fingerprint}'):
+        st.session_state[marks_key]={'X1':None,'X2':None,'Y1':None,'Y2':None}
+        st.session_state.pop(f'v232_verified_{fingerprint}',None)
+        st.rerun()
+    have_four=all(marks.get(k) is not None for k in ('X1','X2','Y1','Y2'))
+    proposed_cal=None
+    if have_four:
         try:
-            cal=GridCalibration(float(x0),float(x5),float(y0),float(y5),float(speed),float(gain))
-            st.success(f'Tỷ lệ đã xác nhận: ngang {cal.px_per_mm_x:.2f} px/mm; dọc {cal.px_per_mm_y:.2f} px/mm. 1 px = {cal.ms_per_px:.3f} ms hoặc {cal.mv_per_px:.5f} mV theo trục tương ứng.')
-        except ValueError as exc: st.error(f'Chưa dùng được tỷ lệ lưới: {exc}')
+            proposed_cal=GridCalibration(float(marks['X1']),float(marks['X2']),float(marks['Y1']),float(marks['Y2']),float(speed),float(gain))
+            st.info(f'Kết quả từ bốn điểm: ngang {proposed_cal.px_per_mm_x:.2f} px/mm; dọc {proposed_cal.px_per_mm_y:.2f} px/mm. Hãy kiểm tra các đường màu xanh trên ảnh có đúng lưới đậm.')
+        except ValueError as exc:
+            st.error(f'Hiệu chuẩn chưa hợp lệ: {exc}')
+    cal_signature=(tuple(marks.get(k) for k in ('X1','X2','Y1','Y2')),speed,gain)
+    if st.button('Xác nhận hiệu chuẩn lưới đã chọn',disabled=proposed_cal is None,
+                 key=f'v232_acceptcal_{fingerprint}'):
+        st.session_state[f'v232_verified_{fingerprint}']=cal_signature
+    cal=proposed_cal if proposed_cal is not None and st.session_state.get(f'v232_verified_{fingerprint}')==cal_signature else None
+    if cal:
+        st.success(f'Đã xác nhận: ngang {cal.px_per_mm_x:.2f} px/mm; dọc {cal.px_per_mm_y:.2f} px/mm. Mỗi px ngang = {cal.ms_per_px:.3f} ms.')
     else:
-        st.warning('Chưa xác nhận hiệu chuẩn lưới → KHÔNG tính ms/mV.')
+        st.warning('CHƯA XÁC NHẬN LƯỚI: không tính ms/mV. Các giá trị ví dụ 20/70 của bản cũ không được tự động dùng.')
 
     st.markdown('**B. Đề xuất vị trí mốc từ AI (chỉ để bác sĩ xem xét)**')
     if st.button('AI gợi ý tọa độ trên lead đang chọn',key=f'v23_infer_{fingerprint}',disabled=not bool(routes)):
@@ -76,35 +145,36 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
             st.dataframe(proposals,width='stretch',hide_index=True)
 
     st.markdown('**C. Bác sĩ đánh dấu mốc trên nét điện tim**')
+    st.caption('Ảnh phóng to chia thành các đoạn ~520 px, không nén toàn bộ Rhythm II thành dải cao 63 px. Click lên mốc, kiểm tra tọa độ và bấm Lưu.')
+    seg_m=_page(roi,f'v232_mark_seg_{fingerprint}')
     rendered=overlay(roi,cal,st.session_state[points_key],proposals)
-    display_w=min(950,roi.width)
-    display_h=max(1,round(roi.height*display_w/roi.width))
-    resized=rendered.resize((display_w,display_h))
-    clicked=None
-    try:
-        from streamlit_image_coordinates import streamlit_image_coordinates
-        clicked=streamlit_image_coordinates(resized,width=display_w,key=f'v23_click_{fingerprint}')
-        st.caption('Chạm vào ảnh: hệ thống quy đổi tọa độ ảnh hiển thị về pixel ROI gốc.')
-    except ImportError:
-        st.image(resized,caption='Chưa cài streamlit-image-coordinates. Có thể nhập tọa độ X/Y thủ công bên dưới.')
-        st.caption('Để bấm trực tiếp lên ảnh, bổ sung streamlit-image-coordinates>=0.1.9,<1 vào requirements.txt.')
-    if clicked and isinstance(clicked,dict) and isinstance(clicked.get('x'),(int,float)):
-        cx=max(0,min(roi.width-1,round(clicked['x']*roi.width/display_w)))
-        cy=max(0,min(roi.height-1,round(clicked['y']*roi.height/display_h)))
-        st.session_state[f'v23_latest_{fingerprint}']=(cx,cy)
-    last=st.session_state.get(f'v23_latest_{fingerprint}',(0,0))
-    st.caption(f'Tọa độ bấm gần nhất: x={last[0]}, y={last[1]} pixel trong ROI. X toàn ảnh={box[0]+last[0]}, Y toàn ảnh={box[1]+last[1]}.')
-    c=st.columns(4)
+    click=_windowed_click(roi,rendered,f'v232_mark_click_{fingerprint}_{seg_m}',seg_m)
+    latest_key=f'v232_latest_{fingerprint}'
+    if click is not None:
+        st.session_state[latest_key]=(seg_m, *click)
+    remembered=st.session_state.get(latest_key)
+    last=(remembered[1],remembered[2]) if remembered and remembered[0]==seg_m else None
+    if last is None:
+        st.warning('CHƯA NHẬN ĐƯỢC CLICK. Không thể lưu mốc mặc định (0,0). Hãy bấm trực tiếp lên ảnh phóng to; nếu không phản hồi, kiểm tra đã cài streamlit-image-coordinates.')
+    else:
+        st.success(f'Đã nhận click: X={last[0]}, Y={last[1]} px trong ROI; tọa độ ảnh gốc ({box[0]+last[0]}, {box[1]+last[1]}).')
+    c=st.columns(3)
     beat=c[0].text_input('Beat ID',value='B1',key=f'v23_beat_{fingerprint}')
     kind=c[1].selectbox('Loại mốc',LANDMARKS,key=f'v23_kind_{fingerprint}')
-    source_mode=c[2].radio('Lấy vị trí',('Điểm bấm trên ảnh','Nhập X/Y'),horizontal=False,key=f'v23_coord_mode_{fingerprint}')
+    source_mode=c[2].radio('Lấy vị trí',('Điểm bấm trên ảnh','Nhập X/Y'),key=f'v23_coord_mode_{fingerprint}')
     if source_mode=='Nhập X/Y':
-        x=c[3].number_input('X trong ROI',min_value=0,max_value=roi.width-1,value=int(last[0]),key=f'v23_x_{fingerprint}')
-        y=c[3].number_input('Y trong ROI',min_value=0,max_value=roi.height-1,value=int(last[1]),key=f'v23_y_{fingerprint}')
-    else:x,y=last
+        a,b=st.columns(2)
+        x=a.number_input('X trong ROI',min_value=0,max_value=roi.width-1,
+                         value=int(last[0]) if last else 0,key=f'v232_xmanual_{fingerprint}')
+        y=b.number_input('Y trong ROI',min_value=0,max_value=roi.height-1,
+                         value=int(last[1]) if last else 0,key=f'v232_ymanual_{fingerprint}')
+        valid=st.checkbox('Tôi đã nhập và kiểm tra cả X/Y bằng tay',key=f'v232_manual_ack_{fingerprint}')
+    else:
+        valid=last is not None
+        x,y=last if valid else (None,None)
     ca,cb=st.columns(2)
     with ca:
-        if st.button('Lưu mốc bác sĩ',key=f'v23_add_{fingerprint}'):
+        if st.button('Lưu mốc bác sĩ',disabled=not valid,key=f'v23_add_{fingerprint}'):
             n=len(st.session_state[points_key])+1
             st.session_state[points_key].append({'id':f'M{n:03d}', 'lead':lead,'beat_id':beat.strip() or 'B1',
                  'landmark_type':kind,'x_pixel':int(x),'y_pixel':int(y),'source':'HUMAN_CONFIRMED',
