@@ -8,6 +8,7 @@ import json
 import zipfile
 from PIL import Image,ImageDraw
 import streamlit as st
+from core.integrated_verification_v25 import visual_coverage
 from core.visual_reader_v21 import (LEADS,FIRST_PASS_PROMPT,SECOND_PASS_PROMPT,
     image_from_bytes,image_identity,image_for_model,layout_boxes,crop_images,extract_json,
     sanitized_observations,normalize_second,choose_leads,reconciliation,report_export)
@@ -197,7 +198,7 @@ with st.expander('Xem trước 4/5 ảnh nhóm thật sẽ gửi Gemini',expande
     st.warning('Nếu bất kỳ ảnh nhóm nào mất R/S, chứa lead khác hoặc sai nhãn, hãy sửa ROI và xem lại. Không gửi AI khi crop chưa đúng.')
 
 confirmed=st.checkbox('Tôi xác nhận các nhóm crop có đúng chuyển đạo và không cắt mất nét sóng quan trọng',value=False)
-second_prompt="""Đọc các ảnh NHÓM ECG được cung cấp theo tên nhóm và nhãn từng hàng trong ảnh. Mỗi nhóm chứa ba chuyển đạo riêng (hoặc một dải II rhythm); KHÔNG giả định chúng được ghi đồng thời hoặc là cùng một nhịp. Đây là lượt mô tả độc lập; không có kết luận lượt 1. Đối với từng lead nhìn thấy, ghi visibility, mô tả quan sát, P, hình thái QRS, J/ST và T; nếu không chắc hãy ghi UNKNOWN, không tự suy từ chẩn đoán in trên ảnh. Nếu có II-rhythm, mô tả nhịp và chuỗi P-QRS. Bắt buộc ghi riêng TẤT CẢ các lead được gửi và không tự tạo lead thiếu. Không xuất độ chênh ST hoặc khoảng QRS chính xác khi chưa có đo lường đã xác minh. Trả JSON duy nhất: {"lead_observations":[{"lead":"I","visibility":"CLEAR|LIMITED|UNKNOWN","observation":"...","p":"...","qrs":"...","st_t":"..."}],"conflicts_or_limits":"..."}"""
+second_prompt="""Đọc các ảnh NHÓM ECG được cung cấp theo tên nhóm và nhãn từng hàng trong ảnh. Mỗi nhóm chứa ba chuyển đạo riêng (hoặc một dải II rhythm); KHÔNG giả định chúng được ghi đồng thời hoặc là cùng một nhịp. Đây là lượt mô tả độc lập; không có kết luận lượt 1. Đối với từng lead nhìn thấy, ghi visibility, mô tả quan sát, P, hình thái QRS, J/ST và T; nếu không chắc hãy ghi UNKNOWN, không tự suy từ chẩn đoán in trên ảnh. Nếu có II-rhythm, mô tả nhịp và chuỗi P-QRS. Bắt buộc ghi riêng TẤT CẢ các lead được gửi, kể cả II-rhythm như một mục độc lập. Với II-rhythm, trường observation phải ghi nhịp, P-QRS và mức chắc chắn; p/qrs/st_t không được bỏ trống, trả UNKNOWN nếu không thấy. Không tự tạo lead thiếu. Không xuất độ chênh ST hoặc khoảng QRS chính xác khi chưa có đo lường đã xác minh. Trả JSON duy nhất: {"lead_observations":[{"lead":"I","visibility":"CLEAR|LIMITED|UNKNOWN","observation":"...","p":"...","qrs":"...","st_t":"..."}],"conflicts_or_limits":"..."}"""
 config_fingerprint=hashlib.sha256(json.dumps({'layout':layout,'group_boxes':group_boxes,'groups':[p.group_id for p in panels]},sort_keys=True).encode()).hexdigest()[:20]
 if st.button('AI đọc chi tiết toàn bộ nhóm (lượt 2)',disabled=not confirmed,type='primary'):
     try:
@@ -206,9 +207,12 @@ if st.button('AI đọc chi tiết toàn bộ nhóm (lượt 2)',disabled=not co
             raw,used_route=analyze_with_routes(routes,second_prompt,images)
             expected=[lead for p in panels for lead in p.leads]
             second=normalize_second(extract_json(raw),expected)
+            second['coverage_v25']=visual_coverage(expected,second)
         st.session_state['v22_second']=second
         st.session_state['v22_config_hash']=config_fingerprint
         st.success(f'AI lượt 2 đã chạy qua {used_route}; các nhận xét vẫn cần bác sĩ xác minh.')
+        if not second['coverage_v25']['complete']:
+            st.error('AI lượt 2 thiếu nội dung: '+str(second['coverage_v25']['missing']+second['coverage_v25']['not_observable'])+'. Có thể chạy lại lượt 2.')
     except Exception as exc:
         st.error(f'Không đọc được lượt 2: {exc}')
 
@@ -217,6 +221,11 @@ if second:
     if st.session_state.get('v22_config_hash')!=config_fingerprint:
         st.warning('Bố cục/ROI đã thay đổi: lượt đọc 2 không còn khớp với ảnh đang xem. Hãy chạy lại.');st.stop()
     st.subheader('4 · Đối chiếu bằng chứng và cảnh báo logic')
+    v25_coverage=visual_coverage([lead for p in panels for lead in p.leads],second)
+    if not v25_coverage['complete']:
+        st.error('CHƯA QUA CỔNG AI VISUAL: thiếu hoặc chưa đọc được '+str(v25_coverage['missing']+v25_coverage['not_observable']))
+    else:
+        st.success('AI lượt 2 đã có mô tả cho tất cả các lead được gửi. Đây chưa phải nghiệm thu lâm sàng.')
     rows=[]
     for p in panels:
         for lead in p.leads:
@@ -225,6 +234,7 @@ if second:
             rows.append({'group':p.group_id,'lead':lead,'AI_original':first_ob,'AI_group_crop':second_ob,'status':'AI_VISUAL_ONLY_NOT_QUANTITATIVE_VERIFICATION'})
     st.dataframe(rows,width='stretch',hide_index=True)
     report=v22_report(first,second,panels,boxes,layout,image_hash)
+    report['visual_coverage_v25']=v25_coverage
     report['schema_version']='2.3.1'
     report['group_crop_method']='DIRECT_SINGLE_RECTANGLE_FROM_ORIGINAL'
     report['direct_group_boxes']={k:list(v) for k,v in group_boxes.items()}
