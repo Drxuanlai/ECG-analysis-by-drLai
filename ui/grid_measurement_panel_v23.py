@@ -14,6 +14,8 @@ from core.gemini_visual_v21 import analyze_with_routes
 from core.visual_reader_v21 import image_for_model,extract_json
 from core.beat_anchor_v24 import (windows_for_anchors,image_r_candidates,map_local_landmarks,
     evidence_checks,compare_to_human,beat_overlay)
+from core.full_beat_v241 import (propose_qrs_candidates, full_beat_windows,
+    full_beat_prompt, validate_one_beat_landmarks, candidate_overlay)
 
 
 def _state(slot:str,default):
@@ -196,87 +198,141 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
         measured=[]
         st.warning('Chưa đủ điều kiện đo: phải xác nhận lưới và lưu các mốc bác sĩ.')
     st.caption('Chú ý: số đo phụ thuộc hiệu chuẩn và độ chính xác điểm bấm. ST_AT_J là điện thế tại J so với baseline cùng beat, KHÔNG tự suy ra STEMI/Brugada. Tránh dùng để quyết định điều trị.')
-    st.markdown('**E. v2.4 · Beat-Anchored Landmark QA (không thay mốc bác sĩ)**')
-    st.caption('Tạo ứng viên QRS độc lập từ nét ảnh, chọn từng nhịp và yêu cầu AI đọc CỬA SỔ NHỊP; không dùng mốc bác sĩ làm đầu vào dự đoán.')
-    anchors_key=f'v24_anchors_{fingerprint}'
-    local_ai_key=f'v24_local_ai_{fingerprint}'
-    _state(anchors_key,[])
-    _state(local_ai_key,[])
-    xa,xb=st.columns(2)
-    with xa:
-        if st.button('Tìm ứng viên QRS từ ảnh (chưa xác minh)',key=f'v24_candidates_{fingerprint}'):
-            st.session_state[anchors_key]=image_r_candidates(roi)
+    st.markdown('**E. v2.4.1 · Full-Beat Window & T-Wave Protection (QA)**')
+    st.caption('Mỗi nhịp B1, B2… chỉ hình thành từ một QRS đã được em CHỌN để phân tích. '
+               'Mọi ứng viên khác vẫn lưu UNRESOLVED, không tự coi là sóng T hay ARTIFACT.')
+    raw_key=f'v241_raw_candidates_{fingerprint}'
+    selected_key=f'v241_selected_ids_{fingerprint}'
+    local_ai_key=f'v241_local_ai_{fingerprint}'
+    _state(raw_key,[]);_state(selected_key,[]);_state(local_ai_key,[])
+    left_col,right_col=st.columns(2)
+    with left_col:
+        if st.button('Tìm ứng viên QRS (chưa xác minh)',key=f'v241_candidates_{fingerprint}'):
+            st.session_state[raw_key]=image_r_candidates(roi)
+            st.session_state[selected_key]=[]
             st.session_state[local_ai_key]=[]
             st.rerun()
-    with xb:
-        guided_mode=st.checkbox('Chế độ hướng dẫn: tự nhập X mốc QRS',key=f'v24_guided_{fingerprint}',
-                                help='Chỉ để kiểm tra giao diện; không dùng để chấm detector độc lập.')
+    with right_col:
+        guided_mode=st.checkbox('Thêm ứng viên tại X do bác sĩ chỉ',
+            key=f'v241_guided_{fingerprint}',
+            help='Ứng viên có hướng dẫn; KHÔNG dùng để chấm detector độc lập.')
     if guided_mode:
-        guided_x=st.number_input('Tọa độ X gợi ý cửa sổ (pixel trong ROI)',0,roi.width-1,
-                                 value=min(roi.width-1,roi.width//3),key=f'v24_guided_x_{fingerprint}')
-        if st.button('Thêm cửa sổ thủ công (GUIDED, không chấm detector)',key=f'v24_addguided_{fingerprint}'):
-            temp=list(st.session_state[anchors_key]);temp.append({'x_pixel':int(guided_x),'source':'GUIDED_MANUAL_ANCHOR'})
-            st.session_state[anchors_key]=temp
+        guided_x=st.number_input('X cửa sổ cần xem (pixel ROI)',0,roi.width-1,
+            value=min(roi.width-1,roi.width//3),key=f'v241_guided_x_{fingerprint}')
+        if st.button('Thêm ứng viên GUIDED',key=f'v241_addguided_{fingerprint}'):
+            raw=list(st.session_state[raw_key]);raw.append({
+                'x_pixel':int(guided_x),'source':'GUIDED_MANUAL_ANCHOR','score':0})
+            st.session_state[raw_key]=raw
+            st.session_state[selected_key]=[]
             st.session_state[local_ai_key]=[]
             st.rerun()
-    anchors=st.session_state[anchors_key]
-    half=st.slider('Nửa độ rộng cửa sổ quanh QRS (px)',45,180,95,step=5,
-                   key=f'v24_half_{fingerprint}')
-    windows=windows_for_anchors(anchors,roi.width,half_width=half)
+
+    candidates=propose_qrs_candidates(st.session_state[raw_key],roi.width)
+    if candidates:
+        st.info('Chọn đúng các phức bộ QRS thực. Sóng T nghi ngờ KHÔNG được chọn thành nhịp; '
+                'các điểm không chọn vẫn giữ UNRESOLVED để tránh bỏ sót ngoại tâm thu.')
+        suggested_ids=[c['candidate_id'] for c in candidates if c['suggested_qrs']]
+        id_to_c={c['candidate_id']:c for c in candidates}
+        current_choice=st.session_state[selected_key]
+        default_choice=current_choice if current_choice else suggested_ids
+        candidate_signature=hashlib.sha256(str([(c['x_pixel'],c['score']) for c in candidates]).encode()).hexdigest()[:10]
+        choices=st.multiselect('Chọn các sự kiện QRS để phân tích P–QRS–ST–T',
+            options=[c['candidate_id'] for c in candidates],default=default_choice,
+            format_func=lambda cid:f"{cid} · X={id_to_c[cid]['x_pixel']} · {id_to_c[cid]['suggestion_status']}",
+            key=f'v241_choice_{fingerprint}_{candidate_signature}')
+        st.image(candidate_overlay(roi,candidates,choices),width='stretch',
+                 caption='Xanh = đang chọn là QRS; cam = chưa chọn/UNRESOLVED. Tất cả ban đầu chỉ là ứng viên.')
+        if st.button('Áp dụng các QRS đã chọn để tạo cửa sổ nhịp',
+                     key=f'v241_apply_{fingerprint}'):
+            st.session_state[selected_key]=list(choices)
+            st.session_state[local_ai_key]=[]
+            st.rerun()
+        st.caption(f'Có {len(candidates)} ứng viên; {len(suggested_ids)} được xếp ưu tiên theo nét hẹp. '
+                   'Đây KHÔNG phải số nhịp đã xác minh. Em phải bấm Áp dụng để tạo cửa sổ.')
+    accepted_ids=set(st.session_state[selected_key])
+    accepted=[dict(c, source=('USER_SELECTED_GUIDED_QRS_FOR_QA' if
+                            c.get('source')=='GUIDED_MANUAL_ANCHOR' else
+                            'USER_SELECTED_IMAGE_QRS_FOR_QA'))
+              for c in candidates if c['candidate_id'] in accepted_ids]
+    unresolved=[dict(c, event_status='UNRESOLVED_NOT_COUNTED_AS_BEAT')
+                for c in candidates if c['candidate_id'] not in accepted_ids]
+    with st.expander('Điều chỉnh phạm vi cửa sổ P–QRS–ST–T',expanded=False):
+        st.caption('Tỷ lệ dựa vào khoảng giữa các QRS ĐÃ CHỌN, không giả định RR đều. '
+                   'Cửa sổ được phép chồng lấp để giữ sóng T khi nhịp ngắn.')
+        lf=st.slider('Phần khoảng RR trước QRS',.20,.60,.36,step=.02,
+                     key=f'v241_left_{fingerprint}')
+        rf=st.slider('Phần khoảng RR sau QRS',.55,1.00,.78,step=.02,
+                     key=f'v241_right_{fingerprint}')
+    windows=full_beat_windows(accepted,roi.width,left_fraction=lf,right_fraction=rf)
     signature=tuple((w['anchor_x'],w['x0'],w['x1']) for w in windows)
-    signature_key=f'v24_window_signature_{fingerprint}'
+    signature_key=f'v241_window_signature_{fingerprint}'
     if st.session_state.get(signature_key)!=signature:
         st.session_state[local_ai_key]=[]
         st.session_state[signature_key]=signature
-    if anchors:
-        st.caption(f'{len(anchors)} ứng viên độc lập/được thêm bằng tay; {len(windows)} cửa sổ. Đặc biệt: bộ dò nét đứng có thể nhận nhầm lưới, T hoặc xung chuẩn.')
     if windows:
-        selected=st.selectbox('Chọn một cửa sổ nhịp để kiểm tra',range(len(windows)),
-            format_func=lambda i:f"{windows[i]['beat_id']} · X≈{windows[i]['anchor_x']} · {windows[i]['anchor_source']}",
-            key=f'v24_window_{fingerprint}')
+        st.success(f'{len(windows)} cửa sổ P–QRS–ST–T được tạo từ QRS em đã chọn; '
+                   f'{len(unresolved)} ứng viên khác chưa phân định, không được tính là nhịp.')
+        selected=st.selectbox('Chọn cửa sổ nhịp để đọc',range(len(windows)),
+            format_func=lambda i:f"{windows[i]['beat_id']} · QRS≈{windows[i]['anchor_x']} · X {windows[i]['x0']}–{windows[i]['x1']}",
+            key=f'v241_beat_{fingerprint}')
         win=windows[selected]
-        stale=[p for p in st.session_state[local_ai_key] if p.get('beat_id')==win['beat_id']]
-        current=evidence_checks(roi,stale,windows)
-        selected_img=beat_overlay(roi,win,current,[]) # do NOT show human reference before inference
-        st.image(selected_img,width='stretch',caption=f"{win['beat_id']} · {win['x0']}–{win['x1']} px · Cam: mốc QRS ứng viên; tím: AI chưa xác minh")
-        if win['anchor_source']=='GUIDED_MANUAL_ANCHOR':
-            st.warning('GUIDED: cửa sổ được bác sĩ chọn. Không sử dụng đầu ra này để chấm hiệu năng detector tự động.')
-        if st.button('AI định vị PQRST chỉ trong cửa sổ này',key=f'v24_ai_{fingerprint}',disabled=not bool(routes)):
+        old=[p for p in st.session_state[local_ai_key] if p.get('beat_id')==win['beat_id']]
+        old=validate_one_beat_landmarks(evidence_checks(roi,old,windows),win)
+        st.image(beat_overlay(roi,win,old,[]),width='stretch',
+            caption=f"{win['beat_id']} · Full P–QRS–ST–T · X={win['x0']}–{win['x1']} px; "
+                    'cam = QRS đã chọn; tím = AI chưa xác minh')
+        st.caption('Cửa sổ là vùng quan sát, KHÔNG bảo đảm T đã thấy đủ; nếu T bị cắt '
+                   'do ảnh hoặc nhịp sau đến sớm, không được tự điền T_END.')
+        if win['coverage_warning']:
+            st.warning(f"Cửa sổ sát biên: {win['coverage_warning']} — cần rà soát thành phần bị cắt.")
+        if st.button('AI định vị PQRST của nhịp này',key=f'v241_ai_{fingerprint}',
+                     disabled=not bool(routes)):
             cut=roi.crop((win['x0'],0,win['x1'],roi.height))
-            prompt=f"""Quan sát duy nhất một cửa sổ ECG của lead {lead}, kích thước ảnh {cut.width}x{cut.height} pixel. Không có thông tin nhãn bác sĩ. Gốc tọa độ (0,0) tại TRÁI TRÊN của ảnh NHỎ này. Trả từng vị trí P_ONSET,P_PEAK,P_OFFSET,QRS_ONSET,R_PEAK,S_NADIR,QRS_OFFSET,J_POINT,T_PEAK,T_END,BASELINE nếu nhìn rõ. Không ép có R dương; QS có thể không có R_PEAK. Không giả định nhịp đều, không đoán tọa độ từ ảnh toàn dải. Nếu không nhìn đủ nét thì bỏ mốc đó. Chỉ JSON {{"landmarks":[{{"landmark_type":"R_PEAK","x_pixel":30,"y_pixel":25,"evidence":"cực đại dương nét mực"}}]}}. Không nhận đường lưới hoặc chữ in là sóng. Chỉ mô tả vị trí; không chẩn đoán."""
+            prompt=full_beat_prompt(lead,win,cut.size)
             try:
-                with st.spinner('AI đọc độc lập cửa sổ nhịp...'):
-                    raw,used=analyze_with_routes(routes,prompt,[(lead,image_for_model(cut,max_side=max(cut.size)))])
+                with st.spinner('AI xem toàn bộ P–QRS–ST–T của nhịp...'):
+                    raw,used=analyze_with_routes(routes,prompt,
+                        [(lead,image_for_model(cut,max_side=max(cut.size)))])
                     local=map_local_landmarks(extract_json(raw),win,roi)
-                # replace this beat only; never let clinician landmarks steer inference
-                st.session_state[local_ai_key]=[p for p in st.session_state[local_ai_key] if p['beat_id']!=win['beat_id']]+local
-                st.caption(f'{len(local)} mốc chưa xác minh; route {used}')
+                st.session_state[local_ai_key]=[
+                    p for p in st.session_state[local_ai_key]
+                    if p.get('beat_id')!=win['beat_id']]+local
+                st.caption(f'{len(local)} tọa độ AI chưa xác minh · route {used}')
                 st.rerun()
             except Exception as exc:
-                st.error(f'AI không trả kết quả hợp lệ ({type(exc).__name__}); kiểm tra Logs và route.')
-        current=evidence_checks(roi,st.session_state[local_ai_key],windows)
-        focus=[p for p in current if p['beat_id']==win['beat_id']]
+                st.error(f'AI chưa hoàn tất ({type(exc).__name__}). Kiểm tra Logs.')
+        focus=validate_one_beat_landmarks(evidence_checks(roi,
+              [p for p in st.session_state[local_ai_key] if p.get('beat_id')==win['beat_id']],windows),win)
         if focus:
             st.dataframe(focus,width='stretch',hide_index=True)
             st.image(beat_overlay(roi,win,focus,points),width='stretch',
-                     caption='Kiểm tra sau suy luận: tím = AI; xanh lá = bác sĩ. Mốc bác sĩ không tham gia prompt.')
-    all_predictions=evidence_checks(roi,st.session_state[local_ai_key],windows)
+                caption='Chỉ QA: tím = AI; xanh lá = bác sĩ. Mốc bác sĩ KHÔNG đưa vào prompt.')
+    else:
+        st.warning('Chưa có QRS được chọn để phân tích. Chọn ứng viên, bỏ sóng T giả '
+                   'rồi bấm “Áp dụng”; hoặc thêm ứng viên GUIDED nếu detector bỏ sót.')
+    all_predictions=[]
+    for w in windows:
+        individual=[p for p in st.session_state[local_ai_key] if p.get('beat_id')==w['beat_id']]
+        all_predictions.extend(validate_one_beat_landmarks(evidence_checks(roi,individual,windows),w))
     comparisons=compare_to_human(all_predictions,points,tol_x=8,tol_y=8)
     if comparisons:
-        with st.expander('So khớp 2D với mốc bác sĩ (chỉ để QA)',expanded=False):
+        with st.expander('So khớp X–Y với mốc bác sĩ (chỉ QA)',expanded=False):
             st.dataframe(comparisons,width='stretch',hide_index=True)
-            st.caption('So khớp một-một theo loại mốc, không dùng tọa độ bác sĩ để tạo dự đoán. Cửa sổ GUIDED phải loại khỏi đánh giá độc lập.')
-    st.caption('Không tự dùng tọa độ AI để đo RR/QRS/ST. Chỉ các mốc bác sĩ đã duyệt mới được chuyển sang mục D.')
+            st.caption('Không dùng mốc bác sĩ trong suy luận. Chế độ GUIDED không dùng để chấm detector.')
+    st.caption('Không tự chuyển tọa độ AI thành số đo RR/QRS/ST. Chỉ các mốc bác sĩ '
+               'đã duyệt trong phần C mới được dùng ở phần D.')
 
-    export={'version':'2.4-QA','image_hash':image_hash,'layout':layout,'lead':lead,'roi_box':list(box),
+    export={'version':'2.4.1-QA','image_hash':image_hash,'layout':layout,'lead':lead,'roi_box':list(box),
         'roi_width':roi.width,'roi_height':roi.height,'grid':cal.to_dict() if cal else None,
         'ai_proposals_unverified':proposals,'human_landmarks':points,'measurements_human_landmarks':measured,
         'clinical_status':'RESEARCH_NOT_CLINICALLY_VALIDATED',
-        'beat_v24':{'anchors':anchors,'windows':windows,'ai_predictions_unverified':all_predictions,
+        'beat_v241':{'candidates_unverified':candidates,'selected_qrs_for_review':accepted,
+                    'unresolved_candidates_not_beats':unresolved,'full_beat_windows':windows,
+                    'ai_predictions_unverified':all_predictions,
                     'comparison_2d_to_human':comparisons,'independent_test_eligible':False}}
     with io.BytesIO() as buf:
         with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
             z.writestr('measurement_evidence_v23.json',json.dumps(export,ensure_ascii=False,indent=2))
-            z.writestr('README.txt','ECG 2.3 QA: AI landmarks are unverified. Measurements require clinician-confirmed pixel landmarks and a manually calibrated local grid. No raw ECG image included.\n')
+            z.writestr('README.txt','ECG 2.4.1 QA: Unselected candidates are UNRESOLVED, not beats. AI landmarks are unverified. Measurements require clinician-confirmed pixel landmarks and a manually calibrated local grid. No raw ECG image included.\n')
         data=buf.getvalue()
     st.download_button('Xuất ZIP Measurement QA v2.3 (không chứa ảnh)',data=data,file_name=f'ecg_core_v2_3_grid_evidence_{lead.replace("-","_")}.zip',mime='application/zip',key=f'v23_export_{fingerprint}')
