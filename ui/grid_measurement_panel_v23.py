@@ -16,6 +16,8 @@ from core.beat_anchor_v24 import (windows_for_anchors,image_r_candidates,map_loc
     evidence_checks,compare_to_human,beat_overlay)
 from core.full_beat_v241 import (propose_qrs_candidates, full_beat_windows,
     full_beat_prompt, validate_one_beat_landmarks, candidate_overlay)
+from core.qrs_inventory_v242 import (strip_tiles,inventory_prompt,parse_tile,
+    merge_tile_inventory,reconcile,inventory_overlay)
 
 
 def _state(slot:str,default):
@@ -198,19 +200,66 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
         measured=[]
         st.warning('Chưa đủ điều kiện đo: phải xác nhận lưới và lưu các mốc bác sĩ.')
     st.caption('Chú ý: số đo phụ thuộc hiệu chuẩn và độ chính xác điểm bấm. ST_AT_J là điện thế tại J so với baseline cùng beat, KHÔNG tự suy ra STEMI/Brugada. Tránh dùng để quyết định điều trị.')
-    st.markdown('**E. v2.4.1 · Full-Beat Window & T-Wave Protection (QA)**')
+    st.markdown('**E. v2.4.2 · AI QRS Inventory → Reconciliation → Full Beat (QA)**')
     st.caption('Mỗi nhịp B1, B2… chỉ hình thành từ một QRS đã được em CHỌN để phân tích. '
                'Mọi ứng viên khác vẫn lưu UNRESOLVED, không tự coi là sóng T hay ARTIFACT.')
     raw_key=f'v241_raw_candidates_{fingerprint}'
     selected_key=f'v241_selected_ids_{fingerprint}'
     local_ai_key=f'v241_local_ai_{fingerprint}'
+    inventory_key=f'v242_inventory_{fingerprint}'
     _state(raw_key,[]);_state(selected_key,[]);_state(local_ai_key,[])
+    _state(inventory_key,{})
+    st.markdown('**E1 · AI đếm và chỉ vị trí từng QRS trên toàn dải**')
+    st.caption('AI đọc nhiều đoạn có vùng chồng lề để giữ độ phân giải. Không dự đoán số QRS từ RR, '
+               'không ép nhịp đều và không sử dụng mốc bác sĩ trong prompt.')
+    tiles=strip_tiles(roi.width,tile_width=950,overlap=140)
+    st.caption(f'{len(tiles)} đoạn ảnh (có chồng lề) · {roi.width} px tổng chiều rộng')
+    if st.button('AI KIỂM KÊ QRS (toàn bộ dải)',key=f'v242_inventory_run_{fingerprint}',
+                 disabled=not bool(routes)):
+        reports=[];failures=[]
+        for tile in tiles:
+            cut=roi.crop((tile['x0'],0,tile['x1'],roi.height))
+            prompt=inventory_prompt(lead,cut.width,cut.height,tile)
+            try:
+                with st.spinner(f"AI kiểm kê {tile['tile_id']} · X {tile['x0']}–{tile['x1']}..."):
+                    raw,used=analyze_with_routes(routes,prompt,
+                         [(f"{lead}_{tile['tile_id']}",image_for_model(cut,max_side=max(cut.size)))])
+                    rep=parse_tile(extract_json(raw),tile,roi.height)
+                    rep['api_route_used']=used
+                    reports.append(rep)
+            except Exception as exc:
+                failures.append({'tile_id':tile['tile_id'], 'error_type':type(exc).__name__})
+        inventory=merge_tile_inventory(reports)
+        inventory['failed_tiles']=failures
+        inventory['all_tiles_processed']=len(reports)==len(tiles) and not failures
+        st.session_state[inventory_key]=inventory
+        st.session_state[selected_key]=[]
+        st.session_state[local_ai_key]=[]
+        st.session_state.pop(f'v242_coverage_ack_{fingerprint}',None)
+        st.rerun()
+    inv=st.session_state[inventory_key]
+    if inv:
+        if not inv.get('all_tiles_processed'):
+            st.error('Một hoặc nhiều đoạn chưa được AI kiểm kê. Kết quả CHƯA bao phủ toàn dải; không nghiệm thu số QRS.')
+        if inv.get('issues'):
+            st.warning('Có đoạn mà số QRS AI khai báo không khớp danh sách tọa độ. Cần kiểm tra.')
+        st.info(f"AI đề xuất {inv.get('ai_count_unverified',0)} QRS có tọa độ từ các đoạn; "
+                'đây không phải tổng QRS đã xác minh.')
+        if inv.get('qrs'):st.dataframe([{'id':q['inventory_id'],'x':q['x_pixel'],
+                  'tiles':','.join(q['tile_ids']), 'overlap_review':q['overlap_merge_review']}
+                  for q in inv['qrs']],hide_index=True,width='stretch')
+        if inv.get('uncertain_events') or inv.get('partial_events'):
+            with st.expander('AI chưa phân định / QRS bị cắt ở mép đoạn'):
+                st.json({'uncertain':inv.get('uncertain_events',[]),
+                         'partial':inv.get('partial_events',[])})
+    st.markdown('**E2 · Đối chiếu với ứng viên từ nét ảnh**')
     left_col,right_col=st.columns(2)
     with left_col:
         if st.button('Tìm ứng viên QRS (chưa xác minh)',key=f'v241_candidates_{fingerprint}'):
             st.session_state[raw_key]=image_r_candidates(roi)
             st.session_state[selected_key]=[]
             st.session_state[local_ai_key]=[]
+            st.session_state.pop(f'v242_coverage_ack_{fingerprint}',None)
             st.rerun()
     with right_col:
         guided_mode=st.checkbox('Thêm ứng viên tại X do bác sĩ chỉ',
@@ -225,30 +274,46 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
             st.session_state[raw_key]=raw
             st.session_state[selected_key]=[]
             st.session_state[local_ai_key]=[]
+            st.session_state.pop(f'v242_coverage_ack_{fingerprint}',None)
             st.rerun()
 
     candidates=propose_qrs_candidates(st.session_state[raw_key],roi.width)
+    if inv and candidates:
+        comparison=reconcile(inv,candidates,tolerance_px=18)
+        st.caption(f"Đối chiếu vị trí: {len(comparison['matches'])} cặp gần nhau; "
+                   f"{len(comparison['ai_only'])} AI-only; {len(comparison['image_only'])} Python-only. "
+                   'Không phải TP/FP/FN.')
+        with st.expander('Danh sách vị trí đồng thuận và bất đồng',expanded=True):
+            st.json(comparison)
+    else:
+        comparison={}
+    if inv or candidates:
+        st.image(inventory_overlay(roi,inv or {},candidates),width='stretch',
+            caption='Tím = AI kiểm kê; cam = ứng viên Python. Cả hai chưa xác minh.')
+    st.markdown('**E3 · Bác sĩ duyệt QRS trước khi tạo Beat ID**')
+    st.caption('Không chọn sẵn ứng viên dựa trên điểm số. Chỉ các QRS em duyệt mới tạo B1, B2… '
+               'Khi AI/Python không phát hiện một QRS rõ, thêm ứng viên GUIDED để không bỏ sót.')
     if candidates:
-        st.info('Chọn đúng các phức bộ QRS thực. Sóng T nghi ngờ KHÔNG được chọn thành nhịp; '
-                'các điểm không chọn vẫn giữ UNRESOLVED để tránh bỏ sót ngoại tâm thu.')
-        suggested_ids=[c['candidate_id'] for c in candidates if c['suggested_qrs']]
         id_to_c={c['candidate_id']:c for c in candidates}
-        current_choice=st.session_state[selected_key]
-        default_choice=current_choice if current_choice else suggested_ids
         candidate_signature=hashlib.sha256(str([(c['x_pixel'],c['score']) for c in candidates]).encode()).hexdigest()[:10]
-        choices=st.multiselect('Chọn các sự kiện QRS để phân tích P–QRS–ST–T',
-            options=[c['candidate_id'] for c in candidates],default=default_choice,
-            format_func=lambda cid:f"{cid} · X={id_to_c[cid]['x_pixel']} · {id_to_c[cid]['suggestion_status']}",
-            key=f'v241_choice_{fingerprint}_{candidate_signature}')
+        choices=st.multiselect('Chọn các QRS thực trên ảnh',
+            options=[c['candidate_id'] for c in candidates],default=[],
+            format_func=lambda cid:f"{cid} · X={id_to_c[cid]['x_pixel']}",
+            key=f'v242_choice_{fingerprint}_{candidate_signature}')
         st.image(candidate_overlay(roi,candidates,choices),width='stretch',
-                 caption='Xanh = đang chọn là QRS; cam = chưa chọn/UNRESOLVED. Tất cả ban đầu chỉ là ứng viên.')
-        if st.button('Áp dụng các QRS đã chọn để tạo cửa sổ nhịp',
-                     key=f'v241_apply_{fingerprint}'):
+                 caption='Xanh = QRS dự kiến chọn; cam = chưa chọn/UNRESOLVED. Phải xác nhận đầy đủ.')
+        count_ack=st.checkbox('Tôi đã rà soát HẾT dải II Rhythm, các QRS thật đều có trong danh sách được chọn',
+            key=f'v242_coverage_ack_{fingerprint}')
+        inventory_ready=bool(inv and inv.get('all_tiles_processed') and not inv.get('issues'))
+        if not inventory_ready:
+            st.warning('Cần hoàn tất bước AI kiểm kê toàn dải và rà soát các lỗi đếm trước khi cấp Beat ID.')
+        if st.button('Áp dụng QRS đã duyệt → tạo cửa sổ PQRST',
+                 key=f'v241_apply_{fingerprint}',disabled=not inventory_ready or not count_ack or not choices):
             st.session_state[selected_key]=list(choices)
             st.session_state[local_ai_key]=[]
             st.rerun()
-        st.caption(f'Có {len(candidates)} ứng viên; {len(suggested_ids)} được xếp ưu tiên theo nét hẹp. '
-                   'Đây KHÔNG phải số nhịp đã xác minh. Em phải bấm Áp dụng để tạo cửa sổ.')
+        st.caption(f'Ứng viên Python: {len(candidates)}; số QRS đã chọn trước khi áp dụng: {len(choices)}. '
+                   'Không ép khớp tổng số do AI đề xuất.')
     accepted_ids=set(st.session_state[selected_key])
     accepted=[dict(c, source=('USER_SELECTED_GUIDED_QRS_FOR_QA' if
                             c.get('source')=='GUIDED_MANUAL_ANCHOR' else
@@ -322,10 +387,11 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
     st.caption('Không tự chuyển tọa độ AI thành số đo RR/QRS/ST. Chỉ các mốc bác sĩ '
                'đã duyệt trong phần C mới được dùng ở phần D.')
 
-    export={'version':'2.4.1-QA','image_hash':image_hash,'layout':layout,'lead':lead,'roi_box':list(box),
+    export={'version':'2.4.2-QA','image_hash':image_hash,'layout':layout,'lead':lead,'roi_box':list(box),
         'roi_width':roi.width,'roi_height':roi.height,'grid':cal.to_dict() if cal else None,
         'ai_proposals_unverified':proposals,'human_landmarks':points,'measurements_human_landmarks':measured,
         'clinical_status':'RESEARCH_NOT_CLINICALLY_VALIDATED',
+        'qrs_inventory_v242':inv,'qrs_reconciliation_v242':comparison,
         'beat_v241':{'candidates_unverified':candidates,'selected_qrs_for_review':accepted,
                     'unresolved_candidates_not_beats':unresolved,'full_beat_windows':windows,
                     'ai_predictions_unverified':all_predictions,
@@ -333,6 +399,6 @@ def render(photo:Image.Image,boxes:dict,layout:str,image_hash:str,routes:list[di
     with io.BytesIO() as buf:
         with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
             z.writestr('measurement_evidence_v23.json',json.dumps(export,ensure_ascii=False,indent=2))
-            z.writestr('README.txt','ECG 2.4.1 QA: Unselected candidates are UNRESOLVED, not beats. AI landmarks are unverified. Measurements require clinician-confirmed pixel landmarks and a manually calibrated local grid. No raw ECG image included.\n')
+            z.writestr('README.txt','ECG 2.4.2 QA: AI QRS Inventory proposals and image candidates are UNVERIFIED. Unselected candidates are UNRESOLVED, not beats. AI landmarks are unverified. Measurements require clinician-confirmed pixel landmarks and a manually calibrated local grid. No raw ECG image included.\n')
         data=buf.getvalue()
-    st.download_button('Xuất ZIP Measurement QA v2.3 (không chứa ảnh)',data=data,file_name=f'ecg_core_v2_3_grid_evidence_{lead.replace("-","_")}.zip',mime='application/zip',key=f'v23_export_{fingerprint}')
+    st.download_button('Xuất ZIP Measurement QA v2.4.2 (không chứa ảnh)',data=data,file_name=f'ecg_core_v2_3_grid_evidence_{lead.replace("-","_")}.zip',mime='application/zip',key=f'v23_export_{fingerprint}')
